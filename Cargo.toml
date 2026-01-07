@@ -1,0 +1,67 @@
+[package]
+name = "satavahana"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance real-time market data pipeline for Zerodha Kite Connect"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["gzip", "rustls-tls", "json"], default-features = false }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CSV parsing
+csv = "1"
+
+# Lock-free concurrent map
+dashmap = "6"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+
+# Binary parsing
+byteorder = "1"
+
+# Math (normal distribution for Black-Scholes)
+statrs = "0.18"
+
+# SHA-256 for auth checksum
+sha2 = "0.10"
+hex = "0.4"
+
+# URL handling
+url = "2"
+
+# Futures utilities
+futures-util = "0.3"
+
+# CPU core affinity for thread pinning
+core_affinity = "0.8"
+
+# Atomic operations for lock-free data structures
+crossbeam = "0.8"
+
+# Random distributions for backtesting
+rand = "0.8"
+rand_distr = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# Optimize for speed over size
+panic = "abort"

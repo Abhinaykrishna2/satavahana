@@ -1,0 +1,45 @@
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Config files with secrets
+config.toml
+
+# Kite session token cache (contains access token — never commit)
+.kite_token
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# User options folder (as requested)
+usoptions/
+
+# Test data
+*.csv
+!**/test_fixtures/*.csv
+
+# Local environments
+venv/
+.venv/
+env/
+
+# Runtime data
+data/
+backtest/
+
+# Large local assets
+logo.png
+lion.mp4
