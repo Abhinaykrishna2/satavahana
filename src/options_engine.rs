@@ -10,12 +10,12 @@ use crate::websocket::TickEvent;
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Timelike, Utc};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use tokio::sync::{broadcast, mpsc};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
-const NIFTY_LOT_SIZE: u32 = 65;
-#[allow(dead_code)]
-const BANKNIFTY_LOT_SIZE: u32 = 30;
 const NSE_OPTIONS_EXCHANGE_TXN_RATE: f64 = 0.000311;
+// Options below ₹30 are typically deep OTM or near-expiry junk — bid-ask spread
+// alone can be ₹2-5 (7-16% of price), making fills far worse than the mid-price.
+const MIN_TRADEABLE_OPTION_PRICE: f64 = 30.0;
 
 fn entry_transaction_cost_per_lot(entry_price: f64, lot_size: u32) -> f64 {
     let premium = entry_price * lot_size as f64;
@@ -62,6 +62,59 @@ fn round_trip_transaction_cost_per_lot(
         + exit_transaction_cost_per_lot(exit_price, lot_size, assumed_exit_time_ms)
 }
 
+fn one_lot_entry_cost(entry_price: f64, lot_size: u32) -> f64 {
+    entry_price * lot_size as f64 + entry_transaction_cost_per_lot(entry_price, lot_size)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StrikeScanDirection {
+    Up,
+    Down,
+}
+
+fn nearest_affordable_otm_idx(
+    prices: &[f64],
+    start_idx: usize,
+    direction: StrikeScanDirection,
+    lot_size: u32,
+    deployable_capital: f64,
+    min_price: f64,
+) -> (Option<usize>, usize) {
+    if prices.is_empty() || start_idx >= prices.len() || lot_size == 0 || deployable_capital <= 0.0 {
+        return (None, 0);
+    }
+
+    let mut checked = 0usize;
+    match direction {
+        StrikeScanDirection::Up => {
+            for idx in start_idx..prices.len() {
+                checked += 1;
+                let price = prices[idx];
+                if !price.is_finite() || price < min_price {
+                    continue;
+                }
+                if one_lot_entry_cost(price, lot_size) <= deployable_capital {
+                    return (Some(idx), checked);
+                }
+            }
+        }
+        StrikeScanDirection::Down => {
+            for idx in (0..=start_idx).rev() {
+                checked += 1;
+                let price = prices[idx];
+                if !price.is_finite() || price < min_price {
+                    continue;
+                }
+                if one_lot_entry_cost(price, lot_size) <= deployable_capital {
+                    return (Some(idx), checked);
+                }
+            }
+        }
+    }
+
+    (None, checked)
+}
+
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MarketRegime {
@@ -90,7 +143,7 @@ impl std::fmt::Display for MarketRegime {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignalAction {
     BuyCE,
     BuyPE,
@@ -268,6 +321,10 @@ pub struct Position {
     pub capital_deployed: f64,
     pub entry_ctx: EntryContext,
     pub breakeven_stop_set: bool,
+    pub exit_pending: bool,
+    /// Number of 30-min hold checkpoints already evaluated.
+    /// At each new checkpoint the trade must be in profit to continue.
+    pub checkpoints_evaluated: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -281,9 +338,60 @@ struct PendingEntryOrder {
     placed_ms: u64,
     last_status_poll_ms: u64,
     cancel_requested: bool,
-    stale_timeout_hit: bool,
+    /// Why the engine decided to cancel; None until a cancel is triggered.
+    cancel_reason: Option<CancelReasonKind>,
+    /// Last wall-clock ms at which a CancelByTag was sent — used for retry backoff.
+    last_cancel_attempt_ms: u64,
+    /// True once capital has been released back to the pool (set by release_pending_entry).
+    /// Guards against double-subtraction if a terminal update arrives after removal.
     released_after_timeout: bool,
     order_id: Option<String>,
+    /// Signal option price at queue time — used as reference for price-reversal guard.
+    signal_price: f64,
+    /// Scan cycle in which this order was placed; used to skip same-cycle scan cancellation.
+    placed_at_scan_count: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingExitOrder {
+    pos_id: u64,
+    tag: String,
+    placed_ms: u64,
+    last_status_poll_ms: u64,
+    reason: String,
+}
+
+/// Why a pending limit entry order was cancelled by the engine (not the broker).
+/// Used for log observability and distinguishes the four guard paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CancelReasonKind {
+    Timeout,
+    PriceReversal,
+    ScanDirectionFlip,
+    ScanScoreCollapse,
+}
+
+impl CancelReasonKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            CancelReasonKind::Timeout           => "timeout",
+            CancelReasonKind::PriceReversal     => "price reversal",
+            CancelReasonKind::ScanDirectionFlip => "scan direction flip",
+            CancelReasonKind::ScanScoreCollapse => "scan score collapse",
+        }
+    }
+}
+
+/// Snapshot of the most recent scan result for one underlying.
+/// Used to validate pending limit entry orders between scans.
+#[derive(Debug, Clone)]
+struct LastScanResult {
+    /// Dominant direction the engine scored this underlying (BuyCE / BuyPE / Hold).
+    action: SignalAction,
+    /// Highest composite confidence seen across all strategies (0 when no signal fired).
+    best_score: f64,
+    /// Wall-clock ms when this scan ran.
+    scanned_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -366,11 +474,12 @@ impl RiskEngine {
         let affordable = (sizing_capital / cost_per_lot).floor() as u32;
         if affordable == 0 { return 0; }
 
-        let max_risk_capital = self.daily_start_capital * 0.20;
+        let kelly = self.kelly_fraction();
+        let max_risk_capital = self.daily_start_capital * kelly;
         let risk_per_lot = (stop_loss_pct * option_price * lot_size as f64).max(1.0);
         let lots_from_risk = (max_risk_capital / risk_per_lot).floor() as u32;
 
-        let lots_from_exposure = (sizing_capital * 0.60 / cost_per_lot).floor() as u32;
+        let lots_from_exposure = (sizing_capital * (kelly * 2.5).min(0.95) / cost_per_lot).floor() as u32;
 
         lots_from_risk.min(lots_from_exposure).min(4).max(1).min(affordable)
     }
@@ -539,7 +648,6 @@ pub struct OptionsEngine {
     spot_history: HashMap<String, VecDeque<(u64, f64)>>,
 
     prev_oi: HashMap<u32, u64>,
-    prev_exch_ts: HashMap<u32, u32>,
 
     risk: RiskEngine,
 
@@ -560,6 +668,7 @@ pub struct OptionsEngine {
 
     clock_override_ms: Option<u64>,
     replay_last_scan_ms: Option<u64>,
+    warmup_until_ms: Option<u64>,
 
     scan_interval_secs: u64,
     max_daily_trades: u32,
@@ -584,10 +693,24 @@ pub struct OptionsEngine {
     order_updates_rx: Option<mpsc::UnboundedReceiver<OrderUpdate>>,
     order_tag_prefix: String,
     pending_entry_orders: Vec<PendingEntryOrder>,
+    pending_exit_orders: Vec<PendingExitOrder>,
     pending_capital_reserved: f64,
     max_concurrent_positions: usize,
     entry_order_timeout_ms: u64,
     order_status_poll_interval_ms: u64,
+    /// Cancel pending entry if current LTP drops this fraction below the limit price
+    /// (signal direction has reversed). Default 0.15 = 15%.
+    limit_cancel_reversal_pct: f64,
+    /// Most recent scan result per underlying — used to invalidate pending entry orders
+    /// when the engine's view of direction or confidence changes between scans.
+    last_scan_result: HashMap<String, LastScanResult>,
+
+    // Live capital refresh from Kite margins API
+    kite_api_key: String,
+    kite_access_token: String,
+    capital_sync_needed: bool,
+
+    log_dir: String,
 }
 
 impl OptionsEngine {
@@ -600,12 +723,34 @@ impl OptionsEngine {
         dividend_yield: f64,
         log_dir: &str,
     ) -> Self {
+        Self::new_with_date(
+            contracts,
+            store,
+            underlying_tokens,
+            cfg,
+            risk_free_rate,
+            dividend_yield,
+            log_dir,
+            None,
+        )
+    }
+
+    pub fn new_with_date(
+        contracts: Vec<OptionContract>,
+        store: TickStore,
+        underlying_tokens: HashMap<String, u32>,
+        cfg: &OptionsEngineConfig,
+        risk_free_rate: f64,
+        dividend_yield: f64,
+        log_dir: &str,
+        replay_date: Option<&str>,
+    ) -> Self {
         let initial_capital = cfg.initial_capital.max(0.0);
         let max_daily_loss_fraction = (cfg.max_daily_loss_pct / 100.0).clamp(0.01, 0.95);
-        let journal = OptionsJournal::new(log_dir, initial_capital)
+        let journal = OptionsJournal::new(log_dir, initial_capital, replay_date)
             .unwrap_or_else(|e| {
                 warn!("Failed to open options journal in '{}': {}", log_dir, e);
-                OptionsJournal::new(".", initial_capital)
+                OptionsJournal::new(".", initial_capital, None)
                     .expect("Could not open options journal even in current directory")
             });
         Self {
@@ -615,7 +760,6 @@ impl OptionsEngine {
             iv_history: IVHistory::new(),
             spot_history: HashMap::new(),
             prev_oi: HashMap::new(),
-            prev_exch_ts: HashMap::new(),
             risk: RiskEngine::new(initial_capital, max_daily_loss_fraction),
             journal,
             positions: Vec::new(),
@@ -629,6 +773,7 @@ impl OptionsEngine {
             scan_count: 0,
             clock_override_ms: None,
             replay_last_scan_ms: None,
+            warmup_until_ms: None,
             scan_interval_secs: cfg.scan_interval_secs.max(1),
             max_daily_trades: cfg.max_daily_trades.clamp(1, 50),
             execution_buy_offset_inr: 0.0,
@@ -647,10 +792,17 @@ impl OptionsEngine {
             order_updates_rx: None,
             order_tag_prefix: "SATA".to_string(),
             pending_entry_orders: Vec::new(),
+            pending_exit_orders: Vec::new(),
             pending_capital_reserved: 0.0,
-            max_concurrent_positions: 2,
-            entry_order_timeout_ms: 5 * 60 * 1_000,
+            max_concurrent_positions: 4,
+            entry_order_timeout_ms: 4 * 60 * 1_000,
             order_status_poll_interval_ms: 2_000,
+            limit_cancel_reversal_pct: 0.15,
+            last_scan_result: HashMap::new(),
+            kite_api_key: String::new(),
+            kite_access_token: String::new(),
+            capital_sync_needed: false,
+            log_dir: log_dir.to_string(),
         }
     }
 
@@ -708,7 +860,7 @@ impl OptionsEngine {
     pub fn process_replay_tick(&mut self, timestamp_ms: u64) {
         self.set_clock_override_ms(timestamp_ms);
         self.process_order_updates();
-        self.poll_pending_entry_orders();
+        self.poll_pending_orders();
         self.check_open_positions();
 
         let session = self.current_session();
@@ -717,13 +869,7 @@ impl OptionsEngine {
         }
 
         if !self.pending_signals.is_empty() {
-            let min_delay_ms: u64 = 30_000;
-            let oldest_age = self.pending_signals.front()
-                .map(|s| timestamp_ms.saturating_sub(s.timestamp_ms))
-                .unwrap_or(0);
-            if oldest_age >= min_delay_ms {
-                self.execute_pending_signals();
-            }
+            self.execute_pending_signals();
         }
 
         let scan_interval_ms = self.scan_interval_secs.saturating_mul(1_000);
@@ -767,6 +913,21 @@ impl OptionsEngine {
         self.execution_sell_offset_inr = sell_offset.max(0.0);
     }
 
+    /// Configure limit-order behaviour for live entry orders.
+    /// `timeout_secs`   — cancel the order if unfilled after this many seconds (default: 240 = 4 min).
+    /// `reversal_pct`   — cancel if the current LTP falls this fraction below the limit price,
+    ///                    indicating the signal direction has reversed (default: 0.15 = 15%).
+    pub fn set_entry_order_config(&mut self, timeout_secs: u64, reversal_pct: f64) {
+        self.entry_order_timeout_ms = timeout_secs.max(30) * 1_000;
+        self.limit_cancel_reversal_pct = reversal_pct.clamp(0.05, 0.50);
+    }
+
+    /// Suppress signal generation until `ts_ms`. Use in backtest to build OI/IV
+    /// baselines before trading begins (mirrors the live OpeningBell run-in).
+    pub fn set_warmup_until_ms(&mut self, ts_ms: u64) {
+        self.warmup_until_ms = Some(ts_ms);
+    }
+
     pub fn set_live_order_bridge(
         &mut self,
         order_tx: mpsc::UnboundedSender<OrderCommand>,
@@ -775,16 +936,65 @@ impl OptionsEngine {
     ) {
         self.order_tx = Some(order_tx);
         self.order_updates_rx = order_updates_rx;
-        let clean = tag_prefix.trim();
+        // Kite enforces [a-zA-Z0-9] on tags — strip anything outside that set.
+        let clean: String = tag_prefix
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_uppercase();
         self.order_tag_prefix = if clean.is_empty() {
             "SATA".to_string()
         } else {
-            clean.to_ascii_uppercase()
+            clean
         };
     }
 
+    /// Store Kite credentials so the engine can re-fetch live margin balance
+    /// every hour and after every trade closes.
+    pub fn set_capital_refresh_credentials(&mut self, api_key: String, access_token: String) {
+        self.kite_api_key = api_key;
+        self.kite_access_token = access_token;
+    }
+
+    async fn sync_capital_from_kite(&mut self) {
+        if self.kite_api_key.is_empty() {
+            return;
+        }
+        let open = self.positions.iter().filter(|p| p.is_open).count();
+        if open > 0 {
+            info!("  Capital sync deferred: {} open position(s); will retry after close", open);
+            return;
+        }
+        match crate::execution::fetch_live_available_funds(
+            &self.kite_api_key,
+            &self.kite_access_token,
+        )
+        .await
+        {
+            Ok(funds) => {
+                let old = self.risk.capital;
+                self.risk.capital = funds.max(0.0);
+                self.capital_sync_needed = false;
+                info!(
+                    "  Capital synced from Kite margins: ₹{:.2} → ₹{:.2}",
+                    old, funds
+                );
+                // Persist to dated file so restarts during the day pick up latest value.
+                let date = self.current_day_ist();
+                let capital_file = format!("{}/{}_starting_capital.txt", self.log_dir, date);
+                if let Err(e) = std::fs::write(&capital_file, format!("{:.2}", funds)) {
+                    warn!("  Could not update capital file {}: {}", capital_file, e);
+                }
+            }
+            Err(e) => {
+                warn!("  Capital sync from Kite margins failed: {}", e);
+            }
+        }
+    }
+
     fn build_order_tag(&self, stage: &str, id: u64) -> String {
-        let mut tag = format!("{}-{}-{}", self.order_tag_prefix, stage, id);
+        // Kite Connect enforces [a-zA-Z0-9] only — no hyphens allowed.
+        let mut tag = format!("{}{}{}", self.order_tag_prefix, stage, id);
         if tag.len() > 20 {
             tag.truncate(20);
         }
@@ -859,6 +1069,7 @@ impl OptionsEngine {
         if disconnected {
             warn!("Live order update channel disconnected; switching to simulation-only status polling off");
             self.order_updates_rx = None;
+            self.order_tx = None;
         }
 
         for update in updates {
@@ -867,25 +1078,41 @@ impl OptionsEngine {
     }
 
     fn handle_order_update(&mut self, update: OrderUpdate) {
-        let idx_opt = self.pending_entry_orders
-            .iter()
-            .position(|p| p.tag == update.tag);
-        let Some(idx) = idx_opt else {
+        if let Some(idx) = self.pending_entry_orders.iter().position(|p| p.tag == update.tag) {
+            self.handle_entry_order_update(idx, update);
             return;
-        };
+        }
+        if let Some(idx) = self.pending_exit_orders.iter().position(|p| p.tag == update.tag) {
+            self.handle_exit_order_update(idx, update);
+            return;
+        }
+    }
 
+    fn handle_entry_order_update(&mut self, idx: usize, update: OrderUpdate) {
         if let Some(order_id) = update.order_id.clone() {
             self.pending_entry_orders[idx].order_id = Some(order_id);
         }
 
         if let Some(msg) = update.message.as_deref() {
-            if update.source == "place_error" {
-                warn!("Entry order {} failed to place: {}", update.tag, msg);
-                self.release_pending_entry(idx, true, "BUY place failed");
-                return;
-            }
-            if update.source == "status_error" {
-                warn!("Entry order {} status lookup issue: {}", update.tag, msg);
+            match update.source.as_str() {
+                "place_error" => {
+                    warn!("Entry order {} failed to place: {}", update.tag, msg);
+                    self.release_pending_entry(idx, true, "BUY place failed");
+                    return;
+                }
+                "cancel_error" => {
+                    // Cancel API call failed transiently. poll_pending_orders() will
+                    // retry via last_cancel_attempt_ms backoff — no action needed here.
+                    warn!(
+                        "Entry order {} cancel failed (will retry): {}",
+                        update.tag, msg
+                    );
+                    return;
+                }
+                "status_error" => {
+                    warn!("Entry order {} status lookup issue: {}", update.tag, msg);
+                }
+                _ => {}
             }
         }
 
@@ -902,81 +1129,222 @@ impl OptionsEngine {
 
         if is_complete {
             let avg_price = update.average_price.unwrap_or(0.0);
-            if self
-                .pending_entry_orders
-                .get(idx)
-                .map(|p| p.released_after_timeout)
-                .unwrap_or(false)
-            {
+            // Split policy: whether to keep or immediately exit a fill that arrived
+            // while a cancel was in-flight depends on WHY the cancel was triggered.
+            //
+            // Timeout          → keep. Price finally came to our level; capital was
+            //                    reserved the whole time; no double-exposure; engine
+            //                    state is valid. Entering is fine.
+            //
+            // PriceReversal    → flatten. LTP had already dropped >15% — the option
+            // ScanDirectionFlip  was losing value when the cancel fired. By the time
+            // ScanScoreCollapse  the fill arrives the engine may be looking the other
+            //                    way. Immediately exit to avoid trading against the
+            //                    engine's current view.
+            let should_flatten = matches!(
+                self.pending_entry_orders[idx].cancel_reason,
+                Some(CancelReasonKind::PriceReversal)
+                    | Some(CancelReasonKind::ScanDirectionFlip)
+                    | Some(CancelReasonKind::ScanScoreCollapse)
+            );
+            if should_flatten {
+                warn!(
+                    "Entry fill arrived after direction-based cancel [{}] tag={} avg=₹{:.2} — flattening immediately",
+                    self.pending_entry_orders[idx].cancel_reason.map(|r| r.as_str()).unwrap_or("?"),
+                    update.tag, avg_price
+                );
                 self.flatten_stale_filled_entry(idx, avg_price);
             } else {
                 self.promote_filled_entry(idx, avg_price);
             }
         } else if is_terminal_reject {
-            let released = self.pending_entry_orders[idx].released_after_timeout;
-            let reason = if self.pending_entry_orders[idx].stale_timeout_hit {
-                format!("Stale entry order terminal status {}", status_upper)
-            } else {
-                format!("Entry order terminal status {}", status_upper)
-            };
-            self.release_pending_entry(idx, !released, &reason);
+            let filled_qty = update.filled_quantity.unwrap_or(0);
+            let avg_price  = update.average_price.unwrap_or(0.0);
+
+            if filled_qty > 0 {
+                // Partial fill before cancel: we own `filled_qty` lots at the broker
+                // but the engine has no Position for them.  Place an immediate MARKET
+                // SELL for exactly the filled quantity and track it so failures surface.
+                let pending = &self.pending_entry_orders[idx];
+                let exit_tag = self.build_order_tag("EXIT", pending.pos_id);
+                let tradingsymbol = pending.tradingsymbol.clone();
+                let pos_id = pending.pos_id;
+                error!(
+                    "Partial fill on cancelled entry: tag={} filled_qty={} avg=₹{:.2} — placing emergency SELL {}",
+                    update.tag, filled_qty, avg_price, exit_tag
+                );
+                let now_ms = self.current_time_ms();
+                self.send_order_command(OrderCommand::Place(PlaceOrderCmd {
+                    tag: exit_tag.clone(),
+                    tradingsymbol,
+                    quantity: filled_qty,
+                    side: OrderSide::Sell,
+                    limit_price: None,
+                }));
+                self.pending_exit_orders.push(PendingExitOrder {
+                    pos_id,
+                    tag: exit_tag.clone(),
+                    placed_ms: now_ms,
+                    last_status_poll_ms: 0,
+                    reason: "PARTIAL FILL EXIT".to_string(),
+                });
+                self.send_order_command(OrderCommand::StatusByTag { tag: exit_tag });
+            }
+
+            let cancel_reason_str = self.pending_entry_orders[idx]
+                .cancel_reason
+                .map(|r| r.as_str())
+                .unwrap_or("broker-initiated");
+            let reason = format!(
+                "Entry order {} — cancel reason: {}{}",
+                status_upper,
+                cancel_reason_str,
+                if filled_qty > 0 { " (partial fill — emergency exit placed)" } else { "" }
+            );
+            self.release_pending_entry(idx, true, &reason);
         }
     }
 
-    fn poll_pending_entry_orders(&mut self) {
-        if !self.live_mode_enabled() || self.pending_entry_orders.is_empty() {
+    fn handle_exit_order_update(&mut self, idx: usize, update: OrderUpdate) {
+        if let Some(msg) = update.message.as_deref() {
+            if update.source == "place_error" {
+                warn!("Exit order {} failed to place: {}", update.tag, msg);
+                let pending = self.pending_exit_orders.remove(idx);
+                if let Some(pos) = self.positions.iter_mut().find(|p| p.id == pending.pos_id) {
+                    pos.exit_pending = false;
+                }
+                return;
+            }
+        }
+        let status = update.status.unwrap_or_default();
+        if status.is_empty() { return; }
+        let status_upper = status.to_ascii_uppercase();
+        let is_complete = status_upper == "COMPLETE";
+        let is_terminal_reject = status_upper == "REJECTED" || status_upper == "CANCELLED" || status_upper == "CANCELED" || status_upper == "EXPIRED";
+
+        // Exits that have no matching engine Position (EMERGENCY FLATTEN, PARTIAL FILL EXIT)
+        // are untracked by design — handle them separately before the normal path.
+        let is_untracked = self
+            .pending_exit_orders
+            .get(idx)
+            .map(|p| p.reason == "EMERGENCY FLATTEN" || p.reason == "PARTIAL FILL EXIT")
+            .unwrap_or(false);
+
+        if is_complete {
+            let avg_price = update.average_price.unwrap_or(0.0);
+            let pending = self.pending_exit_orders.remove(idx);
+            if is_untracked {
+                warn!(
+                    "[{}] SELL complete tag={} avg=₹{:.2} — broker position closed",
+                    pending.reason, pending.tag, avg_price
+                );
+            } else if let Some(pos_idx) = self.positions.iter().position(|p| p.id == pending.pos_id) {
+                self.finalize_position_close(pos_idx, avg_price, pending.reason);
+            }
+        } else if is_terminal_reject {
+            let pending = self.pending_exit_orders.remove(idx);
+            if is_untracked {
+                // SELL itself failed — broker-side position may still be open.
+                error!(
+                    "[{}] SELL REJECTED ({}) tag={} — broker position may still be OPEN. MANUAL INTERVENTION REQUIRED.",
+                    pending.reason, status_upper, pending.tag
+                );
+            } else {
+                warn!("Exit order {} terminal status {}. Will re-attempt exit later.", pending.tag, status_upper);
+                if let Some(pos) = self.positions.iter_mut().find(|p| p.id == pending.pos_id) {
+                    pos.exit_pending = false;
+                }
+            }
+        }
+    }
+
+    fn poll_pending_orders(&mut self) {
+        if !self.live_mode_enabled() || (self.pending_entry_orders.is_empty() && self.pending_exit_orders.is_empty()) {
             return;
         }
+        const CANCEL_RETRY_INTERVAL_MS: u64 = 15_000;
         let now = self.current_time_ms();
         let mut status_tags: Vec<String> = Vec::new();
         let mut cancel_tags: Vec<String> = Vec::new();
-        let mut stale_indices: Vec<usize> = Vec::new();
+        let reversal_pct = self.limit_cancel_reversal_pct;
 
-        for (idx, pending) in self.pending_entry_orders.iter_mut().enumerate() {
+        for pending in self.pending_entry_orders.iter_mut() {
+            // ── Retry path: cancel was already sent but not yet confirmed ──────────────
+            // Capital stays reserved until broker returns CANCELLED/REJECTED (Issue 1 fix).
+            // Re-send CancelByTag every CANCEL_RETRY_INTERVAL_MS to handle transient
+            // failures (Issue 2 fix).
+            if pending.cancel_requested {
+                if now.saturating_sub(pending.last_cancel_attempt_ms) >= CANCEL_RETRY_INTERVAL_MS {
+                    pending.last_cancel_attempt_ms = now;
+                    cancel_tags.push(pending.tag.clone());
+                    status_tags.push(pending.tag.clone());
+                    warn!(
+                        "Cancel retry [{}] tag={} — awaiting broker confirmation",
+                        pending.cancel_reason.map(|r| r.as_str()).unwrap_or("unknown"),
+                        pending.tag
+                    );
+                }
+                continue; // don't apply new guards to already-cancelled orders
+            }
+
             let age = now.saturating_sub(pending.placed_ms);
-            if age >= self.entry_order_timeout_ms && !pending.cancel_requested {
+
+            // 1. Hard timeout — cancel after configured window.
+            if age >= self.entry_order_timeout_ms {
                 pending.cancel_requested = true;
-                pending.stale_timeout_hit = true;
+                pending.cancel_reason = Some(CancelReasonKind::Timeout);
+                pending.last_cancel_attempt_ms = now;
                 cancel_tags.push(pending.tag.clone());
                 status_tags.push(pending.tag.clone());
-                stale_indices.push(idx);
                 warn!(
-                    "Entry order stale (> {}s): {} — cancel requested",
-                    self.entry_order_timeout_ms / 1000,
-                    pending.tag
+                    "Entry order [timeout {}s] tag={} — cancelling unfilled limit order; capital held until broker confirms",
+                    self.entry_order_timeout_ms / 1000, pending.tag
                 );
                 continue;
             }
 
+            // 2. Price-reversal guard — option LTP dropped >reversal_pct below limit.
+            if let Some(tick) = self.store.get(pending.token) {
+                if tick.ltp > 0.01 {
+                    let threshold = pending.signal_price * (1.0 - reversal_pct);
+                    if tick.ltp < threshold {
+                        pending.cancel_requested = true;
+                        pending.cancel_reason = Some(CancelReasonKind::PriceReversal);
+                        pending.last_cancel_attempt_ms = now;
+                        cancel_tags.push(pending.tag.clone());
+                        status_tags.push(pending.tag.clone());
+                        warn!(
+                            "Entry order [price reversal] tag={} — LTP ₹{:.2} is {:.1}% below limit ₹{:.2}; capital held until broker confirms",
+                            pending.tag,
+                            tick.ltp,
+                            (1.0 - tick.ltp / pending.signal_price) * 100.0,
+                            pending.signal_price
+                        );
+                        continue;
+                    }
+                }
+            }
+
+            // 3. Regular status poll.
             if now.saturating_sub(pending.last_status_poll_ms) >= self.order_status_poll_interval_ms {
                 pending.last_status_poll_ms = now;
                 status_tags.push(pending.tag.clone());
             }
         }
 
-        for idx in stale_indices {
-            self.mark_pending_entry_stale(idx, "Stale order timeout");
+        for pending in self.pending_exit_orders.iter_mut() {
+            if now.saturating_sub(pending.last_status_poll_ms) >= self.order_status_poll_interval_ms {
+                pending.last_status_poll_ms = now;
+                status_tags.push(pending.tag.clone());
+            }
         }
+
         for tag in cancel_tags {
             self.send_order_command(OrderCommand::CancelByTag { tag });
         }
         for tag in status_tags {
             self.send_order_command(OrderCommand::StatusByTag { tag });
         }
-    }
-
-    fn mark_pending_entry_stale(&mut self, idx: usize, reason: &str) {
-        if idx >= self.pending_entry_orders.len() {
-            return;
-        }
-        let pending = &mut self.pending_entry_orders[idx];
-        if pending.released_after_timeout {
-            return;
-        }
-        pending.released_after_timeout = true;
-        self.pending_capital_reserved = (self.pending_capital_reserved - pending.estimated_capital).max(0.0);
-        self.entry_rejections += 1;
-        warn!("Pending entry marked stale [{}] tag={}", reason, pending.tag);
     }
 
     fn release_pending_entry(&mut self, idx: usize, count_as_rejection: bool, reason: &str) {
@@ -993,44 +1361,29 @@ impl OptionsEngine {
         warn!("Pending entry released [{}] tag={}", reason, pending.tag);
     }
 
-    fn promote_filled_entry(&mut self, idx: usize, broker_avg_price: f64) {
+    fn promote_filled_entry(&mut self, idx: usize, broker_avg_price: f64) -> bool {
         if idx >= self.pending_entry_orders.len() {
-            return;
+            return false;
         }
         let pending = self.pending_entry_orders.remove(idx);
         if !pending.released_after_timeout {
             self.pending_capital_reserved = (self.pending_capital_reserved - pending.estimated_capital).max(0.0);
         }
-        self.open_filled_position_from_pending(pending, broker_avg_price);
+        self.open_filled_position_from_pending(pending, broker_avg_price)
     }
 
     fn flatten_stale_filled_entry(&mut self, idx: usize, broker_avg_price: f64) {
         if idx >= self.pending_entry_orders.len() {
             return;
         }
-        let pending = self.pending_entry_orders.remove(idx);
-        if !pending.released_after_timeout {
-            self.pending_capital_reserved = (self.pending_capital_reserved - pending.estimated_capital).max(0.0);
+        warn!("Stale entry filled late | avg={:.2} -> opening Position and initiating tracking exit", broker_avg_price);
+        if self.promote_filled_entry(idx, broker_avg_price) {
+            let new_idx = self.positions.len().saturating_sub(1);
+            self.close_position_at(new_idx, broker_avg_price, "STALE FLATTEN".to_string());
+            // A stale flatten is a bookkeeping close, not a real trade execution.
+            // Do not consume a daily trade slot for it.
+            self.daily_trades_opened = self.daily_trades_opened.saturating_sub(1);
         }
-
-        let quantity = pending.signal.lots.saturating_mul(pending.signal.lot_size);
-        if quantity == 0 || pending.tradingsymbol.is_empty() {
-            return;
-        }
-
-        warn!(
-            "Stale entry filled late | tag={} avg={:.2} -> sending immediate SELL flatten order",
-            pending.tag,
-            broker_avg_price
-        );
-        let exit_tag = self.build_order_tag("EXIT", pending.pos_id);
-        self.send_order_command(OrderCommand::Place(PlaceOrderCmd {
-            tag: exit_tag.clone(),
-            tradingsymbol: pending.tradingsymbol,
-            quantity,
-            side: OrderSide::Sell,
-        }));
-        self.send_order_command(OrderCommand::StatusByTag { tag: exit_tag });
     }
 
     pub fn diagnostics(&self) -> (u64, u64, u64, u64, u64, usize) {
@@ -1063,6 +1416,15 @@ impl OptionsEngine {
                 tokio::time::Duration::from_secs(self.scan_interval_secs)
             );
 
+            // Capital refresh: every hour + after every trade close.
+            // First tick fires immediately — skip it so we don't double-fetch at startup.
+            let mut capital_timer = {
+                let mut t = tokio::time::interval(tokio::time::Duration::from_secs(3600));
+                t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                t
+            };
+            capital_timer.tick().await; // consume the immediate first tick
+
             loop {
                 tokio::select! {
                     tick_result = rx.recv() => {
@@ -1070,7 +1432,7 @@ impl OptionsEngine {
                             Ok(_event) => {
                                 self.clear_clock_override();
                                 self.process_order_updates();
-                                self.poll_pending_entry_orders();
+                                self.poll_pending_orders();
                                 self.check_open_positions();
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -1090,10 +1452,18 @@ impl OptionsEngine {
                             continue;
                         }
 
+                        // Sync capital after a trade closed in a previous tick cycle.
+                        if self.capital_sync_needed {
+                            self.sync_capital_from_kite().await;
+                        }
+
                         self.scan_count += 1;
                         self.process_order_updates();
-                        self.poll_pending_entry_orders();
+                        self.poll_pending_orders();
                         self.run_full_scan();
+                    }
+                    _ = capital_timer.tick() => {
+                        self.sync_capital_from_kite().await;
                     }
                 }
             }
@@ -1139,12 +1509,53 @@ impl OptionsEngine {
                 self.risk.max_daily_loss_fraction * 100.0);
         }
 
-        let midday_threshold = if matches!(session, SessionPhase::Midday) { 78.0 } else { self.min_confidence };
+        // Hard entry cutoff: no new position entries after 15:00 IST.
+        // Afternoon phase runs until 15:14, so we must check IST time explicitly.
+        let ist_mins = {
+            let now_utc = Utc.timestamp_millis_opt(self.current_time_ms() as i64)
+                .single()
+                .unwrap_or_else(Utc::now);
+            let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
+            let now_ist = now_utc.with_timezone(&ist);
+            now_ist.hour() * 60 + now_ist.minute()
+        };
+        let past_entry_cutoff = ist_mins >= 900; // 15:00 IST = 900 mins from midnight
+        if past_entry_cutoff && !matches!(session, SessionPhase::Closing | SessionPhase::AfterMarket) {
+            warn!("Entry cutoff: no new signals after 15:00 IST (current IST {:02}:{:02})",
+                ist_mins / 60, ist_mins % 60);
+        }
+
+        // Midday uses a floor of 70 to keep IVExpansion reachable (max ~73),
+        // but never drop below min_confidence so the configured floor is always respected.
+        let midday_threshold = if matches!(session, SessionPhase::Midday) {
+            self.min_confidence.max(70.0)
+        } else {
+            self.min_confidence
+        };
         let mut pending_batch: Vec<(Signal, usize)> = Vec::new();
 
-        if !circuit_broken && !matches!(session, SessionPhase::OpeningBell | SessionPhase::Closing) {
+        let now_ms = self.current_time_ms();
+        if !circuit_broken && !past_entry_cutoff && !matches!(session, SessionPhase::OpeningBell | SessionPhase::Closing) {
             for (snap_idx, snap) in snapshots.iter().enumerate() {
                 let signals = self.generate_signals(snap);
+                let best_score = signals.iter().map(|s| s.confidence).fold(0.0_f64, f64::max);
+                // Dominant action: take from the highest-scoring signal (all signals from one
+                // scan share the same dominant direction; Hold means no signal fired).
+                let dominant_action = signals.iter()
+                    .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal))
+                    .map(|s| s.action)
+                    .unwrap_or(SignalAction::Hold);
+                self.last_scan_result.insert(snap.underlying.clone(), LastScanResult {
+                    action: dominant_action,
+                    best_score,
+                    scanned_at_ms: now_ms,
+                });
+                let best = best_score as i32;
+                warn!("Scan #{} {} {:?} spot={:.0} atm_iv={:.1}% iv_rank={:.0} pcr={:.2} best_score={} threshold={:.0} signals_above={}",
+                    self.scan_count, snap.underlying, session, snap.spot,
+                    snap.atm_iv * 100.0, snap.iv_rank, snap.pcr_oi,
+                    best, midday_threshold,
+                    signals.iter().filter(|s| s.confidence >= midday_threshold).count());
                 for signal in signals {
                     if signal.confidence >= midday_threshold {
                         pending_batch.push((signal, snap_idx));
@@ -1153,10 +1564,18 @@ impl OptionsEngine {
             }
         }
 
-        let cross_ce = pending_batch.iter().any(|(s, _)| s.underlying == "NIFTY" && s.action == SignalAction::BuyCE)
-            && pending_batch.iter().any(|(s, _)| s.underlying == "BANKNIFTY" && s.action == SignalAction::BuyCE);
-        let cross_pe = pending_batch.iter().any(|(s, _)| s.underlying == "NIFTY" && s.action == SignalAction::BuyPE)
-            && pending_batch.iter().any(|(s, _)| s.underlying == "BANKNIFTY" && s.action == SignalAction::BuyPE);
+        // Cross-underlying confirmation: if ≥2 underlyings signal the same direction,
+        // boost all matching signals. Works for any combination (NIFTY+NIFTYNXT50).
+        let ce_underlyings: std::collections::HashSet<&str> = pending_batch.iter()
+            .filter(|(s, _)| s.action == SignalAction::BuyCE)
+            .map(|(s, _)| s.underlying.as_str())
+            .collect();
+        let pe_underlyings: std::collections::HashSet<&str> = pending_batch.iter()
+            .filter(|(s, _)| s.action == SignalAction::BuyPE)
+            .map(|(s, _)| s.underlying.as_str())
+            .collect();
+        let cross_ce = ce_underlyings.len() >= 2;
+        let cross_pe = pe_underlyings.len() >= 2;
 
         for (signal, snap_idx) in &mut pending_batch {
             let boosted = (cross_ce && signal.action == SignalAction::BuyCE)
@@ -1165,7 +1584,7 @@ impl OptionsEngine {
                 let boost = 8.0_f64;
                 signal.confidence = (signal.confidence + boost).min(100.0);
                 signal.reasons.insert(0, (
-                    format!("Cross-underlying NIFTY+BANKNIFTY confirmation: both show same direction"),
+                    format!("Cross-underlying confirmation: ≥2 indices signal same direction"),
                     boost,
                 ));
                 info!("  Cross-confirm: {} {} boosted to {:.0} confidence",
@@ -1176,12 +1595,103 @@ impl OptionsEngine {
             }
         }
 
-        for (signal, _) in pending_batch {
-            self.pending_signals.push_back(signal);
+        let in_warmup = self.warmup_until_ms
+            .map_or(false, |wu| self.current_time_ms() < wu);
+        if in_warmup {
+            info!("Warmup active: {} signal(s) suppressed (clock {} ms)", pending_batch.len(), self.current_time_ms());
+        } else {
+            for (signal, _) in pending_batch {
+                self.pending_signals.push_back(signal);
+            }
         }
+
+        // After every scan, re-validate any pending limit entry orders against the
+        // freshly computed scan results.
+        self.validate_pending_entries_against_scan();
 
         if self.scan_count % 10 == 0 {
             self.log_portfolio_summary();
+        }
+    }
+
+    /// After each scan cycle, check every pending (unfilled) limit entry order to see
+    /// if the engine's view of the market has changed enough to warrant cancellation.
+    ///
+    /// Two cancellation triggers:
+    ///   1. Direction flip  — new scan's dominant action is opposite to the pending order.
+    ///   2. Score collapse  — best composite score fell below 40, meaning all strategy
+    ///      signals have gone quiet (market has gone flat/undecided).
+    ///
+    /// A marginal score drop (e.g. 65→55) is intentionally ignored; only a definitive
+    /// reversal or complete signal collapse justifies pulling an already-queued order.
+    fn validate_pending_entries_against_scan(&mut self) {
+        if !self.live_mode_enabled() || self.pending_entry_orders.is_empty() {
+            return;
+        }
+        const SCORE_COLLAPSE_THRESHOLD: f64 = 40.0;
+        let now = self.current_time_ms();
+        let mut cancel_tags: Vec<(String, CancelReasonKind, String)> = Vec::new();
+
+        for pending in self.pending_entry_orders.iter_mut() {
+            if pending.cancel_requested {
+                continue;
+            }
+            // Once the order has been placed at the broker (order_id is set), scan-based
+            // validation is moot. MARKET orders fill in <1ms; LIMIT orders that are already
+            // live at the exchange are handled by poll_pending_orders (timeout / price-reversal).
+            // Marking a just-placed order here causes legitimate fills to be flattened.
+            if pending.order_id.is_some() {
+                continue;
+            }
+            // Don't apply scan-based cancellation to orders placed in the current scan cycle.
+            // execute_pending_signals() runs at the START of run_full_scan() — the Place command
+            // hasn't even reached the broker yet when validate runs at the END of the same call.
+            // Waiting until the next scan (scan_count > placed_at_scan_count) gives the broker
+            // time to confirm the fill and set order_id, at which point the guard above applies.
+            if pending.placed_at_scan_count >= self.scan_count {
+                continue;
+            }
+            let result = match self.last_scan_result.get(&pending.signal.underlying) {
+                Some(r) => r.clone(),
+                None => continue,
+            };
+
+            let direction_flipped = matches!(
+                (pending.signal.action, result.action),
+                (SignalAction::BuyCE, SignalAction::BuyPE) | (SignalAction::BuyPE, SignalAction::BuyCE)
+            );
+            let score_collapsed = result.best_score < SCORE_COLLAPSE_THRESHOLD;
+
+            if direction_flipped {
+                pending.cancel_requested = true;
+                pending.cancel_reason = Some(CancelReasonKind::ScanDirectionFlip);
+                pending.last_cancel_attempt_ms = now;
+                cancel_tags.push((
+                    pending.tag.clone(),
+                    CancelReasonKind::ScanDirectionFlip,
+                    format!("pending={} new_scan={:?} score={:.0}",
+                        pending.signal.action, result.action, result.best_score),
+                ));
+            } else if score_collapsed {
+                pending.cancel_requested = true;
+                pending.cancel_reason = Some(CancelReasonKind::ScanScoreCollapse);
+                pending.last_cancel_attempt_ms = now;
+                cancel_tags.push((
+                    pending.tag.clone(),
+                    CancelReasonKind::ScanScoreCollapse,
+                    format!("best_score={:.0} (below {SCORE_COLLAPSE_THRESHOLD})", result.best_score),
+                ));
+            }
+        }
+
+        // Capital stays reserved until broker confirms — Issue 1 fix.
+        for (tag, kind, detail) in cancel_tags {
+            warn!(
+                "Entry order [{}] tag={} — {}; capital held until broker confirms",
+                kind.as_str(), tag, detail
+            );
+            self.send_order_command(OrderCommand::CancelByTag { tag: tag.clone() });
+            self.send_order_command(OrderCommand::StatusByTag { tag });
         }
     }
 
@@ -1203,11 +1713,37 @@ impl OptionsEngine {
             return;
         }
 
+        // Enforce hard 15:00 entry cutoff: a signal queued at 14:59 would normally
+        // execute 30s later at 15:00+. Discard any pending signals once IST >= 15:00.
+        let exec_ist_mins = {
+            let now_utc = Utc.timestamp_millis_opt(self.current_time_ms() as i64)
+                .single()
+                .unwrap_or_else(Utc::now);
+            let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
+            let now_ist = now_utc.with_timezone(&ist);
+            now_ist.hour() * 60 + now_ist.minute()
+        };
+        if exec_ist_mins >= 900 {
+            let n = self.pending_signals.len();
+            if n > 0 {
+                warn!("Entry cutoff: discarding {} queued signal(s) — past 15:00 IST", n);
+                self.pending_signals.clear();
+            }
+            return;
+        }
+
+        let min_delay_ms: u64 = 30_000;
         let max_age_ms = self.scan_interval_secs.saturating_mul(2_000);
 
         let pending: Vec<Signal> = self.pending_signals.drain(..).collect();
+        let mut requeue: Vec<Signal> = Vec::new();
         for mut signal in pending {
             let age_ms = self.current_time_ms().saturating_sub(signal.timestamp_ms);
+            if age_ms < min_delay_ms {
+                // Too young — re-queue; enforce per-signal delay, not just oldest.
+                requeue.push(signal);
+                continue;
+            }
             if age_ms > max_age_ms {
                 warn!("Pending signal #{}: stale ({:.0}s old), discarding",
                     signal.id, age_ms as f64 / 1000.0);
@@ -1229,7 +1765,11 @@ impl OptionsEngine {
                     .unwrap_or(0),
                 _ => 0,
             };
-            if token == 0 { continue; }
+            if token == 0 {
+                warn!("Pending signal #{}: no contract found for {} {:?} strike={:.0}, discarding",
+                    signal.id, signal.underlying, signal.action, signal.strike);
+                continue;
+            }
 
             let fresh_ltp = match self.store.get(token) {
                 Some(t) if t.ltp > 0.01 => t.ltp,
@@ -1248,7 +1788,7 @@ impl OptionsEngine {
 
             signal.option_price = fresh_ltp;
 
-            let post_stop_cooldown_ms: u64 = 10 * 60 * 1_000;
+            let post_stop_cooldown_ms: u64 = self.progressive_cooldown_ms();
             if self.recent_stop_loss_block(
                 &signal.underlying,
                 &signal.action,
@@ -1266,14 +1806,26 @@ impl OptionsEngine {
 
             self.open_simulated_position(&signal);
         }
+        for sig in requeue {
+            self.pending_signals.push_back(sig);
+        }
     }
 
 
-    fn estimate_synthetic_spot(&self, strike_map: &BTreeMap<u64, StrikeLevel>) -> Option<f64> {
+    fn estimate_synthetic_spot(
+        &self,
+        strike_map: &BTreeMap<u64, StrikeLevel>,
+        t_years: f64,
+    ) -> Option<f64> {
+        // Correct put-call parity: C - P = S·e^{-qT} - K·e^{-rT}
+        // Solving for S (with q≈0 for NSE indices):  S = K·e^{-rT} + C - P
+        // The naive K + C - P formula underestimates S by K·(1 - e^{-rT}),
+        // which is ~22 pts on NIFTY at 5 DTE and ~130 pts at 30 DTE.
+        let discount = (-self.risk_free_rate * t_years).exp();
         let mut implied_spots = Vec::new();
         for level in strike_map.values() {
             if level.ce_ltp > 0.01 && level.pe_ltp > 0.01 {
-                let implied = level.strike + level.ce_ltp - level.pe_ltp;
+                let implied = level.strike * discount + level.ce_ltp - level.pe_ltp;
                 if implied.is_finite() && implied > 0.0 {
                     implied_spots.push(implied);
                 }
@@ -1327,15 +1879,15 @@ impl OptionsEngine {
 
             let prev_oi = *self.prev_oi.get(&contract.instrument_token).unwrap_or(&0);
             let curr_oi = tick.oi as u64;
-            let prev_ts = *self.prev_exch_ts.get(&contract.instrument_token).unwrap_or(&0);
-            let curr_ts = tick.exchange_ts;
-            let oi_change = if curr_ts > 0 && curr_ts != prev_ts && curr_oi > 0 {
+            // Simple scan-to-scan delta: if OI didn't change the delta is 0 naturally.
+            // The old exchange_ts guard was blocking valid OI changes when the exchange
+            // sent a fresh OI packet but exchange_ts happened to equal the previous scan's ts.
+            let oi_change = if curr_oi > 0 {
                 curr_oi as i64 - prev_oi as i64
             } else {
                 0i64
             };
             self.prev_oi.insert(contract.instrument_token, curr_oi);
-            self.prev_exch_ts.insert(contract.instrument_token, curr_ts);
 
             match contract.option_type {
                 OptionType::CE => {
@@ -1361,13 +1913,26 @@ impl OptionsEngine {
 
         let min_strike = strike_map.values().map(|s| s.strike).fold(f64::INFINITY, f64::min);
         let max_strike = strike_map.values().map(|s| s.strike).fold(f64::NEG_INFINITY, f64::max);
-        let strike_mid = (min_strike + max_strike) / 2.0;
+
+        // Compute chain center from liquid near-ATM strikes only (both CE and PE have ltp).
+        // Using (min+max)/2 across all strikes is unreliable when a wide strike range is
+        // configured — deep ITM PE options with no matching CE pull min_strike far below ATM,
+        // biasing strike_mid and causing far_from_chain to falsely reject the index token.
+        let liquid_center: Option<f64> = {
+            let mut liquid: Vec<f64> = strike_map.values()
+                .filter(|l| l.ce_ltp > 0.01 && l.pe_ltp > 0.01)
+                .map(|l| l.strike)
+                .collect();
+            liquid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            if liquid.is_empty() { None } else { Some(liquid[liquid.len() / 2]) }
+        };
+        let strike_mid = liquid_center.unwrap_or_else(|| (min_strike + max_strike) / 2.0);
 
         let spot_from_token = self.underlying_tokens.get(underlying)
             .and_then(|tok| self.store.get(*tok))
             .map(|t| t.ltp)
             .filter(|v| *v > 0.0);
-        let synthetic_spot = self.estimate_synthetic_spot(&strike_map);
+        let synthetic_spot = self.estimate_synthetic_spot(&strike_map, t_years);
 
         let spot = match (spot_from_token, synthetic_spot) {
             (Some(token_spot), Some(synth_spot)) => {
@@ -1396,6 +1961,31 @@ impl OptionsEngine {
             buf.push_back((now_ms, spot));
             while buf.front().map(|(t, _)| now_ms.saturating_sub(*t) > 60 * 60 * 1_000).unwrap_or(false) {
                 buf.pop_front();
+            }
+
+            // Frozen-spot guard: if the spot hasn't moved across the last 6 entries
+            // spanning at least 4 minutes, the WebSocket feed is stale (e.g., 403 auth
+            // failure or disconnection). Bail out so we don't scan on dead data.
+            if buf.len() >= 4 {
+                let tail: Vec<(u64, f64)> = buf.iter().rev().take(4).cloned().collect();
+                let span_ms = tail[0].0.saturating_sub(tail[3].0);
+                if span_ms >= 3 * 60 * 1_000 {
+                    let (min_s, max_s) = tail.iter().fold(
+                        (f64::MAX, f64::MIN),
+                        |(mn, mx), (_, v)| (mn.min(*v), mx.max(*v)),
+                    );
+                    // A truly dead store returns the exact same stored value every scan.
+                    // Use an absolute threshold (< 0.5 points = sub-tick movement) rather
+                    // than a percentage: a percentage fires on quiet backtest afternoons where
+                    // the spot legitimately moves only 10-15 points over 30 minutes.
+                    if max_s > 0.0 && (max_s - min_s) < 0.5 {
+                        warn!(
+                            "{} spot frozen at {:.0} for {}min — stale WebSocket feed, skipping scan",
+                            underlying, spot, span_ms / 60_000
+                        );
+                        return None;
+                    }
+                }
             }
         }
 
@@ -1444,7 +2034,13 @@ impl OptionsEngine {
 
         for level in strike_map.values_mut() {
             level.straddle_premium = level.ce_ltp + level.pe_ltp;
-            level.iv_skew = level.ce_iv - level.pe_iv;
+            // Only compute skew when both sides solved; zero-IV from a failed Newton-Raphson
+            // solve would otherwise fabricate a skew signal.
+            level.iv_skew = if level.ce_iv > 0.001 && level.pe_iv > 0.001 {
+                level.ce_iv - level.pe_iv
+            } else {
+                f64::NAN
+            };
             level.ce_pe_oi_ratio = if level.pe_oi > 0 {
                 level.ce_oi as f64 / level.pe_oi as f64
             } else {
@@ -1471,12 +2067,24 @@ impl OptionsEngine {
             .min_by(|a, b| (a.strike - spot).abs().partial_cmp(&(b.strike - spot).abs()).unwrap());
 
         let atm_strike = atm_level.map(|l| l.strike).unwrap_or(spot);
-        let atm_iv = atm_level.map(|l| (l.ce_iv + l.pe_iv) / 2.0).unwrap_or(0.0);
+        // Average only valid IV sides; a failed Newton-Raphson solve leaves the field at 0.0
+        // which would halve atm_iv and silently corrupt iv_rank, regime, and skew logic.
+        let atm_iv = atm_level.map(|l| {
+            match (l.ce_iv > 0.001, l.pe_iv > 0.001) {
+                (true, true)  => (l.ce_iv + l.pe_iv) / 2.0,
+                (true, false) => l.ce_iv,
+                (false, true) => l.pe_iv,
+                (false, false) => 0.0,
+            }
+        }).unwrap_or(0.0);
 
-        let lot_size = self.contracts.iter()
-            .find(|c| c.underlying == underlying)
-            .map(|c| c.lot_size)
-            .unwrap_or(NIFTY_LOT_SIZE);
+        let lot_size = match self.contracts.iter().find(|c| c.underlying == underlying).map(|c| c.lot_size) {
+            Some(ls) => ls,
+            None => {
+                warn!("{}: lot_size unknown (no contracts loaded from API) — skipping snapshot", underlying);
+                return None;
+            }
+        };
 
         let net_gex = compute_gex(&strikes, spot, lot_size);
         let iv_rank = self.iv_history.iv_rank(underlying, atm_iv);
@@ -1557,7 +2165,7 @@ impl OptionsEngine {
             }
         }
         prices.reverse();
-        if prices.len() < 6 {
+        if prices.len() < 4 {
             return None;
         }
 
@@ -1664,6 +2272,29 @@ impl OptionsEngine {
         (threshold_pct * 100.0 * 1.4).clamp(0.20, 1.20)
     }
 
+    /// Progressive cooldown: starts tight at open (2 min) and widens each hour.
+    /// Keeps expiry-day gamma scalp opportunities available at open while
+    /// preventing late-session overtrading.
+    ///
+    /// 09:15-10:15 → 2 min | 10:15-11:15 → 4 min | 11:15-12:15 → 6 min
+    /// 12:15-13:15 → 8 min | 13:15-14:15 → 10 min | 14:15-15:00 → 12 min
+    fn progressive_cooldown_ms(&self) -> u64 {
+        let now_utc = Utc.timestamp_millis_opt(self.current_time_ms() as i64)
+            .single().unwrap_or_else(Utc::now);
+        let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
+        let now_ist = now_utc.with_timezone(&ist);
+        let ist_mins = now_ist.hour() * 60 + now_ist.minute();
+        let mins: u64 = match ist_mins {
+            0..=614  => 2,  // 09:15–10:15
+            615..=674 => 4,  // 10:15–11:15
+            675..=734 => 6,  // 11:15–12:15
+            735..=794 => 8,  // 12:15–13:15
+            795..=854 => 10, // 13:15–14:15
+            _         => 12, // 14:15–15:00
+        };
+        mins * 60 * 1_000
+    }
+
     fn detect_regime(
         &self,
         pcr_oi: f64,
@@ -1671,8 +2302,12 @@ impl OptionsEngine {
         spot: f64,
         strikes: &[StrikeLevel],
     ) -> MarketRegime {
-        if atm_iv > 0.25 { return MarketRegime::PanicHighVol; }
-        if atm_iv < 0.11 { return MarketRegime::ComplacencyLowVol; }
+        // Skip IV-based regime gates when atm_iv is zero — that means both CE and PE
+        // IV solves failed for the ATM strike; using 0.0 would wrongly fire ComplacencyLowVol.
+        if atm_iv > 0.001 {
+            if atm_iv > 0.40 { return MarketRegime::PanicHighVol; }
+            if atm_iv < 0.11 { return MarketRegime::ComplacencyLowVol; }
+        }
 
         let avg_skew: f64 = {
             let skews: Vec<f64> = strikes.iter()
@@ -1697,16 +2332,19 @@ impl OptionsEngine {
     fn generate_signals(&mut self, snap: &ChainSnapshot) -> Vec<Signal> {
         let mut signals = Vec::new();
 
-        let lot_size = self.contracts.iter()
-            .find(|c| c.underlying == snap.underlying)
-            .map(|c| c.lot_size)
-            .unwrap_or(NIFTY_LOT_SIZE);
+        let lot_size = match self.contracts.iter().find(|c| c.underlying == snap.underlying).map(|c| c.lot_size) {
+            Some(ls) => ls,
+            None => {
+                warn!("{}: lot_size unknown (no contracts loaded from API) — skipping signal generation", snap.underlying);
+                return signals;
+            }
+        };
 
         if self.positions.iter().any(|p| p.is_open && p.underlying == snap.underlying) {
             return signals;
         }
 
-        let cooldown_ms: u64 = 5 * 60 * 1_000;
+        let cooldown_ms: u64 = self.progressive_cooldown_ms();
         let now_ms = self.current_time_ms();
         if let Some(&last_ms) = self.last_signal_ms.get(&snap.underlying) {
             if now_ms.saturating_sub(last_ms) < cooldown_ms {
@@ -1719,7 +2357,7 @@ impl OptionsEngine {
             .get(&snap.underlying)
             .copied()
             .unwrap_or(0)
-            >= 2
+            >= 3
         {
             return signals;
         }
@@ -1742,8 +2380,31 @@ impl OptionsEngine {
             return signals;
         }
 
+        // IV rank gates — protect against buying structurally overpriced options.
+        //
+        // Gate A: In a low-to-moderate IV environment (atm_iv < 38%), an extremely high
+        // iv_rank (>80%) means options are near the session IV ceiling. Buying at the
+        // peak of today's IV range risks a double loss: adverse spot move + IV crush
+        // back toward the session average. Days with genuinely elevated IV (atm_iv ≥ 38%)
+        // are exempt because a high iv_rank there reflects sustained fear, not a spike.
+        if snap.iv_rank > 80.0 && snap.iv_rank > 0.0 && snap.atm_iv < 0.38 {
+            return signals;
+        }
+        // Gate B: High atm_iv (>38%) combined with low iv_rank (<25%) means IV spiked
+        // earlier in the session and is now compressing — spot has already repriced the
+        // shock and IV is deflating. Buying expensive options into falling IV is a
+        // structural losing trade: spot often bounces (adverse move) while the option
+        // loses value from both theta and IV crush simultaneously.
+        if snap.atm_iv > 0.38 && snap.iv_rank < 25.0 && snap.iv_rank > 0.0 {
+            return signals;
+        }
+
         if let Some(s) = self.strategy_gamma_scalp(snap)   { scored.push(s); }
-        if let Some(s) = self.strategy_iv_expansion(snap)  { scored.push(s); }
+        // IVExpansion requires IV to expand — blocked in compressed regimes where
+        // low volatility is likely to persist, directly contradicting the entry thesis.
+        if !compressive {
+            if let Some(s) = self.strategy_iv_expansion(snap) { scored.push(s); }
+        }
         if let Some(s) = self.strategy_trend_follow(snap)  { scored.push(s); }
         if let Some(s) = self.strategy_max_pain(snap)      { scored.push(s); }
         if let Some(s) = self.strategy_oi_divergence(snap) {
@@ -1760,16 +2421,52 @@ impl OptionsEngine {
             }
         }
 
-        if scored.is_empty() { return signals; }
+        if scored.is_empty() {
+            warn!("  {} gen_signals: all strategies returned None", snap.underlying);
+            return signals;
+        }
 
+        let ce_score: f64 = scored.iter().filter(|(a, _, _, _)| *a == SignalAction::BuyCE).map(|(_, s, _, _)| *s).sum();
+        let pe_score: f64 = scored.iter().filter(|(a, _, _, _)| *a == SignalAction::BuyPE).map(|(_, s, _, _)| *s).sum();
         let ce_count = scored.iter().filter(|(a, _, _, _)| *a == SignalAction::BuyCE).count();
         let pe_count = scored.iter().filter(|(a, _, _, _)| *a == SignalAction::BuyPE).count();
+        warn!("  {} gen_signals: strategies_fired={} CE={} (score={:.0}) PE={} (score={:.0})",
+            snap.underlying, scored.len(), ce_count, ce_score, pe_count, pe_score);
+        for (action, score, strat, _) in &scored {
+            warn!("    {:?} {:.0} -> {:?}", action, score, strat);
+        }
 
-        let dominant_action = if ce_count > pe_count { SignalAction::BuyCE }
-                              else if pe_count > ce_count { SignalAction::BuyPE }
+        // Use total accumulated score to pick direction, not vote count.
+        // Prevents 3 weak CE signals from overriding 2 strong PE signals.
+        let dominant_action = if ce_score > pe_score { SignalAction::BuyCE }
+                              else if pe_score > ce_score { SignalAction::BuyPE }
                               else { SignalAction::Hold };
 
-        if dominant_action == SignalAction::Hold { return signals; }
+        if dominant_action == SignalAction::Hold {
+            warn!("  {} gen_signals: CE/PE tied => Hold, no signal", snap.underlying);
+            return signals;
+        }
+
+        // Symmetric PCR conviction floors.
+        //
+        // For PE: PCR 0.83–0.90 = mild put-writer activity, ambiguous directional edge.
+        //         Require PCR ≤ 0.82 (clear net-put-writing dominance) before shorting
+        //         via puts; weaker signals are frequently wrong in mean-reverting tape.
+        //
+        // For CE: PCR 1.20–1.24 = mild call-writing / slight bullish tilt.
+        //         The Bullish regime threshold is already PCR > 1.20; a signal barely
+        //         above that (1.21–1.24) carries the same ambiguity. Require PCR ≥ 1.25
+        //         for CE entries so only confirmed put-writing excess triggers a long call.
+        if dominant_action == SignalAction::BuyPE && snap.pcr_oi > 0.82 {
+            warn!("  {} gen_signals: PE blocked — PCR {:.2} > 0.82 (weak bearish conviction)",
+                snap.underlying, snap.pcr_oi);
+            return signals;
+        }
+        if dominant_action == SignalAction::BuyCE && snap.pcr_oi < 1.25 {
+            warn!("  {} gen_signals: CE blocked — PCR {:.2} < 1.25 (weak bullish conviction)",
+                snap.underlying, snap.pcr_oi);
+            return signals;
+        }
 
         let dominant_signals: Vec<_> = scored.iter()
             .filter(|(a, _, _, _)| *a == dominant_action)
@@ -1781,8 +2478,8 @@ impl OptionsEngine {
         let (composite_score, merged_reasons, primary_strategy) = {
 
             let max_score = dominant_signals.iter().map(|(_, s, _, _)| *s).fold(0.0_f64, f64::max);
-            let composite = (max_score + dominant_signals.iter().map(|(_, s, _, _)| *s * 0.25).sum::<f64>())
-                .min(100.0);
+            let sum_all = dominant_signals.iter().map(|(_, s, _, _)| *s).sum::<f64>();
+            let composite = (max_score + (sum_all - max_score) * 0.25).min(100.0);
 
             let mut reasons: Vec<(String, f64)> = Vec::new();
             let mut strategy = StrategyType::Composite;
@@ -1795,6 +2492,9 @@ impl OptionsEngine {
             (composite, reasons, strategy)
         };
 
+        let n_dominant = dominant_signals.len();
+        warn!("  {} gen_signals: dominant={:?} composite={:.1} threshold={:.0} strategies={}",
+            snap.underlying, dominant_action, composite_score, self.min_confidence, n_dominant);
         if composite_score < self.min_confidence { return signals; }
 
         let target_strike = self.pick_strike(snap, &dominant_action, lot_size);
@@ -1804,20 +2504,39 @@ impl OptionsEngine {
             _ => 0.0,
         };
 
-        if option_price < 15.0 { return signals; }
+        // Below this floor gamma/theta dominates and transaction costs become disproportionate.
+        warn!("  {} gen_signals: option_price={:.1} (floor={:.0})", snap.underlying, option_price, MIN_TRADEABLE_OPTION_PRICE);
+        if option_price < MIN_TRADEABLE_OPTION_PRICE { return signals; }
 
-        let effective_target_pct = if compressive {
-            (sideways_threshold_pct * 100.0 * 55.0)
-                .clamp(12.0, 28.0)
-                .min(self.profit_target_pct)
-        } else {
-            self.profit_target_pct
-        };
-        let effective_stop_pct = if compressive {
-            (self.stop_loss_pct * effective_target_pct / self.profit_target_pct)
-                .max(self.stop_loss_pct / 2.0)
-        } else {
-            self.stop_loss_pct
+        // Regime-adaptive exits: target and stop calibrated to market character,
+        // not a single fixed config value. Confidence and DTE apply as scalars.
+        let (effective_target_pct, effective_stop_pct) = {
+            // Confidence multiplier: 0.90x at threshold → 1.15x at threshold+30.
+            let conf_norm = ((composite_score - self.min_confidence) / 30.0).clamp(0.0, 1.0);
+            let conf_mult = 0.90 + conf_norm * 0.25;
+
+            if compressive {
+                // Compressed range: target proportional to the measured range, stop floored hard.
+                let comp_target = (sideways_threshold_pct * 100.0 * 55.0).clamp(12.0, 25.0);
+                let comp_stop = (comp_target * 0.70).max(12.0);
+                (comp_target.min(self.profit_target_pct), comp_stop)
+            } else {
+                // Base target/stop by regime character.
+                let (regime_t, regime_s) = match snap.regime {
+                    MarketRegime::StrongBullish | MarketRegime::StrongBearish => (48.0_f64, 22.0_f64),
+                    MarketRegime::Bullish | MarketRegime::Bearish           => (38.0,     20.0),
+                    MarketRegime::PanicHighVol                              => (25.0,     17.0),
+                    MarketRegime::ComplacencyLowVol                         => (22.0,     15.0),
+                    MarketRegime::Neutral | MarketRegime::Sideways          => (30.0,     18.0),
+                };
+                // Expiry day: gamma amplifies moves — allow up to 15% more room on target.
+                let dte_mult = if snap.days_to_expiry <= 1.0 { 1.15 } else { 1.0 };
+                let target = (regime_t * conf_mult * dte_mult).min(self.profit_target_pct);
+                // Stop: wider for high-confidence (more conviction = tolerate more noise).
+                // Floor at 12% — never risk less, as bid-ask alone can span 5-8%.
+                let stop = (regime_s * (2.0 - conf_mult)).clamp(12.0, self.stop_loss_pct);
+                (target, stop)
+            }
         };
 
         let effective_target_pct = {
@@ -1872,6 +2591,14 @@ impl OptionsEngine {
                 self.current_time_ms(),
             ) * lots as f64;
         let risk_reward = if max_loss > 0.0 { max_profit / max_loss } else { 0.0 };
+
+        // Reject trades without sufficient risk-reward edge.
+        // 1.3:1 minimum prevents marginal trades that are more coin-flip than edge.
+        if risk_reward < 1.3 {
+            warn!("  {} signal rejected: R:R {:.2}:1 below 1.3 floor", snap.underlying, risk_reward);
+            return signals;
+        }
+
 
         let session = self.current_session();
         let option_type_str = match dominant_action {
@@ -1967,7 +2694,7 @@ impl OptionsEngine {
 
 
     fn pick_strike<'a>(&self, snap: &'a ChainSnapshot, action: &SignalAction, lot_size: u32) -> Option<&'a StrikeLevel> {
-        let max_affordable = self.risk.available_capital() * 0.60;
+        let deployable_capital = self.available_capital_for_new_orders();
 
         let atm_idx = snap.strikes.iter()
             .enumerate()
@@ -1976,12 +2703,12 @@ impl OptionsEngine {
             })
             .map(|(i, _)| i)?;
 
-        let tier = self.risk.capital_tier();
-        let otm_offset: usize = if tier == 1 { 1 } else { 0 };
-
+        // Always start at ATM regardless of capital tier.
+        // If ATM is unaffordable, the fallback scan below finds the nearest
+        // affordable strike. Forcing OTM early led to unnecessarily far strikes.
         let candidate_idx = match action {
-            SignalAction::BuyCE => (atm_idx + otm_offset).min(snap.strikes.len() - 1),
-            SignalAction::BuyPE => atm_idx.saturating_sub(otm_offset),
+            SignalAction::BuyCE => atm_idx,
+            SignalAction::BuyPE => atm_idx,
             _ => atm_idx,
         };
 
@@ -1992,35 +2719,87 @@ impl OptionsEngine {
             SignalAction::BuyPE => candidate.pe_ltp,
             _ => 0.0,
         };
+        let candidate_cost = one_lot_entry_cost(price, lot_size);
 
-        if price * lot_size as f64 <= max_affordable && price >= 15.0 { Some(candidate) }
-        else {
-            let max_otm = 2usize;
-            match action {
-                SignalAction::BuyCE => {
-                    let end = (atm_idx + max_otm + 1).min(snap.strikes.len());
-                    snap.strikes[atm_idx..end]
-                        .iter()
-                        .find(|s| s.ce_ltp * lot_size as f64 <= max_affordable && s.ce_ltp >= 15.0)
-                }
-                SignalAction::BuyPE => {
-                    let start = atm_idx.saturating_sub(max_otm);
-                    snap.strikes[start..=atm_idx]
-                        .iter()
-                        .rev()
-                        .find(|s| s.pe_ltp * lot_size as f64 <= max_affordable && s.pe_ltp >= 15.0)
-                }
-                _ => Some(candidate),
+        warn!(
+            "  pick_strike {} {:?} lot={} cap={:.0} candidate={:.0} price={:.1} one_lot_cost={:.0}",
+            snap.underlying,
+            action,
+            lot_size,
+            deployable_capital,
+            candidate.strike,
+            price,
+            candidate_cost,
+        );
+        if candidate_cost <= deployable_capital && price >= MIN_TRADEABLE_OPTION_PRICE {
+            return Some(candidate);
+        }
+
+        let (prices, direction) = match action {
+            SignalAction::BuyCE => (
+                snap.strikes.iter().map(|s| s.ce_ltp).collect::<Vec<_>>(),
+                StrikeScanDirection::Up,
+            ),
+            SignalAction::BuyPE => (
+                snap.strikes.iter().map(|s| s.pe_ltp).collect::<Vec<_>>(),
+                StrikeScanDirection::Down,
+            ),
+            _ => return Some(candidate),
+        };
+
+        let (idx_opt, checked) = nearest_affordable_otm_idx(
+            &prices,
+            candidate_idx,
+            direction,
+            lot_size,
+            deployable_capital,
+            MIN_TRADEABLE_OPTION_PRICE,
+        );
+
+        if let Some(idx) = idx_opt {
+            let otm_steps = idx.abs_diff(atm_idx);
+            let picked = &snap.strikes[idx];
+            let picked_price = prices[idx];
+            warn!(
+                "  pick_strike {} {:?} fallback: checked {} strikes, selected {:.0} @ ₹{:.1} ({} OTM steps)",
+                snap.underlying,
+                action,
+                checked,
+                picked.strike,
+                picked_price,
+                otm_steps,
+            );
+            // Don't go more than 3 strikes OTM -- stay close to ATM for delta/gamma exposure
+            if otm_steps > 3 {
+                warn!(
+                    "  pick_strike {} {:?}: {} OTM steps exceeds max 3, skipping",
+                    snap.underlying, action, otm_steps
+                );
+                return None;
             }
+            Some(picked)
+        } else {
+            warn!(
+                "  pick_strike {} {:?} fallback: checked {} strikes, found=false",
+                snap.underlying,
+                action,
+                checked,
+            );
+            None
         }
     }
 
     fn strategy_gamma_scalp(&self, snap: &ChainSnapshot) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
-        if snap.days_to_expiry > 2.5 { return None; }
-        if snap.atm_iv > 0.40 { return None; }
+        if snap.days_to_expiry > 2.0 { return None; }
+        if snap.atm_iv > 0.55 { return None; }
+        // On 1-DTE (day before expiry), block if IV is at session minimum.
+        // iv_rank=0 means IV was higher earlier in the session (crash peak) and is now
+        // compressing — buying options into falling IV on expensive 1-DTE premium is
+        // a double-whammy loss (spot bounce + IV crush). Not applicable on expiry day (DTE<0.5).
+        if snap.days_to_expiry >= 0.5 && snap.iv_rank < 5.0 { return None; }
 
         let session = self.current_session();
-        if !matches!(session, SessionPhase::Morning | SessionPhase::Afternoon) { return None; }
+        if !matches!(session, SessionPhase::Morning | SessionPhase::Midday | SessionPhase::Afternoon) { return None; }
 
         let mut score = 0.0_f64;
         let mut reasons = Vec::new();
@@ -2036,7 +2815,20 @@ impl OptionsEngine {
             reasons.push((format!("{:.1} DTE: moderate gamma", snap.days_to_expiry), 10.0));
         }
 
-        let (action, pcr_score, pcr_reason) = if snap.pcr_oi > 1.3 {
+        // On expiry day (DTE < 0.5), gamma dominates even moderate PCR bias.
+        // Relax thresholds so a slight lean contributes to composite scoring.
+        // Score 18 (not 22) because conviction is lower than extreme PCR; composite still clears 62.
+        let (action, pcr_score, pcr_reason) = if snap.days_to_expiry < 0.5 {
+            if snap.pcr_oi > 1.15 {
+                (SignalAction::BuyCE, 18.0,
+                 format!("PCR {:.2} (mildly bullish): expiry-day put writing supports CE gamma play", snap.pcr_oi))
+            } else if snap.pcr_oi < 0.75 {
+                (SignalAction::BuyPE, 18.0,
+                 format!("PCR {:.2} (bearish): expiry-day call writing supports PE gamma play", snap.pcr_oi))
+            } else {
+                return None;
+            }
+        } else if snap.pcr_oi > 1.3 {
             (SignalAction::BuyCE, 22.0,
              format!("PCR {:.2} (bullish): heavy put writing = market floor", snap.pcr_oi))
         } else if snap.pcr_oi < 0.80 {
@@ -2059,12 +2851,16 @@ impl OptionsEngine {
             reasons.push((format!("ATM IV {:.1}% — sufficient for gamma moves", snap.atm_iv * 100.0), 8.0));
         }
 
-        if score < self.min_confidence { return None; }
+        // Individual strategies use a low floor; composite in generate_signals applies min_confidence.
+        if score < 25.0 { return None; }
         Some((action, score.min(100.0), StrategyType::GammaScalp, reasons))
     }
 
     fn strategy_iv_expansion(&self, snap: &ChainSnapshot) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
         if snap.iv_rank > 40.0 { return None; }
+        // iv_rank=0 means no IV history yet (session just started or data gap).
+        // Scoring 30 pts as "historically cheap" on an empty baseline is a false signal.
+        if snap.iv_rank < 1.0 { return None; }
         if snap.days_to_expiry < 1.0 { return None; }
 
         let mut score = 0.0_f64;
@@ -2092,6 +2888,21 @@ impl OptionsEngine {
                 reasons.push(("Bearish regime: buy PE for directional IV play".into(), 20.0));
                 SignalAction::BuyPE
             }
+            // PANIC: IV is elevated but if iv_rank is low (IV hasn't expanded from session start),
+            // options are still relatively cheap vs recent range. Use PCR for direction.
+            MarketRegime::PanicHighVol => {
+                if snap.pcr_oi > 1.1 {
+                    score += 10.0;
+                    reasons.push(("Panic + low IV rank: options cheap vs session range, PCR bullish → CE".into(), 10.0));
+                    SignalAction::BuyCE
+                } else if snap.pcr_oi < 0.8 {
+                    score += 10.0;
+                    reasons.push(("Panic + low IV rank: options cheap vs session range, PCR bearish → PE".into(), 10.0));
+                    SignalAction::BuyPE
+                } else {
+                    return None;
+                }
+            }
             _ => {
                 if snap.pcr_oi > 1.1 {
                     score += 10.0;
@@ -2113,7 +2924,7 @@ impl OptionsEngine {
             reasons.push((format!("{:.0} DTE: time for IV to build before expiry", snap.days_to_expiry), 8.0));
         }
 
-        if score < self.min_confidence { return None; }
+        if score < 25.0 { return None; }
         Some((action, score.min(100.0), StrategyType::IVExpansion, reasons))
     }
 
@@ -2129,25 +2940,48 @@ impl OptionsEngine {
             .map(|(i, _)| i)
             .unwrap_or(0);
 
-        let lo = atm_idx.saturating_sub(3);
-        let hi = (atm_idx + 4).min(snap.strikes.len());
+        // Use ±4 window (same 9-strike window as OI Divergence) so OI changes captured
+        // at the chain periphery are visible to TrendFollow as well.
+        let lo = atm_idx.saturating_sub(4);
+        let hi = (atm_idx + 5).min(snap.strikes.len());
         let nearby = &snap.strikes[lo..hi];
 
         let ce_oi_change: i64 = nearby.iter().map(|s| s.ce_oi_change).sum();
         let pe_oi_change: i64 = nearby.iter().map(|s| s.pe_oi_change).sum();
 
-        let (action, oi_score, oi_reason) = if ce_oi_change > 0 && snap.regime == MarketRegime::Bullish {
+        // Price/OI quadrant: regime provides the price-direction axis so we can resolve
+        // whether an OI build is speculator-driven or writer-driven.
+        //   CE OI UP + price UP   (Bullish)  = call buyers entering      → BuyCE  (long buildup)
+        //   PE OI UP + price DOWN (Bearish)  = put buyers entering        → BuyPE  (short buildup)
+        //   CE OI DOWN + price DOWN (Bearish) = call longs unwinding      → BuyPE  (confirms trend)
+        //   PE OI DOWN + price UP  (Bullish)  = put shorts covering       → BuyCE  (confirms trend)
+        // This is consistent with strategy_oi_divergence and the writer-dominance convention
+        // in quant_engine (quant lacks regime so defaults to writer assumption for all cases).
+        let (action, oi_score, oi_reason) = if ce_oi_change > 0 && matches!(snap.regime, MarketRegime::Bullish | MarketRegime::StrongBullish) {
             (SignalAction::BuyCE, 25.0,
              format!("CE OI +{} with bullish regime: new long buildup", ce_oi_change))
-        } else if pe_oi_change > 0 && snap.regime == MarketRegime::Bearish {
+        } else if pe_oi_change > 0 && matches!(snap.regime, MarketRegime::Bearish | MarketRegime::StrongBearish) {
             (SignalAction::BuyPE, 25.0,
              format!("PE OI +{} with bearish regime: new short buildup", pe_oi_change))
-        } else if ce_oi_change < 0 && snap.regime == MarketRegime::Bearish {
+        } else if ce_oi_change < 0 && matches!(snap.regime, MarketRegime::Bearish | MarketRegime::StrongBearish) {
             (SignalAction::BuyPE, 18.0,
              format!("CE OI {} (unwinding) + bearish: longs exiting, further down", ce_oi_change))
-        } else if pe_oi_change < 0 && snap.regime == MarketRegime::Bullish {
+        } else if pe_oi_change < 0 && matches!(snap.regime, MarketRegime::Bullish | MarketRegime::StrongBullish) {
             (SignalAction::BuyCE, 18.0,
              format!("PE OI {} (unwinding) + bullish: bears exiting, further up", pe_oi_change))
+        // PANIC: sustained fear → OI activity is directionally bearish regardless of which side builds.
+        // CE OI up = call writers piling on; PE OI up = put buyers hedging; CE OI down = longs fleeing.
+        } else if matches!(snap.regime, MarketRegime::PanicHighVol) && (ce_oi_change > 0 || pe_oi_change > 0 || ce_oi_change < 0) {
+            let mag = pe_oi_change.abs().max(ce_oi_change.abs());
+            let reason = if pe_oi_change > ce_oi_change.abs() as i64 {
+                format!("PE OI +{} in panic: institutional hedging confirms bearish", pe_oi_change)
+            } else if ce_oi_change > 0 {
+                format!("CE OI +{} in panic: call writers aggressively positioning short", ce_oi_change)
+            } else {
+                format!("CE OI {} in panic: longs unwinding, further downside", ce_oi_change)
+            };
+            if mag < 5000 { return None; }
+            (SignalAction::BuyPE, 22.0, reason)
         } else {
             return None;
         };
@@ -2156,12 +2990,19 @@ impl OptionsEngine {
 
         let ce_vol_surge: u64 = nearby.iter().map(|s| s.ce_volume).sum();
         let pe_vol_surge: u64 = nearby.iter().map(|s| s.pe_volume).sum();
+        // Two-tier volume confirmation: strong (>2x) or moderate (>1.3x)
         if action == SignalAction::BuyCE && ce_vol_surge > pe_vol_surge * 2 {
             score += 15.0;
-            reasons.push((format!("CE volume ({}) >> PE volume ({}): buying pressure", ce_vol_surge, pe_vol_surge), 15.0));
+            reasons.push((format!("CE volume ({}) >> PE volume ({}): strong buying pressure", ce_vol_surge, pe_vol_surge), 15.0));
+        } else if action == SignalAction::BuyCE && ce_vol_surge * 10 > pe_vol_surge * 13 {
+            score += 8.0;
+            reasons.push((format!("CE volume ({}) > PE volume ({}): moderate buying pressure", ce_vol_surge, pe_vol_surge), 8.0));
         } else if action == SignalAction::BuyPE && pe_vol_surge > ce_vol_surge * 2 {
             score += 15.0;
-            reasons.push((format!("PE volume ({}) >> CE volume ({}): selling pressure", pe_vol_surge, ce_vol_surge), 15.0));
+            reasons.push((format!("PE volume ({}) >> CE volume ({}): strong selling pressure", pe_vol_surge, ce_vol_surge), 15.0));
+        } else if action == SignalAction::BuyPE && pe_vol_surge * 10 > ce_vol_surge * 13 {
+            score += 8.0;
+            reasons.push((format!("PE volume ({}) > CE volume ({}): moderate selling pressure", pe_vol_surge, ce_vol_surge), 8.0));
         }
 
         if snap.iv_rank < 60.0 {
@@ -2174,14 +3015,26 @@ impl OptionsEngine {
                 score += 20.0;
                 reasons.push(("Strong bullish regime confirms CE buy".into(), 20.0));
             }
+            (SignalAction::BuyCE, MarketRegime::Bullish) => {
+                score += 12.0;
+                reasons.push(("Bullish regime with OI + volume confirmation".into(), 12.0));
+            }
             (SignalAction::BuyPE, MarketRegime::StrongBearish) => {
                 score += 20.0;
                 reasons.push(("Strong bearish regime confirms PE buy".into(), 20.0));
             }
+            (SignalAction::BuyPE, MarketRegime::Bearish) => {
+                score += 12.0;
+                reasons.push(("Bearish regime with OI + volume confirmation".into(), 12.0));
+            }
+            (SignalAction::BuyPE, MarketRegime::PanicHighVol) => {
+                score += 15.0;
+                reasons.push(("Panic regime confirms PE trend direction".into(), 15.0));
+            }
             _ => {}
         }
 
-        if score < self.min_confidence { return None; }
+        if score < 25.0 { return None; }
         Some((action, score.min(100.0), StrategyType::TrendFollow, reasons))
     }
 
@@ -2240,11 +3093,20 @@ impl OptionsEngine {
             reasons.push((format!("PCR {:.2} aligns with max pain direction", snap.pcr_oi), 10.0));
         }
 
-        if score < self.min_confidence { return None; }
+        if score < 25.0 { return None; }
         Some((action, score.min(100.0), StrategyType::MaxPainConvergence, reasons))
     }
 
     fn strategy_oi_divergence(&self, snap: &ChainSnapshot) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
+        // OI buildup signals play out over hours-to-days; on expiry day the positioning
+        // is dominated by MM hedging/unwinds, not genuine directional bets.
+        if snap.days_to_expiry < 1.0 { return None; }
+
+        // In neutral regime there is no directional bias — large OI builds are
+        // typically market-maker activity (delta hedging) not speculator positioning.
+        // Without a directional regime the OI signal has no edge.
+        if matches!(snap.regime, MarketRegime::Neutral) { return None; }
+
         let atm_idx = snap.strikes.iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
@@ -2261,22 +3123,45 @@ impl OptionsEngine {
         let net_pe_oi_change: i64 = nearby.iter().map(|s| s.pe_oi_change).sum();
 
         let nearby_volume: u64 = nearby.iter().map(|s| s.ce_volume + s.pe_volume).sum();
-        if nearby_volume < 10_000 { return None; }
+        if nearby_volume < 10_000u64 { return None; }
 
-        let (dominant_change, action) = if net_ce_oi_change.abs() > net_pe_oi_change.abs() {
-            (net_ce_oi_change, if net_ce_oi_change > 0 { SignalAction::BuyCE } else { SignalAction::BuyPE })
-        } else {
-            (net_pe_oi_change, if net_pe_oi_change > 0 { SignalAction::BuyPE } else { SignalAction::BuyCE })
+        // Price/OI quadrant: raw OI direction alone is ambiguous — a CE OI increase could
+        // be call BUYERS (bullish) or call WRITERS (bearish), depending on whether price is
+        // rising or falling with it. We resolve the ambiguity using the price regime.
+        //   CE dominant + uptrend  → call buyers entering        → BuyCE
+        //   CE dominant + downtrend → call writers (hedging down) → BuyPE
+        //   PE dominant + downtrend → put buyers entering         → BuyPE
+        //   PE dominant + uptrend  → put writers (income)        → BuyCE
+        let is_ce_dominant = net_ce_oi_change.abs() > net_pe_oi_change.abs();
+        let dominant_magnitude = if is_ce_dominant { net_ce_oi_change.abs() } else { net_pe_oi_change.abs() };
+
+        if dominant_magnitude < 1000i64 { return None; }
+
+        let (action, quadrant_desc) = match (is_ce_dominant, &snap.regime) {
+            (true, MarketRegime::Bullish | MarketRegime::StrongBullish) =>
+                (SignalAction::BuyCE, "CE OI buildup in uptrend: call buyers positioning long"),
+            (true, MarketRegime::Bearish | MarketRegime::StrongBearish) =>
+                (SignalAction::BuyPE, "CE OI buildup in downtrend: call writers signaling downside"),
+            (false, MarketRegime::Bearish | MarketRegime::StrongBearish) =>
+                (SignalAction::BuyPE, "PE OI buildup in downtrend: put buyers positioning short"),
+            (false, MarketRegime::Bullish | MarketRegime::StrongBullish) =>
+                (SignalAction::BuyCE, "PE OI buildup in uptrend: put writers signaling further upside"),
+            // In PANIC, massive PE OI buildup = institutional panic hedging = confirmed bearish.
+            // CE OI buildup in PANIC = call writers aggressively piling on the downside.
+            // Both unambiguously bearish; DTE constraint is applied at the caller level.
+            (false, MarketRegime::PanicHighVol) =>
+                (SignalAction::BuyPE, "PE OI buildup in panic: institutional hedgers piling short"),
+            (true, MarketRegime::PanicHighVol) =>
+                (SignalAction::BuyPE, "CE OI buildup in panic: call writers aggressively hedging downside"),
+            _ => return None,
         };
-
-        if dominant_change.abs() < 1000 { return None; }
 
         let sideways = self
             .is_spot_sideways(&snap.underlying, snap.atm_iv, snap.days_to_expiry)
             .map(|(s, _, _, _, _)| s)
             .unwrap_or(false);
         if sideways {
-            if dominant_change.abs() < 1_000_000 {
+            if dominant_magnitude < 1_000_000i64 {
                 return None;
             }
             let pcr_extreme_ok =
@@ -2290,19 +3175,20 @@ impl OptionsEngine {
         let mut score = 0.0_f64;
         let mut reasons = Vec::new();
 
-        let oi_score = (dominant_change.abs() as f64 / 10_000.0).min(30.0);
+        let oi_divisor = 10_000.0;
+        let oi_score = (dominant_magnitude as f64 / oi_divisor).min(30.0);
         score += oi_score;
         reasons.push((
-            format!("{} OI change {}: strong institutional positioning",
-                if action == SignalAction::BuyCE { "CE" } else { "PE" },
-                dominant_change),
+            format!("{} (OI Δ {}): {}", if is_ce_dominant { "CE dominant" } else { "PE dominant" },
+                dominant_magnitude, quadrant_desc),
             oi_score,
         ));
 
-        if (action == SignalAction::BuyCE && matches!(snap.regime, MarketRegime::Bullish | MarketRegime::StrongBullish))
-        || (action == SignalAction::BuyPE && matches!(snap.regime, MarketRegime::Bearish | MarketRegime::StrongBearish)) {
-            score += 20.0;
-            reasons.push((format!("OI divergence aligned with {} regime", snap.regime), 20.0));
+        // Regime alignment is already baked into the quadrant action above; give a small
+        // confirmation bonus when the regime is strong.
+        if matches!(snap.regime, MarketRegime::StrongBullish | MarketRegime::StrongBearish) {
+            score += 10.0;
+            reasons.push((format!("Strong {} regime confirms OI quadrant", snap.regime), 10.0));
         }
 
         if (action == SignalAction::BuyCE && snap.pcr_oi > 1.1)
@@ -2329,7 +3215,7 @@ impl OptionsEngine {
             ));
         }
 
-        if score < self.min_confidence { return None; }
+        if score < 25.0 { return None; }
         Some((action, score.min(100.0), StrategyType::OIDivergence, reasons))
     }
 
@@ -2366,7 +3252,7 @@ impl OptionsEngine {
             ));
             SignalAction::BuyCE
         } else if avg_skew > 0.06 {
-            let skew_score = (avg_skew * 200.0).min(30.0);
+            let skew_score = (avg_skew * 200.0).min(35.0);
             score += skew_score;
             reasons.push((
                 format!("IV skew +{:.1}%: call IV >> put IV — extreme greed/squeeze, PE opportunity",
@@ -2380,8 +3266,8 @@ impl OptionsEngine {
 
         if (action == SignalAction::BuyCE && snap.pcr_oi > 1.2)
         || (action == SignalAction::BuyPE && snap.pcr_oi < 0.8) {
-            score += 15.0;
-            reasons.push((format!("PCR {:.2} confirms skew reversion direction", snap.pcr_oi), 15.0));
+            score += 20.0;
+            reasons.push((format!("PCR {:.2} confirms skew reversion direction", snap.pcr_oi), 20.0));
         }
 
         if snap.days_to_expiry > 2.0 {
@@ -2389,13 +3275,14 @@ impl OptionsEngine {
             reasons.push((format!("{:.0} DTE: sufficient time for skew to revert", snap.days_to_expiry), 8.0));
         }
 
-        if score < self.min_confidence { return None; }
+        if score < 25.0 { return None; }
         Some((action, score.min(100.0), StrategyType::IVSkewReversion, reasons))
     }
 
     fn strategy_gex_play(&self, snap: &ChainSnapshot) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
-        if snap.net_gex >= 0.0 { return None; }
-
+        // GEX sign (positive vs negative) cannot be reliably determined from OI + Black-Scholes
+        // gamma alone — it would require knowing whether dealers are long or short each strike,
+        // which is not observable from public OI data. Use magnitude only; direction from regime.
         let gex_magnitude = snap.net_gex.abs();
         if gex_magnitude < 1e6 { return None; }
 
@@ -2406,19 +3293,25 @@ impl OptionsEngine {
         let clamped = gex_score.min(30.0);
         score += clamped;
         reasons.push((
-            format!("Net GEX {:.2e} (negative): dealers short gamma, moves will be amplified", snap.net_gex),
+            format!("Net GEX magnitude {:.2e}: high gamma environment, amplified moves likely", gex_magnitude),
             clamped,
         ));
 
         let action = match snap.regime {
             MarketRegime::StrongBullish | MarketRegime::Bullish => {
                 score += 20.0;
-                reasons.push(("Bullish regime + negative GEX = explosive upside possible".into(), 20.0));
+                reasons.push(("Bullish regime in high-gamma environment: explosive upside possible".into(), 20.0));
                 SignalAction::BuyCE
             }
             MarketRegime::StrongBearish | MarketRegime::Bearish => {
                 score += 20.0;
-                reasons.push(("Bearish regime + negative GEX = explosive downside possible".into(), 20.0));
+                reasons.push(("Bearish regime in high-gamma environment: explosive downside possible".into(), 20.0));
+                SignalAction::BuyPE
+            }
+            // PANIC: sustained fear + high gamma = explosive downside. Direction is clear (bearish).
+            MarketRegime::PanicHighVol => {
+                score += 15.0;
+                reasons.push(("Panic regime in high-gamma environment: explosive downside continuation".into(), 15.0));
                 SignalAction::BuyPE
             }
             _ => {
@@ -2436,12 +3329,19 @@ impl OptionsEngine {
             }
         };
 
-        if snap.iv_rank < 65.0 {
+        if snap.iv_rank >= 1.0 && snap.iv_rank < 65.0 {
             score += 10.0;
             reasons.push((format!("IV Rank {:.0}%: options still reasonably priced for GEX play", snap.iv_rank), 10.0));
         }
 
-        if score < self.min_confidence { return None; }
+        // PCR confirmation lifts GEX signal above min_confidence threshold in directional regimes
+        if (action == SignalAction::BuyCE && snap.pcr_oi > 1.1)
+        || (action == SignalAction::BuyPE && snap.pcr_oi < 0.9) {
+            score += 8.0;
+            reasons.push((format!("PCR {:.2} confirms GEX play direction", snap.pcr_oi), 8.0));
+        }
+
+        if score < 25.0 { return None; }
         Some((action, score.min(100.0), StrategyType::GEXPlay, reasons))
     }
 
@@ -2490,11 +3390,15 @@ impl OptionsEngine {
         self.entry_attempts += 1;
         self.reset_daily_state_if_needed();
         let used_slots = self.daily_trade_slots_used();
-        if used_slots >= self.max_daily_trades {
+        // dynamic_daily_trade_cap adjusts the per-day limit by tier/session/conditions;
+        // max_daily_trades (from config) serves as the hard safety ceiling.
+        let effective_cap = self.dynamic_daily_trade_cap(signal).min(self.max_daily_trades);
+        if used_slots >= effective_cap {
             self.entry_rejections += 1;
             warn!(
-                "Position rejected (daily trade cap): used {} / {}",
-                used_slots,
+                "Position rejected (daily trade cap): used {} / {} (dynamic={}, config_max={})",
+                used_slots, effective_cap,
+                self.dynamic_daily_trade_cap(signal),
                 self.max_daily_trades
             );
             return;
@@ -2626,6 +3530,8 @@ impl OptionsEngine {
             capital_deployed,
             entry_ctx: signal.entry_ctx.clone(),
             breakeven_stop_set: false,
+            exit_pending: false,
+            checkpoints_evaluated: 0,
         };
 
         info!("📂 POSITION OPENED #{} | {} {} {:.0} {} | {}×{} lots | Entry: ₹{:.2} | Capital: ₹{:.2}",
@@ -2670,9 +3576,12 @@ impl OptionsEngine {
             placed_ms: now,
             last_status_poll_ms: 0,
             cancel_requested: false,
-            stale_timeout_hit: false,
+            cancel_reason: None,
+            last_cancel_attempt_ms: 0,
             released_after_timeout: false,
             order_id: None,
+            signal_price: signal.option_price,
+            placed_at_scan_count: self.scan_count,
         });
         self.last_signal_ms.insert(signal.underlying.clone(), now);
 
@@ -2691,6 +3600,7 @@ impl OptionsEngine {
             tradingsymbol,
             quantity,
             side: OrderSide::Buy,
+            limit_price: None,
         }));
         self.send_order_command(OrderCommand::StatusByTag { tag });
     }
@@ -2699,7 +3609,7 @@ impl OptionsEngine {
         &mut self,
         pending: PendingEntryOrder,
         broker_avg_price: f64,
-    ) {
+    ) -> bool {
         let signal = pending.signal;
         let fallback_price = self
             .store
@@ -2719,23 +3629,38 @@ impl OptionsEngine {
             + entry_costs;
         if !self.risk.reserve_capital(capital_deployed) {
             self.entry_rejections += 1;
-            warn!(
-                "Filled BUY could not reserve capital (late-state mismatch). tag={} deployed ₹{:.2}",
-                pending.tag,
-                capital_deployed
+            // This path should be rare with Issue 1 fixed (capital held until
+            // broker confirmation), but can still occur if risk capital was genuinely
+            // exhausted by a concurrent position.  Place an emergency MARKET SELL and
+            // track it in pending_exit_orders so status is polled and failures are
+            // visible.  pos_id has no matching Position — handle_exit_order_update
+            // will log ERROR if the SELL itself fails.
+            error!(
+                "EMERGENCY FLATTEN: filled BUY but capital exhausted. tag={} deployed ₹{:.2} — placing MARKET SELL",
+                pending.tag, capital_deployed
             );
             let exit_tag = self.build_order_tag("EXIT", pending.pos_id);
             let quantity = signal.lots.saturating_mul(signal.lot_size);
             if quantity > 0 {
+                let now_ms = self.current_time_ms();
                 self.send_order_command(OrderCommand::Place(PlaceOrderCmd {
                     tag: exit_tag.clone(),
                     tradingsymbol: pending.tradingsymbol,
                     quantity,
                     side: OrderSide::Sell,
+                    limit_price: None,
                 }));
+                // Track via PendingExitOrder so status is polled and rejections surface.
+                self.pending_exit_orders.push(PendingExitOrder {
+                    pos_id: pending.pos_id, // no matching Position; handled below
+                    tag: exit_tag.clone(),
+                    placed_ms: now_ms,
+                    last_status_poll_ms: 0,
+                    reason: "EMERGENCY FLATTEN".to_string(),
+                });
                 self.send_order_command(OrderCommand::StatusByTag { tag: exit_tag });
             }
-            return;
+            return false;
         }
 
         let orig_entry = signal.option_price.max(0.01);
@@ -2769,6 +3694,8 @@ impl OptionsEngine {
             capital_deployed,
             entry_ctx: signal.entry_ctx.clone(),
             breakeven_stop_set: false,
+            exit_pending: false,
+            checkpoints_evaluated: 0,
         };
 
         self.last_signal_ms.insert(signal.underlying.clone(), self.current_time_ms());
@@ -2783,9 +3710,53 @@ impl OptionsEngine {
             signal.strike,
             entry_fill_price
         );
+        true
     }
 
     fn close_position_at(&mut self, idx: usize, current_price: f64, reason: String) {
+        let live_mode = self.live_mode_enabled();
+        let (quantity, tradingsymbol, pos_id) = {
+            let Some(pos) = self.positions.get_mut(idx) else { return; };
+            if !pos.is_open || pos.exit_pending { return; }
+            if live_mode {
+                pos.exit_pending = true;
+                pos.exit_reason = reason.clone();
+                let q = pos.lots.saturating_mul(pos.lot_size);
+                (q, pos.tradingsymbol.clone(), pos.id)
+            } else {
+                (0, String::new(), pos.id)
+            }
+        };
+
+        if live_mode {
+            if quantity > 0 && !tradingsymbol.is_empty() {
+                let exit_tag = self.build_order_tag("EXIT", pos_id);
+                self.send_order_command(OrderCommand::Place(PlaceOrderCmd {
+                    tag: exit_tag.clone(),
+                    tradingsymbol: tradingsymbol.clone(),
+                    quantity,
+                    side: OrderSide::Sell,
+                    limit_price: None,
+                }));
+                self.send_order_command(OrderCommand::StatusByTag { tag: exit_tag.clone() });
+                
+                self.pending_exit_orders.push(PendingExitOrder {
+                    pos_id,
+                    tag: exit_tag,
+                    placed_ms: self.current_time_ms(),
+                    last_status_poll_ms: self.current_time_ms(),
+                    reason,
+                });
+            } else {
+                self.finalize_position_close(idx, current_price, reason);
+            }
+        } else {
+            let exit_fill_price = (current_price - self.execution_sell_offset_inr).max(0.05);
+            self.finalize_position_close(idx, exit_fill_price, reason);
+        }
+    }
+
+    fn finalize_position_close(&mut self, idx: usize, exit_fill_price: f64, reason: String) {
         let exit_time_ms = self.current_time_ms();
         let (
             trade_id,
@@ -2810,18 +3781,15 @@ impl OptionsEngine {
             pnl_pct,
             holding_mins,
         ) = {
-            let Some(pos) = self.positions.get_mut(idx) else {
-                return;
-            };
-            if !pos.is_open {
-                return;
-            }
+            let Some(pos) = self.positions.get_mut(idx) else { return; };
+            if !pos.is_open { return; }
 
-            let exit_fill_price = (current_price - self.execution_sell_offset_inr).max(0.05);
             pos.is_open = false;
+            pos.exit_pending = false;
             pos.exit_price = exit_fill_price;
             pos.exit_time_ms = exit_time_ms;
             pos.exit_reason = reason.clone();
+            self.capital_sync_needed = true;
 
             let gross_pnl = (exit_fill_price - pos.entry_price) * pos.lot_size as f64 * pos.lots as f64;
             let entry_costs = entry_transaction_cost_per_lot(pos.entry_price, pos.lot_size) * pos.lots as f64;
@@ -2842,27 +3810,11 @@ impl OptionsEngine {
             };
 
             (
-                pos.id,
-                pos.entry_ctx.clone(),
-                pos.underlying.clone(),
-                pos.tradingsymbol.clone(),
-                option_type_str,
-                pos.strike,
-                pos.expiry.clone(),
-                pos.entry_datetime.clone(),
-                datetime_string_from_ms(pos.exit_time_ms),
-                pos.entry_price,
-                pos.exit_price,
-                pos.lots,
-                pos.lot_size,
-                pos.capital_deployed,
-                pos.target_price,
-                pos.stop_price,
-                gross_pnl,
-                costs,
-                pos.pnl,
-                pos.pnl_pct,
-                holding_mins,
+                pos.id, pos.entry_ctx.clone(), pos.underlying.clone(), pos.tradingsymbol.clone(),
+                option_type_str, pos.strike, pos.expiry.clone(), pos.entry_datetime.clone(),
+                datetime_string_from_ms(pos.exit_time_ms), pos.entry_price, pos.exit_price,
+                pos.lots, pos.lot_size, pos.capital_deployed, pos.target_price, pos.stop_price,
+                gross_pnl, costs, pos.pnl, pos.pnl_pct, holding_mins,
             )
         };
 
@@ -2874,32 +3826,10 @@ impl OptionsEngine {
         self.positions_closed += 1;
 
         if is_stop {
-            let next = self
-                .stop_streak_by_underlying
-                .get(&underlying)
-                .copied()
-                .unwrap_or(0)
-                .saturating_add(1);
+            let next = self.stop_streak_by_underlying.get(&underlying).copied().unwrap_or(0).saturating_add(1);
             self.stop_streak_by_underlying.insert(underlying.clone(), next);
         } else if is_target {
             self.stop_streak_by_underlying.insert(underlying.clone(), 0);
-        }
-
-        let quantity = lots.saturating_mul(lot_size);
-        if quantity > 0 && !tradingsymbol.is_empty() {
-            let entry_tag = self.build_order_tag("ENTRY", trade_id);
-            self.send_order_command(OrderCommand::StatusByTag {
-                tag: entry_tag.clone(),
-            });
-
-            let exit_tag = self.build_order_tag("EXIT", trade_id);
-            self.send_order_command(OrderCommand::Place(PlaceOrderCmd {
-                tag: exit_tag.clone(),
-                tradingsymbol,
-                quantity,
-                side: OrderSide::Sell,
-            }));
-            self.send_order_command(OrderCommand::StatusByTag { tag: exit_tag });
         }
 
         self.journal.log_trade(
@@ -2936,40 +3866,76 @@ impl OptionsEngine {
     }
 
     fn check_open_positions(&mut self) {
-        let session = self.current_session();
-        let force_exit = matches!(session, SessionPhase::Closing);
+        // Compute IST minutes once for dynamic closing window logic.
+        let close_ist_mins = {
+            let now_utc = Utc.timestamp_millis_opt(self.current_time_ms() as i64)
+                .single()
+                .unwrap_or_else(Utc::now);
+            let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
+            let now_ist = now_utc.with_timezone(&ist);
+            now_ist.hour() * 60 + now_ist.minute()
+        };
+        // Hard close-all at 15:20 IST regardless of confidence.
+        let hard_close_all = close_ist_mins >= 920;
 
+        // Progressive profit lock-in: 3 checkpoints based on % of target distance.
+        //   CP1 (40% of range): stop → entry - 3%   (trim risk, absorb noise)
+        //   CP2 (65% of range): stop → entry + 5%   (locked 5% profit)
+        //   CP3 (85% of range): stop → entry + 15%  (locked 15% profit)
+        // checkpoints_evaluated tracks which level we've reached (0–3).
+        // Thresholds are intentionally conservative — early checkpoints cause false exits
+        // on intraday volatility when the underlying is still trending in our direction.
+        let now_ms = self.current_time_ms();
         for i in 0..self.positions.len() {
-            let (is_open, option_token, entry_price, target_price, breakeven_done) = {
+            let (is_open, option_token, entry_price, target_price, cp, entry_time_ms) = {
                 let pos = &self.positions[i];
-                (pos.is_open, pos.option_token, pos.entry_price, pos.target_price, pos.breakeven_stop_set)
+                (pos.is_open, pos.option_token, pos.entry_price, pos.target_price,
+                 pos.checkpoints_evaluated, pos.entry_time_ms)
             };
-            if !is_open || breakeven_done { continue; }
+            if !is_open || cp >= 3 { continue; }
 
             let current_price = match self.store.get(option_token) {
                 Some(t) if t.ltp > 0.0 => t.ltp,
                 _ => continue,
             };
+            if entry_price <= 0.0 { continue; }
 
-            let trigger_level = entry_price + (target_price - entry_price) * 0.65;
-            if current_price >= trigger_level && entry_price > 0.0 {
+            let hold_mins = (now_ms.saturating_sub(entry_time_ms)) as f64 / 60_000.0;
+
+            let range = (target_price - entry_price).max(0.01);
+            let gain_frac = (current_price - entry_price) / range;
+
+            // Minimum hold before each checkpoint can fire:
+            //   CP1 (40%): 5 min  — avoids open-tick noise triggering early stop-to-near-entry
+            //   CP2 (65%): 5 min  — same gate
+            //   CP3 (85%): 10 min — locks in 15%; needs confirmed move, not a 30s spike
+            let new_cp = if gain_frac >= 0.85 && hold_mins >= 10.0 { 3 }
+                         else if gain_frac >= 0.65 && hold_mins >= 5.0 { 2 }
+                         else if gain_frac >= 0.40 && hold_mins >= 5.0 { 1 }
+                         else { cp };
+
+            if new_cp > cp {
                 let pos = &mut self.positions[i];
-                let be_stop = pos.entry_price * 0.98;
-                if pos.stop_price < be_stop {
-                    pos.stop_price = be_stop;
-                    pos.breakeven_stop_set = true;
-                    info!("  Breakeven stop: position #{} {} stop raised to ₹{:.2} (2% below entry; current ₹{:.2}, target ₹{:.2})",
-                        pos.id, pos.underlying, pos.stop_price, current_price, pos.target_price);
-                } else {
-                    pos.breakeven_stop_set = true;
+                let new_stop = match new_cp {
+                    1 => entry_price * 0.97,   // -3% below entry: trim risk, absorb noise
+                    2 => entry_price * 1.05,   // +5% locked in
+                    _ => entry_price * 1.15,   // +15% locked in
+                };
+                if pos.stop_price < new_stop {
+                    pos.stop_price = new_stop;
+                    info!("  Profit lock CP{}: position #{} {} stop → ₹{:.2} (current ₹{:.2}, target ₹{:.2})",
+                        new_cp, pos.id, pos.underlying, pos.stop_price, current_price, pos.target_price);
                 }
+                pos.checkpoints_evaluated = new_cp;
+                pos.breakeven_stop_set = new_cp >= 1;
             }
         }
 
         for i in 0..self.positions.len() {
-            let (is_open, option_token, target_price, stop_price) = {
+            let (is_open, option_token, target_price, stop_price, confidence, entry_time_ms) = {
                 let pos = &self.positions[i];
-                (pos.is_open, pos.option_token, pos.target_price, pos.stop_price)
+                (pos.is_open, pos.option_token, pos.target_price, pos.stop_price,
+                 pos.entry_ctx.confidence, pos.entry_time_ms)
             };
             if !is_open {
                 continue;
@@ -2980,8 +3946,42 @@ impl OptionsEngine {
                 _ => continue,
             };
 
-            let exit_reason = if force_exit {
-                Some("Time stop: market closing".to_string())
+            // Checkpoint-scaled hold cap: only extend time if the trade has proven itself
+            // by reaching a profit-lock checkpoint. A flat/drifting position gets the
+            // standard cap; one that already hit CP1/CP2/CP3 earns extra runway.
+            //   cp == 0 (no profit locked)  → 120 min (exit a flat trade promptly)
+            //   cp >= 1 (CP1: −3% locked)   → 150 min (move confirmed, give room)
+            //   cp >= 2 (CP2: +5% locked)   → 180 min (trend running, let it extend)
+            //   cp >= 3 (CP3: +15% locked)  → 240 min (strong trend, let it run to target)
+            let cp_now = self.positions[i].checkpoints_evaluated;
+            let holding_ms = self.current_time_ms().saturating_sub(entry_time_ms);
+            let max_hold_mins: u64 = match cp_now {
+                0 => 120,
+                1 => 150,
+                2 => 180,
+                _ => 240,
+            };
+            let max_hold_expired = holding_ms >= max_hold_mins * 60 * 1_000;
+
+            // Dynamic closing window: higher confidence gets extra time near close.
+            //   confidence >= 70 → close at 15:20 (920 mins) — hard_close_all
+            //   confidence 65–70 → close at 15:17 (917 mins)
+            //   confidence <  65 → close at 15:15 (915 mins, start of Closing phase)
+            let time_force_exit = if hard_close_all {
+                true
+            } else if close_ist_mins >= 917 {
+                confidence < 70.0
+            } else if close_ist_mins >= 915 {
+                confidence < 65.0
+            } else {
+                false
+            };
+
+            let exit_reason = if max_hold_expired {
+                Some(format!("Time stop: {}-min max hold ({:.0} min held)", max_hold_mins, holding_ms as f64 / 60_000.0))
+            } else if time_force_exit {
+                Some(format!("Time stop: market closing ({:02}:{:02} IST, conf {:.0})",
+                    close_ist_mins / 60, close_ist_mins % 60, confidence))
             } else if current_price >= target_price {
                 Some(format!("TARGET HIT ₹{:.2}", current_price))
             } else if current_price <= stop_price {
@@ -3103,5 +4103,89 @@ impl OptionsEngine {
         info!("│  Circuit Breaker  : {}                                │",
             if self.risk.circuit_breaker_triggered() { "TRIGGERED ⛔" } else { "OK ✅           " });
         info!("└─────────────────────────────────────────────────────────┘");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        nearest_affordable_otm_idx,
+        StrikeScanDirection,
+        MIN_TRADEABLE_OPTION_PRICE,
+    };
+
+    #[test]
+    fn finds_pe_strike_beyond_old_five_strike_limit() {
+        let prices = vec![
+            44.7, 49.7, 55.6, 61.85, 69.05, 77.15, 86.2, 96.25, 108.4, 120.0, 134.55, 150.25,
+            167.55, 186.95, 208.2,
+        ];
+        let start_idx = prices.len() - 1; // ATM PE
+        let deployable_capital = 7_907.0;
+        let lot_size = 75;
+
+        let (idx, checked) = nearest_affordable_otm_idx(
+            &prices,
+            start_idx,
+            StrikeScanDirection::Down,
+            lot_size,
+            deployable_capital,
+            MIN_TRADEABLE_OPTION_PRICE,
+        );
+
+        assert_eq!(idx, Some(7));
+        assert_eq!(checked, 8);
+    }
+
+    #[test]
+    fn finds_ce_strike_beyond_old_five_strike_limit() {
+        let prices = vec![
+            560.0, 520.0, 480.0, 440.0, 400.0, 360.0, 320.0, 280.0, 240.0, 210.0,
+        ];
+        let deployable_capital = 12_000.0;
+        let lot_size = 25;
+
+        let (idx, checked) = nearest_affordable_otm_idx(
+            &prices,
+            0,
+            StrikeScanDirection::Up,
+            lot_size,
+            deployable_capital,
+            MIN_TRADEABLE_OPTION_PRICE,
+        );
+
+        assert_eq!(idx, Some(3));
+        assert_eq!(checked, 4);
+
+        let (idx_far, checked_far) = nearest_affordable_otm_idx(
+            &prices,
+            0,
+            StrikeScanDirection::Up,
+            lot_size,
+            7_000.0,
+            MIN_TRADEABLE_OPTION_PRICE,
+        );
+
+        assert_eq!(idx_far, Some(8));
+        assert_eq!(checked_far, 9);
+    }
+
+    #[test]
+    fn prefers_near_otm_contract_when_full_capital_can_fund_one_lot() {
+        let prices = vec![210.85, 183.8, 159.0, 136.75, 116.6];
+        let deployable_capital = 13_000.0;
+        let lot_size = 75;
+
+        let (idx, checked) = nearest_affordable_otm_idx(
+            &prices,
+            0,
+            StrikeScanDirection::Up,
+            lot_size,
+            deployable_capital,
+            MIN_TRADEABLE_OPTION_PRICE,
+        );
+
+        assert_eq!(idx, Some(2));
+        assert_eq!(checked, 3);
     }
 }

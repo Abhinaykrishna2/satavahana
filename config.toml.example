@@ -18,15 +18,29 @@ access_token = ""
 symbols = ["INFY", "TCS", "RELIANCE", "HDFCBANK", "ICICIBANK", "SBIN", "ITC", "LT", "WIPRO", "TATASTEEL"]
 
 [options]
-# Underlying indices/stocks for options chain
-underlyings = ["NIFTY", "BANKNIFTY"]
-# Expiry date in YYYY-MM-DD format
-expiry = "2026-02-26"
-# Strike range [min, max]
-strike_min = 22000.0
-strike_max = 24000.0
-# Strike step size
+# Underlying indices for options chain.
+# Supported: NIFTY, NIFTYNXT50, FINNIFTY (and any single-stock NFO name).
+# MIDCPNIFTY omitted: options are illiquid with wide bid-ask spreads.
+underlyings = ["NIFTY"]
+# Leave empty for AUTO mode (nearest available expiry selected per underlying).
+# Optional manual override: set to a specific YYYY-MM-DD.
+expiry = ""
+# Strike range [min, max] — must cover ALL configured underlyings.
+# FINNIFTY ~24000, NIFTY ~25000, NIFTYNXT50 ~27000.
+# Set min=0 / max=999999 to include all available strikes (recommended).
+strike_min = 0.0
+strike_max = 999999.0
+# Strike step size (used only for display/logging; filtering is by strike_min/max)
 strike_step = 50.0
+# Global default: keep only the N nearest strikes per underlying on EACH side of ATM.
+# 15 each side = 32 contracts per underlying (2 ATM + 15 CE + 15 PE).
+# Applies to NIFTY and NIFTYNXT50 (most liquid — use more strikes for chain-level OI coverage).
+# Total tokens: NIFTY(32) + NIFTYNXT50(32) + FINNIFTY(12) + 3 index = 79 — well within 3000.
+nearest_strikes = 15
+# Per-underlying override: FINNIFTY data quality is lower (illiquid OTM strikes, zero-LTP rows).
+# Restrict to 5 each side to keep only the liquid near-ATM zone.
+[options.nearest_strikes_override]
+FINNIFTY = 5
 
 [greeks]
 # Risk-free rate (annualized, decimal). 6.5% for Indian markets
@@ -61,15 +75,17 @@ stop_loss_pct = 35.0
 
 # Minimum composite confidence score (0-100) to act on a signal.
 # Each strategy scores sub-signals; composite must clear this bar.
-# 62 = medium conservatism. Raise to 70+ for fewer, higher-quality signals.
-min_confidence = 62.0
+# 58 = balanced. Raise to 65+ for fewer, higher-quality signals.
+min_confidence = 58.0
 
 # How often to run the full chain scan (seconds)
-# 60 = scan every minute during market hours
-scan_interval_secs = 60
+# 45 = scan every 45s during market hours
+scan_interval_secs = 45
 
-# Max total entries per IST trading day
-max_daily_trades = 3
+# Max total entries per IST trading day (across all underlyings)
+# 1 = take the first qualifying signal of the day and stop. If it stops out,
+# no further entries — avoids compounding losses on volatile days.
+max_daily_trades = 1
 
 [execution]
 # Set true only when you want live broker order placement enabled.
@@ -78,9 +94,17 @@ enable_live_orders = false
 # Kite order parameters for options execution.
 variety = "regular"
 exchange = "NFO"
-product = "NRML"
+product = "MIS"
 order_type = "MARKET"
 validity = "DAY"
 
 # Prefix used in Kite order tag for place/cancel/status correlation.
 order_tag_prefix = "SATA"
+
+# Cancel unfilled limit entry orders after this many seconds (default: 240 = 4 minutes).
+entry_order_timeout_secs = 240
+
+# Cancel pending entry if the option LTP drops this fraction below the limit price.
+# A large drop means the market reversed direction — no point filling a stale signal.
+# Default 0.15 = cancel if LTP < limit_price × 0.85 (15% adverse move).
+limit_cancel_reversal_pct = 0.15

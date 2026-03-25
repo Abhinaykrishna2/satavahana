@@ -1,4 +1,5 @@
 use satavahana::config::Config;
+use tracing_subscriber;
 use satavahana::models::{OHLC, OptionContract, OptionType, Tick, TickMode};
 use satavahana::options_engine::OptionsEngine;
 use satavahana::store::TickStore;
@@ -44,6 +45,7 @@ struct CliArgs {
     options_file: PathBuf,
     capital_mode: CapitalMode,
     fill_offset_inr: f64,
+    max_daily_trades: Option<u32>,
 }
 
 fn print_usage(bin: &str) {
@@ -55,12 +57,13 @@ fn print_usage(bin: &str) {
            --isolated                              Alias for --capital-mode isolated\n\
            --continuous                            Alias for --capital-mode continuous\n\
            --fill-offset-inr <value>              Buy +x / Sell -x execution offset in INR (default: 0.5)\n\
+           --max-daily-trades <N>                 Override config max_daily_trades (live=3, backtest=20)\n\
            -h, --help                             Show this help\n\
          \n\
          Examples:\n\
            {bin} data/2026-02-24_options_ticks.csv\n\
-           {bin} --isolated --fill-offset-inr 0.5 data/2026-02-24_options_ticks.csv\n\
-           {bin} --capital-mode continuous data/2026-02-24_options_ticks.csv"
+           {bin} --max-daily-trades 20 data/2026-02-24_options_ticks.csv\n\
+           {bin} --isolated --fill-offset-inr 0.5 data/2026-02-24_options_ticks.csv"
     );
 }
 
@@ -81,6 +84,7 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
     let mut options_file: Option<PathBuf> = None;
     let mut capital_mode = CapitalMode::Continuous;
     let mut fill_offset_inr = 0.5_f64;
+    let mut max_daily_trades: Option<u32> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -103,6 +107,13 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
                 fill_offset_inr = value.parse::<f64>()
                     .map_err(|e| format!("Invalid --fill-offset-inr value '{}': {}", value, e))?;
             }
+            "--max-daily-trades" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --max-daily-trades".to_string())?;
+                max_daily_trades = Some(value.parse::<u32>()
+                    .map_err(|e| format!("Invalid --max-daily-trades value '{}': {}", value, e))?);
+            }
             _ if arg.starts_with("--capital-mode=") => {
                 let value = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
                 capital_mode = parse_capital_mode(value)?;
@@ -111,6 +122,11 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
                 let value = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
                 fill_offset_inr = value.parse::<f64>()
                     .map_err(|e| format!("Invalid --fill-offset-inr value '{}': {}", value, e))?;
+            }
+            _ if arg.starts_with("--max-daily-trades=") => {
+                let value = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
+                max_daily_trades = Some(value.parse::<u32>()
+                    .map_err(|e| format!("Invalid --max-daily-trades value '{}': {}", value, e))?);
             }
             _ if arg.starts_with('-') => {
                 return Err(format!("Unknown flag: {}", arg).into());
@@ -131,6 +147,7 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
     Ok(CliArgs {
         options_file: options_file.unwrap_or_else(|| PathBuf::from(DEFAULT_OPTIONS_FILE)),
         capital_mode,
+        max_daily_trades,
         fill_offset_inr,
     })
 }
@@ -178,26 +195,45 @@ fn parse_option_type(s: &str) -> Option<OptionType> {
     }
 }
 
+/// Canonical lot sizes from SEBI circulars (March 2026). Used as a safe fallback
+/// when a token never shows any non-zero last_qty in the captured data.
 fn default_lot_size(underlying: &str) -> u32 {
     match underlying {
-        "NIFTY" => 65,
-        "BANKNIFTY" => 30,
+        "NIFTY"      => 65,
         "NIFTYNXT50" => 25,
-        _ => 50,
+        _ => 25,
     }
 }
 
-fn infer_lot_size(underlying: &str, last_qty: u32) -> u32 {
-    match underlying {
-        "NIFTY" | "BANKNIFTY" | "NIFTYNXT50" => default_lot_size(underlying),
-        _ => {
-            if (1..=500).contains(&last_qty) {
-                last_qty
-            } else {
-                default_lot_size(underlying)
+/// Scan the CSV once and return a map of token → inferred lot size.
+///
+/// Method: minimum non-zero `last_qty` observed across all ticks for each token.
+/// `last_qty` is the quantity of the most-recently executed trade in that tick.
+/// The smallest possible trade is 1 lot, so the minimum non-zero value converges
+/// to the lot size once a 1-lot trade is seen (which is typical for liquid NSE options).
+/// This mirrors what the live system gets from the Kite instruments API — no hardcoding.
+fn infer_lot_sizes_from_csv(
+    options_csv: &Path,
+    i_token: usize,
+    i_last_qty: usize,
+) -> Result<HashMap<u32, u32>, Box<dyn Error>> {
+    let mut min_last_qty: HashMap<u32, u32> = HashMap::new();
+    let mut rdr = csv::Reader::from_path(options_csv)?;
+    for rec in rdr.records() {
+        let rec = rec?;
+        let token = parse_u32(&rec, i_token);
+        if token == 0 {
+            continue;
+        }
+        let lq = parse_u32(&rec, i_last_qty);
+        if lq > 0 {
+            let e = min_last_qty.entry(token).or_insert(lq);
+            if lq < *e {
+                *e = lq;
             }
         }
     }
+    Ok(min_last_qty)
 }
 
 fn find_single_file_with_suffix(dir: &Path, suffix: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -217,14 +253,45 @@ fn find_single_file_with_suffix(dir: &Path, suffix: &str) -> Result<PathBuf, Box
         .ok_or_else(|| format!("No file ending with '{}' found in {}", suffix, dir.display()).into())
 }
 
-fn summarize_trades(trades_csv: &Path) -> Result<TradeSummary, Box<dyn Error>> {
+#[derive(Default)]
+struct TradeDetail {
+    trade_id: String,
+    underlying: String,
+    option_type: String,
+    strike: f64,
+    spot_at_entry: f64,
+    entry_price: f64,
+    exit_price: f64,
+    lots: u32,
+    lot_size: u32,
+    exit_reason: String,
+    net_pnl: f64,
+    strategy: String,
+    holding_mins: f64,
+}
+
+fn summarize_trades(trades_csv: &Path) -> Result<(TradeSummary, Vec<TradeDetail>), Box<dyn Error>> {
     let mut rdr = csv::Reader::from_path(trades_csv)?;
     let headers = rdr.headers()?.clone();
-    let i_gross = col_idx(&headers, "gross_pnl")?;
-    let i_costs = col_idx(&headers, "transaction_costs")?;
-    let i_net = col_idx(&headers, "net_pnl")?;
+    let i_trade_id    = col_idx(&headers, "trade_id")?;
+    let i_underlying  = col_idx(&headers, "underlying")?;
+    let i_opt_type    = col_idx(&headers, "option_type")?;
+    let i_strike      = col_idx(&headers, "strike")?;
+    let i_spot        = col_idx(&headers, "spot_at_entry")?;
+    let i_entry_price = col_idx(&headers, "entry_price")?;
+    let i_exit_price  = col_idx(&headers, "exit_price")?;
+    let i_lots        = col_idx(&headers, "lots")?;
+    let i_lot_size    = col_idx(&headers, "lot_size")?;
+    let i_exit_reason = col_idx(&headers, "exit_reason")?;
+    let i_gross       = col_idx(&headers, "gross_pnl")?;
+    let i_costs       = col_idx(&headers, "transaction_costs")?;
+    let i_net         = col_idx(&headers, "net_pnl")?;
+    let i_strategy    = col_idx(&headers, "strategy")?;
+    let i_holding     = col_idx(&headers, "holding_duration_mins")?;
 
     let mut out = TradeSummary::default();
+    let mut details = Vec::new();
+
     for rec in rdr.records() {
         let rec = rec?;
         let gross = parse_f64(&rec, i_gross);
@@ -241,23 +308,50 @@ fn summarize_trades(trades_csv: &Path) -> Result<TradeSummary, Box<dyn Error>> {
         } else {
             out.breakeven += 1;
         }
+
+        details.push(TradeDetail {
+            trade_id:     rec.get(i_trade_id).unwrap_or("").to_string(),
+            underlying:   rec.get(i_underlying).unwrap_or("").to_string(),
+            option_type:  rec.get(i_opt_type).unwrap_or("").to_string(),
+            strike:       parse_f64(&rec, i_strike),
+            spot_at_entry: parse_f64(&rec, i_spot),
+            entry_price:  parse_f64(&rec, i_entry_price),
+            exit_price:   parse_f64(&rec, i_exit_price),
+            lots:         parse_u32(&rec, i_lots),
+            lot_size:     parse_u32(&rec, i_lot_size),
+            exit_reason:  rec.get(i_exit_reason).unwrap_or("").to_string(),
+            net_pnl:      net,
+            strategy:     rec.get(i_strategy).unwrap_or("").to_string(),
+            holding_mins: parse_f64(&rec, i_holding),
+        });
     }
-    Ok(out)
+    Ok((out, details))
 }
 
 fn build_contracts(options_csv: &Path) -> Result<Vec<OptionContract>, Box<dyn Error>> {
-    let mut rdr = csv::Reader::from_path(options_csv)?;
-    let headers = rdr.headers()?.clone();
+    // Resolve column indices from CSV headers (needed for both passes).
+    let headers = {
+        let mut rdr = csv::Reader::from_path(options_csv)?;
+        rdr.headers()?.clone()
+    };
 
-    let i_token = col_idx(&headers, "token")?;
-    let i_symbol = col_idx(&headers, "tradingsymbol")?;
+    let i_token      = col_idx(&headers, "token")?;
+    let i_symbol     = col_idx(&headers, "tradingsymbol")?;
     let i_underlying = col_idx(&headers, "underlying")?;
-    let i_expiry = col_idx(&headers, "expiry")?;
-    let i_strike = col_idx(&headers, "strike")?;
-    let i_opt_type = col_idx(&headers, "option_type")?;
-    let i_last_qty = col_idx(&headers, "last_qty")?;
+    let i_expiry     = col_idx(&headers, "expiry")?;
+    let i_strike     = col_idx(&headers, "strike")?;
+    let i_opt_type   = col_idx(&headers, "option_type")?;
+    let i_last_qty   = col_idx(&headers, "last_qty")?;
 
+    // Pass 1: infer lot sizes dynamically from the data (min non-zero last_qty per token).
+    // This replicates what the live system gets from the Kite instruments API without hardcoding.
+    let lot_size_map = infer_lot_sizes_from_csv(options_csv, i_token, i_last_qty)?;
+
+    // Pass 2: build one OptionContract per token.
     let mut contracts: HashMap<u32, OptionContract> = HashMap::new();
+    let mut rdr = csv::Reader::from_path(options_csv)?;
+    // skip re-reading headers (already cloned above)
+    let _ = rdr.headers()?;
 
     for rec in rdr.records() {
         let rec = rec?;
@@ -286,7 +380,10 @@ fn build_contracts(options_csv: &Path) -> Result<Vec<OptionContract>, Box<dyn Er
         if tradingsymbol.is_empty() {
             continue;
         }
-        let lot_size = infer_lot_size(&underlying, parse_u32(&rec, i_last_qty));
+        // Use dynamically inferred lot size; fall back to SEBI canonical size if
+        // the token never showed any non-zero last_qty in the captured data.
+        let lot_size = lot_size_map.get(&token).copied()
+            .unwrap_or_else(|| default_lot_size(&underlying));
 
         contracts.entry(token).or_insert_with(|| OptionContract {
             instrument_token: token,
@@ -305,6 +402,15 @@ fn build_contracts(options_csv: &Path) -> Result<Vec<OptionContract>, Box<dyn Er
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .with_target(false)
+        .init();
+
     let cli = parse_args()?;
     let options_file = cli.options_file.clone();
     if !options_file.exists() {
@@ -312,10 +418,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let config = Config::load("config.toml")?;
-    let contracts = build_contracts(&options_file)?;
-    if contracts.is_empty() {
+    let all_contracts = build_contracts(&options_file)?;
+    if all_contracts.is_empty() {
         return Err("No option contracts found in CSV".into());
     }
+
+    // Filter to only underlyings in config — ignore MIDCPNIFTY, FINNIFTY, etc.
+    let active_underlyings: std::collections::HashSet<&str> =
+        config.options.underlyings.iter().map(|s| s.as_str()).collect();
+    let contracts: Vec<_> = all_contracts
+        .into_iter()
+        .filter(|c| active_underlyings.contains(c.underlying.as_str()))
+        .collect();
 
     let mut underlying_names: Vec<String> = contracts.iter().map(|c| c.underlying.clone()).collect();
     underlying_names.sort();
@@ -324,6 +438,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     eprintln!("Options CSV: {}", options_file.display());
     eprintln!("Contracts loaded: {}", contracts.len());
     eprintln!("Underlyings: {:?}", underlying_names);
+
+    // Show inferred lot sizes per underlying (sample one contract per underlying)
+    let mut lot_sizes_by_underlying: std::collections::BTreeMap<&str, u32> = std::collections::BTreeMap::new();
+    for c in &contracts {
+        lot_sizes_by_underlying.entry(c.underlying.as_str()).or_insert(c.lot_size);
+    }
+    for (u, ls) in &lot_sizes_by_underlying {
+        eprintln!("  Lot size [{u}]: {ls} (inferred from data)");
+    }
     eprintln!("Capital mode: {}", cli.capital_mode.as_str());
     eprintln!(
         "Execution fill adjustment: buy +₹{:.2}, sell -₹{:.2}",
@@ -331,7 +454,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         cli.fill_offset_inr
     );
 
-    let engine_cfg = config.options_engine.clone();
+    let mut engine_cfg = config.options_engine.clone();
+    if let Some(mdt) = cli.max_daily_trades {
+        eprintln!("max_daily_trades override: {} (config was {})", mdt, engine_cfg.max_daily_trades);
+        engine_cfg.max_daily_trades = mdt;
+    }
     match cli.capital_mode {
         CapitalMode::Continuous => {
             eprintln!(
@@ -351,9 +478,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     let run_dir = PathBuf::from(format!("backtest/options_backtest_{}", run_id));
     fs::create_dir_all(&run_dir)?;
 
+    // Extract replay date from CSV filename (e.g. "2026-02-24_options_ticks.csv" → "2026-02-24")
+    // so log files inside the backtest dir are named after the data date, not today.
+    let replay_date: Option<String> = options_file
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .and_then(|s| {
+            let date_part = s.split('_').next().unwrap_or("");
+            if date_part.len() == 10 && date_part.chars().nth(4) == Some('-') {
+                Some(date_part.to_string())
+            } else {
+                None
+            }
+        });
+
     let store = TickStore::new();
     let underlying_tokens: HashMap<String, u32> = HashMap::new();
-    let mut engine = OptionsEngine::new(
+    let mut engine = OptionsEngine::new_with_date(
         contracts,
         store.clone(),
         underlying_tokens,
@@ -361,6 +502,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         config.greeks.risk_free_rate,
         config.greeks.dividend_yield,
         run_dir.to_string_lossy().as_ref(),
+        replay_date.as_deref(),
     );
     engine.set_execution_fill_offsets(cli.fill_offset_inr, cli.fill_offset_inr);
 
@@ -383,6 +525,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     let i_sell_qty = col_idx(&headers, "sell_qty")?;
     let i_last_qty = col_idx(&headers, "last_qty")?;
     let i_exchange_ts = col_idx(&headers, "exchange_ts")?;
+
+    // 15-minute warmup: engine builds OI/IV baselines but suppresses signal generation.
+    // Mirrors the live OpeningBell run-in; warmup_end set after first valid tick.
+    const WARMUP_SECS: u64 = 15 * 60;
+    let mut warmup_armed = false;
 
     let mut rows_seen: u64 = 0;
     let mut rows_replayed: u64 = 0;
@@ -455,6 +602,15 @@ fn main() -> Result<(), Box<dyn Error>> {
             ts_ms
         };
 
+        if !warmup_armed && causal_ts_ms > 0 {
+            engine.set_warmup_until_ms(causal_ts_ms + WARMUP_SECS * 1_000);
+            eprintln!(
+                "Warmup set: suppressing signals for first {}min (until replay clock +{}s)",
+                WARMUP_SECS / 60, WARMUP_SECS
+            );
+            warmup_armed = true;
+        }
+
         store.update(tick);
         engine.process_replay_tick(causal_ts_ms);
         rows_replayed += 1;
@@ -472,7 +628,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     engine.finalize_replay("Backtest end-of-data exit");
 
     let trades_csv = find_single_file_with_suffix(&run_dir, "_options_trades.csv")?;
-    let summary = summarize_trades(&trades_csv)?;
+    let (summary, trade_details) = summarize_trades(&trades_csv)?;
     let (signals, entry_attempts, entry_rejections, opened, closed, open_positions) = engine.diagnostics();
 
     let successful_trades = closed as usize;
@@ -537,8 +693,54 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
 
     println!("{}", report);
+
+    // Per-trade breakdown: spot, strike, P&L
+    if !trade_details.is_empty() {
+        println!("\n--------------------------------------------------------------");
+        println!("TRADE BREAKDOWN (spot → strike → entry/exit → net P&L)");
+        println!("--------------------------------------------------------------");
+        println!("{:<4} {:<12} {:<4} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:<20} {:>7}",
+            "#", "Underlying", "OT", "Spot", "Strike", "Entry", "Exit",
+            "Lots×Sz", "Net P&L", "Exit reason", "Hold(m)");
+        println!("{}", "-".repeat(105));
+        for (i, t) in trade_details.iter().enumerate() {
+            let sign = if t.net_pnl >= 0.0 { "+" } else { "" };
+            println!("{:<4} {:<12} {:<4} {:>8.0} {:>8.0} {:>8.2} {:>8.2} {:>4}x{:<3} {:>+8.2} {:<20} {:>7.1}",
+                i + 1,
+                t.underlying,
+                t.option_type,
+                t.spot_at_entry,
+                t.strike,
+                t.entry_price,
+                t.exit_price,
+                t.lots,
+                t.lot_size,
+                t.net_pnl,
+                &t.exit_reason[..t.exit_reason.len().min(20)],
+                t.holding_mins,
+            );
+            let _ = sign;
+        }
+        println!("{}", "-".repeat(105));
+        println!("Strategy breakdown:");
+        let mut strat_map: std::collections::HashMap<String, (usize, usize, f64)> = std::collections::HashMap::new();
+        for t in &trade_details {
+            let e = strat_map.entry(t.strategy.clone()).or_insert((0, 0, 0.0));
+            e.0 += 1;
+            if t.net_pnl >= 0.0 { e.1 += 1; }
+            e.2 += t.net_pnl;
+        }
+        let mut strats: Vec<_> = strat_map.iter().collect();
+        strats.sort_by_key(|(k, _)| k.as_str());
+        for (s, (total, wins, pnl)) in &strats {
+            println!("  {:<35}  {}W/{}L  net ₹{:+.2}", s, wins, total - wins, pnl);
+        }
+    } else {
+        println!("\nNo completed trades.");
+    }
+
     fs::write(run_dir.join("backtest_report.txt"), format!("{}\n", report))?;
-    println!("Trades CSV: {}", trades_csv.display());
+    println!("\nTrades CSV: {}", trades_csv.display());
 
     Ok(())
 }

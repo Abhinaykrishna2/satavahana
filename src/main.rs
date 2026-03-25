@@ -10,6 +10,7 @@ mod options_engine;
 mod recorder;
 mod store;
 mod websocket;
+mod quote_fetcher;
 
 use auth::KiteAuth;
 use config::Config;
@@ -33,6 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
+        .with_writer(std::io::stderr)
         .with_target(false)
         .init();
 
@@ -53,10 +55,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "  Equity watchlist: {:?}",
         config.equities.symbols
     );
+    let expiry_mode = config
+        .options
+        .expiry
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("AUTO (nearest per underlying)");
     info!(
         "  Options: {:?} expiry {} strikes {:.0}-{:.0}",
         config.options.underlyings,
-        config.options.expiry,
+        expiry_mode,
         config.options.strike_min,
         config.options.strike_max,
     );
@@ -90,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         info!("    → {}", pair);
     }
 
-    let options_chain = build_options_chain(&instruments, &config.options);
+    let options_chain = build_options_chain(&auth, &instruments, &config.options).await;
     info!("  Options contracts: {}", options_chain.len());
 
     if equity_pairs.is_empty() && options_chain.is_empty() {
@@ -109,8 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut underlying_tokens: HashMap<String, u32> = HashMap::new();
     for underlying in &config.options.underlyings {
         let aliases: &[&str] = match underlying.as_str() {
-            "NIFTY" => &["NIFTY 50", "NIFTY50", "NIFTY"],
-            "BANKNIFTY" => &["NIFTY BANK", "BANKNIFTY"],
+            "NIFTY"      => &["NIFTY 50", "NIFTY50", "NIFTY"],
             "NIFTYNXT50" => &["NIFTY NEXT 50", "NIFTYNXT50"],
             _ => &[underlying.as_str()],
         };
@@ -175,7 +183,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let (tx, _) = broadcast::channel::<TickEvent>(4096);
 
-    let rec_underlying_tokens: Vec<u32> = underlying_tokens.values().copied().collect();
+    // Underlying index tokens are only needed by the live engine for spot price reads.
+    // Do NOT pass them to the recorder as equity_tokens — they are not equities and
+    // produce a spurious equity_ticks.csv full of index OHLC rows.
     let rec_option_tokens = option_tokens.clone();
 
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
@@ -183,24 +193,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let ws_url = auth.ws_url();
     let mut handles = Vec::new();
-    let mut live_order_tx = None;
-    let mut live_order_updates_rx = None;
-    let mut live_starting_capital_override = None;
-
-    if config.execution.enable_live_orders {
+    // Resolve starting capital: fetch from Kite margin API, persist to a dated
+    // file so restarts during the same day reuse the same baseline.
+    let capital_file = {
+        use chrono::{FixedOffset, Utc};
+        let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("IST offset");
+        let today = Utc::now().with_timezone(&ist).format("%Y-%m-%d").to_string();
+        format!("logs/{}_starting_capital.txt", today)
+    };
+    let live_starting_capital_override: Option<f64> =
         match fetch_live_available_funds(&auth.api_key, &auth.access_token).await {
             Ok(funds) => {
-                live_starting_capital_override = Some(funds);
-                info!("  Live funds detected from Kite margins: ₹{:.2}", funds);
+                if let Err(e) = std::fs::write(&capital_file, format!("{:.2}", funds)) {
+                    warn!("  Could not write capital file {}: {}", capital_file, e);
+                } else {
+                    info!("  Starting capital ₹{:.2} fetched from Kite and saved to {}", funds, capital_file);
+                }
+                Some(funds)
             }
             Err(e) => {
-                warn!(
-                    "  Could not fetch live funds from Kite margins ({}); falling back to config capital",
-                    e
-                );
+                warn!("  Could not fetch live funds from Kite margins ({})", e);
+                match std::fs::read_to_string(&capital_file) {
+                    Ok(s) => match s.trim().parse::<f64>() {
+                        Ok(saved) => {
+                            info!("  Using saved starting capital ₹{:.2} from {}", saved, capital_file);
+                            Some(saved)
+                        }
+                        Err(_) => {
+                            warn!("  Capital file {} is malformed; falling back to config capital", capital_file);
+                            None
+                        }
+                    },
+                    Err(_) => {
+                        warn!("  No capital file found; falling back to config capital ₹{:.0}", config.options_engine.initial_capital);
+                        None
+                    }
+                }
             }
-        }
+        };
 
+    let mut live_order_tx = None;
+    let mut live_order_updates_rx = None;
+
+    if config.execution.enable_live_orders {
         let (tx, updates_rx, handle) = spawn_order_executor(
             auth.api_key.clone(),
             auth.access_token.clone(),
@@ -222,6 +257,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
 
     if !all_option_tokens.is_empty() {
+        if all_option_tokens.len() > 3000 {
+            warn!(
+                "  WARNING: {} tokens exceeds Kite WebSocket limit of 3000! Some subscriptions may fail.",
+                all_option_tokens.len()
+            );
+        }
         info!(
             "  Connection 1 (Options): {} tokens in 'full' mode",
             all_option_tokens.len()
@@ -281,6 +322,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         handles.push(greeks_engine.spawn(greeks_rx));
         info!("  Greeks Engine: ACTIVE");
 
+        if !config.options_engine.enabled {
+            info!("  Options Signal Engine: DISABLED (data collection only)");
+        } else {
+
         let mut oecfg = config.options_engine.clone();
         if let Some(funds) = live_starting_capital_override {
             oecfg.initial_capital = funds.max(0.0);
@@ -292,7 +337,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             &oecfg,
             config.greeks.risk_free_rate,
             config.greeks.dividend_yield,
-            "backtest",
+            "logs",
+        );
+        // Suppress signals for the first 15 minutes of live operation so OI/IV
+        // baselines can accumulate before the engine is allowed to trade.
+        let warmup_end_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+            + 15 * 60 * 1_000;
+        options_signal_engine.set_warmup_until_ms(warmup_end_ms);
+        info!("  Options warmup: signals suppressed for 15 min after startup");
+
+        options_signal_engine.set_capital_refresh_credentials(
+            auth.api_key.clone(),
+            auth.access_token.clone(),
         );
         if let Some(tx) = live_order_tx.clone() {
             options_signal_engine.set_live_order_bridge(
@@ -300,15 +359,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 live_order_updates_rx.take(),
                 config.execution.order_tag_prefix.clone(),
             );
+            options_signal_engine.set_entry_order_config(
+                config.execution.entry_order_timeout_secs,
+                config.execution.limit_cancel_reversal_pct,
+            );
             info!(
-                "  Options execution bridge: ACTIVE (tag prefix '{}')",
-                config.execution.order_tag_prefix
+                "  Options execution bridge: ACTIVE (tag prefix '{}' | LIMIT orders | timeout={}s | reversal-cancel={:.0}%)",
+                config.execution.order_tag_prefix,
+                config.execution.entry_order_timeout_secs,
+                config.execution.limit_cancel_reversal_pct * 100.0,
             );
         }
         let oe_rx = tx.subscribe();
         handles.push(options_signal_engine.spawn(oe_rx));
         info!("  Options Signal Engine: ACTIVE (₹{:.0} capital, scan every {}s)",
             oecfg.initial_capital, oecfg.scan_interval_secs);
+
+        } // end options_engine.enabled
     }
 
     {
@@ -316,12 +383,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let recorder = TickRecorder::new(
             rec_rx,
             &instruments,
-            &rec_underlying_tokens,
+            &[],               // no equity recording in options-only mode
             &rec_option_tokens,
             "data",
         );
         handles.push(recorder.spawn());
-        info!("  Tick Recorder: ACTIVE (equity_ticks + options_ticks CSV)");
+        info!("  Tick Recorder: ACTIVE (options_ticks CSV)");
     }
 
     info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");

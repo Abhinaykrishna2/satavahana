@@ -88,7 +88,10 @@ impl TickStore {
     #[inline(always)]
     pub fn update(&self, tick: Tick) {
         if let Some(&idx) = self.hot_token_map.get(&tick.token) {
+            // Hot path: atomic LTP for spread engine fast-reads
             self.hot_path[idx].update(&tick);
+            // Cold path: full tick for options engine (OI, volume, exchange_ts)
+            self.cold_path.insert(tick.token, tick);
         } else {
             self.cold_path.insert(tick.token, tick);
         }
@@ -116,7 +119,7 @@ impl TickStore {
     }
 
     pub fn len(&self) -> usize {
-        self.hot_path.len() + self.cold_path.len()
+        self.cold_path.len()
     }
 
     pub fn is_empty(&self) -> bool {

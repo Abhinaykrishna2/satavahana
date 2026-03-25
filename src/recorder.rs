@@ -110,30 +110,36 @@ impl TickRecorder {
             .format("%Y-%m-%d")
             .to_string();
 
-        let eq_path = self.logs_dir.join(format!("{}_equity_ticks.csv", date_str));
         let opt_path = self.logs_dir.join(format!("{}_options_ticks.csv", date_str));
 
-        let eq_file = File::options()
-            .create(true)
-            .append(true)
-            .open(&eq_path)?;
         let opt_file = File::options()
             .create(true)
             .append(true)
             .open(&opt_path)?;
 
-        let mut eq_writer = BufWriter::with_capacity(8 * 1024 * 1024, eq_file);
         let mut opt_writer = BufWriter::with_capacity(8 * 1024 * 1024, opt_file);
 
-        let eq_is_new = eq_path.metadata().map(|m| m.len() == 0).unwrap_or(true);
-        let opt_is_new = opt_path.metadata().map(|m| m.len() == 0).unwrap_or(true);
+        // Equity file is only opened when equity tokens are actually configured.
+        let eq_path = self.logs_dir.join(format!("{}_equity_ticks.csv", date_str));
+        let mut eq_writer: Option<BufWriter<File>> = if !self.equity_tokens.is_empty() {
+            let eq_file = File::options()
+                .create(true)
+                .append(true)
+                .open(&eq_path)?;
+            let mut w = BufWriter::with_capacity(8 * 1024 * 1024, eq_file);
+            let is_new = eq_path.metadata().map(|m| m.len() == 0).unwrap_or(true);
+            if is_new {
+                writeln!(
+                    w,
+                    "recv_ts,token,symbol,exchange,ltp,open,high,low,close,volume,buy_qty,sell_qty,avg_price,last_qty,last_trade_ts,exchange_ts"
+                )?;
+            }
+            Some(w)
+        } else {
+            None
+        };
 
-        if eq_is_new {
-            writeln!(
-                eq_writer,
-                "recv_ts,token,symbol,exchange,ltp,open,high,low,close,volume,buy_qty,sell_qty,avg_price,last_qty,last_trade_ts,exchange_ts"
-            )?;
-        }
+        let opt_is_new = opt_path.metadata().map(|m| m.len() == 0).unwrap_or(true);
         if opt_is_new {
             writeln!(
                 opt_writer,
@@ -141,11 +147,15 @@ impl TickRecorder {
             )?;
         }
 
-        info!(
-            "TickRecorder: writing to\n  {}\n  {}",
-            eq_path.display(),
-            opt_path.display()
-        );
+        if eq_writer.is_some() {
+            info!(
+                "TickRecorder: writing to\n  {}\n  {}",
+                eq_path.display(),
+                opt_path.display()
+            );
+        } else {
+            info!("TickRecorder: writing to {}", opt_path.display());
+        }
 
         let mut tick_count: u64 = 0;
         let mut last_flush = tokio::time::Instant::now();
@@ -168,11 +178,11 @@ impl TickRecorder {
                                 let tok = tick.token;
 
                                 if self.equity_tokens.contains(&tok) {
-                                    if let Some(TokenMeta::Equity { symbol, exchange }) =
-                                        self.token_map.get(&tok)
+                                    if let (Some(w), Some(TokenMeta::Equity { symbol, exchange })) =
+                                        (eq_writer.as_mut(), self.token_map.get(&tok))
                                     {
                                         writeln!(
-                                            eq_writer,
+                                            w,
                                             "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},{},{},{:.2},{},{},{}",
                                             recv_ts,
                                             tok,
@@ -241,20 +251,20 @@ impl TickRecorder {
                     }
 
                     if last_flush.elapsed() >= flush_interval {
-                        eq_writer.flush()?;
+                        if let Some(w) = eq_writer.as_mut() { w.flush()?; }
                         opt_writer.flush()?;
                         last_flush = tokio::time::Instant::now();
                     }
                 }
                 _ = &mut timeout => {
-                    eq_writer.flush()?;
+                    if let Some(w) = eq_writer.as_mut() { w.flush()?; }
                     opt_writer.flush()?;
                     last_flush = tokio::time::Instant::now();
                 }
             }
         }
 
-        eq_writer.flush()?;
+        if let Some(w) = eq_writer.as_mut() { w.flush()?; }
         opt_writer.flush()?;
 
         info!(

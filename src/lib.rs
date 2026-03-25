@@ -5,5 +5,6 @@ pub mod greeks;
 pub mod ledger;
 pub mod models;
 pub mod options_engine;
+pub mod quant_engine;
 pub mod store;
 pub mod websocket;

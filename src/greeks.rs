@@ -71,7 +71,7 @@ impl GreeksEngine {
                                 .tick_count
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-                            if count % self.log_interval == 0 {
+                            if self.log_interval > 0 && count % self.log_interval == 0 {
                                 self.compute_and_log_greeks();
                             }
                         }

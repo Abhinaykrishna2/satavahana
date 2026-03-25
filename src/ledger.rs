@@ -99,9 +99,11 @@ pub struct OptionsJournal {
 }
 
 impl OptionsJournal {
-    pub fn new(log_dir: &str, initial_capital: f64) -> std::io::Result<Self> {
+    /// `replay_date`: pass `Some("YYYY-MM-DD")` during backtests so log files are named
+    /// after the data date rather than today. Pass `None` for live trading.
+    pub fn new(log_dir: &str, initial_capital: f64, replay_date: Option<&str>) -> std::io::Result<Self> {
         fs::create_dir_all(log_dir)?;
-        let d = date_str();
+        let d = replay_date.map(str::to_string).unwrap_or_else(date_str);
 
         let sig_path     = Path::new(log_dir).join(format!("{}_options_signals.csv", d));
         let trades_path  = Path::new(log_dir).join(format!("{}_options_trades.csv", d));

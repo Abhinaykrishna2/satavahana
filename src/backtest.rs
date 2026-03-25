@@ -1,7 +1,6 @@
+#![allow(dead_code)]
 use crate::models::Tick;
-use rand::Rng;
 use std::collections::VecDeque;
-use std::time::Duration;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone)]
@@ -242,8 +241,8 @@ impl BacktestEngine {
 
     fn apply_slippage(
         &self,
-        nse_signal: f64,
-        bse_signal: f64,
+        _nse_signal: f64,
+        _bse_signal: f64,
         nse_exec: f64,
         bse_exec: f64,
         original_spread: f64,

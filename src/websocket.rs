@@ -50,19 +50,22 @@ impl WsConnection {
 
         info!("[{}] Connected! Subscribing to {} tokens...", self.name, self.tokens.len());
 
-        let subscribe_msg = serde_json::json!({
-            "a": "subscribe",
-            "v": self.tokens
-        });
-        write
-            .send(Message::Text(subscribe_msg.to_string().into()))
-            .await?;
+        // Kite allows max 3000 tokens; chunk subscribe + mode messages to stay safe
+        for chunk in self.tokens.chunks(500) {
+            let subscribe_msg = serde_json::json!({
+                "a": "subscribe",
+                "v": chunk
+            });
+            write
+                .send(Message::Text(subscribe_msg.to_string().into()))
+                .await?;
 
-        let mode_msg = serde_json::json!({
-            "a": "mode",
-            "v": [&self.mode, self.tokens]
-        });
-        write.send(Message::Text(mode_msg.to_string().into())).await?;
+            let mode_msg = serde_json::json!({
+                "a": "mode",
+                "v": [&self.mode, chunk]
+            });
+            write.send(Message::Text(mode_msg.to_string().into())).await?;
+        }
 
         info!("[{}] Subscribed and mode set. Streaming...", self.name);
 

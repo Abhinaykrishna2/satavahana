@@ -74,6 +74,8 @@ pub struct PlaceOrderCmd {
     pub tradingsymbol: String,
     pub quantity: u32,
     pub side: OrderSide,
+    /// Set for LIMIT orders; None sends a MARKET order regardless of order_type config.
+    pub limit_price: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -237,16 +239,27 @@ impl OrderExecutor {
 
     async fn place_order(&self, cmd: &PlaceOrderCmd) -> Result<String, String> {
         let url = format!("{}/{}", KITE_ORDERS_URL, self.cfg.variety);
-        let params = vec![
+        // Use LIMIT when a price is provided; fall back to configured order_type otherwise.
+        let effective_order_type = if cmd.limit_price.is_some() {
+            "LIMIT".to_string()
+        } else {
+            self.cfg.order_type.clone()
+        };
+        let mut params = vec![
             ("exchange", self.cfg.exchange.clone()),
             ("tradingsymbol", cmd.tradingsymbol.clone()),
             ("transaction_type", cmd.side.as_str().to_string()),
             ("quantity", cmd.quantity.to_string()),
             ("product", self.cfg.product.clone()),
-            ("order_type", self.cfg.order_type.clone()),
+            ("order_type", effective_order_type),
             ("validity", self.cfg.validity.clone()),
             ("tag", cmd.tag.clone()),
         ];
+        if let Some(price) = cmd.limit_price {
+            // Round to 2 decimal places — Kite requires ₹0.05 tick on options but
+            // accepts 2-dp values; the exchange itself enforces tick rounding.
+            params.push(("price", format!("{:.2}", price)));
+        }
 
         let resp = self
             .client

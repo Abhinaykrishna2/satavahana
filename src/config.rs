@@ -19,13 +19,14 @@ pub struct Config {
 
 fn default_options_engine_config() -> OptionsEngineConfig {
     OptionsEngineConfig {
+        enabled: true,
         initial_capital: 10_000.0,
         max_daily_loss_pct: 30.0,
         profit_target_pct: 55.0,
         stop_loss_pct: 35.0,
-        min_confidence: 62.0,
-        scan_interval_secs: 60,
-        max_daily_trades: 3,
+        min_confidence: 60.0,
+        scan_interval_secs: 45,
+        max_daily_trades: 5,
     }
 }
 
@@ -38,6 +39,8 @@ fn default_execution_config() -> ExecutionConfig {
         order_type: "MARKET".to_string(),
         validity: "DAY".to_string(),
         order_tag_prefix: "SATA".to_string(),
+        entry_order_timeout_secs: 240,
+        limit_cancel_reversal_pct: 0.15,
     }
 }
 
@@ -69,10 +72,31 @@ fn default_min_volume() -> u32 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct OptionsConfig {
     pub underlyings: Vec<String>,
-    pub expiry: String,
+    #[serde(default)]
+    pub expiry: Option<String>,
     pub strike_min: f64,
     pub strike_max: f64,
     pub strike_step: f64,
+    /// Keep only the N nearest strikes per underlying on each side of ATM (0 = keep all in range).
+    /// Acts as the global default; `nearest_strikes_override` can set per-underlying values.
+    #[serde(default)]
+    pub nearest_strikes: u32,
+    /// Per-underlying overrides for nearest_strikes.
+    /// Example: { NIFTYNXT50 = 15, FINNIFTY = 15 }
+    /// Falls back to `nearest_strikes` for any underlying not listed here.
+    #[serde(default)]
+    pub nearest_strikes_override: std::collections::HashMap<String, u32>,
+}
+
+impl OptionsConfig {
+    /// Returns the nearest_strikes value for the given underlying,
+    /// using the per-underlying override if set, otherwise the global default.
+    pub fn strikes_for(&self, underlying: &str) -> u32 {
+        self.nearest_strikes_override
+            .get(underlying)
+            .copied()
+            .unwrap_or(self.nearest_strikes)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -117,6 +141,13 @@ pub struct ExecutionConfig {
     pub validity: String,
     #[serde(default = "default_order_tag_prefix")]
     pub order_tag_prefix: String,
+    /// Seconds to wait for a limit entry order to fill before cancelling (default: 240 = 4 min).
+    #[serde(default = "default_entry_order_timeout_secs")]
+    pub entry_order_timeout_secs: u64,
+    /// Cancel pending entry if LTP drops this fraction below the limit price, signalling
+    /// a directional reversal (default: 0.15 = 15%).
+    #[serde(default = "default_limit_cancel_reversal_pct")]
+    pub limit_cancel_reversal_pct: f64,
 }
 
 fn default_mean_lag() -> f64 {
@@ -151,6 +182,14 @@ fn default_order_type() -> String {
     "MARKET".to_string()
 }
 
+fn default_entry_order_timeout_secs() -> u64 {
+    240
+}
+
+fn default_limit_cancel_reversal_pct() -> f64 {
+    0.15
+}
+
 fn default_order_validity() -> String {
     "DAY".to_string()
 }
@@ -161,6 +200,11 @@ fn default_order_tag_prefix() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct OptionsEngineConfig {
+    /// Set to false to disable signal generation and trading while keeping
+    /// the WebSocket and tick recorder running for data collection.
+    #[serde(default = "default_engine_enabled")]
+    pub enabled: bool,
+
     #[serde(default = "default_initial_capital")]
     pub initial_capital: f64,
 
@@ -183,12 +227,13 @@ pub struct OptionsEngineConfig {
     pub max_daily_trades: u32,
 }
 
+fn default_engine_enabled()   -> bool  { true }
 fn default_initial_capital() -> f64 { 10_000.0 }
 fn default_max_daily_loss()   -> f64 { 30.0 }
 fn default_profit_target()    -> f64 { 55.0 }
 fn default_stop_loss()        -> f64 { 35.0 }
-fn default_min_confidence()   -> f64 { 62.0 }
-fn default_scan_interval()    -> u64 { 60 }
+fn default_min_confidence()   -> f64 { 60.0 }
+fn default_scan_interval()    -> u64 { 45 }
 fn default_max_daily_trades() -> u32 { 3 }
 
 impl Config {
@@ -233,6 +278,7 @@ greeks_log_interval = 1
         assert_eq!(config.kite.api_key, "test_key");
         assert_eq!(config.equities.symbols.len(), 2);
         assert_eq!(config.options.underlyings[0], "NIFTY");
+        assert_eq!(config.options.expiry.as_deref(), Some("2026-02-26"));
         assert!((config.greeks.risk_free_rate - 0.065).abs() < 1e-9);
     }
 }
