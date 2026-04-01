@@ -6,6 +6,7 @@ Cargo.lock
 
 # Config files with secrets
 config.toml
+CLAUDE.md
 
 # Kite session token cache (contains access token — never commit)
 .kite_token
@@ -39,6 +40,10 @@ env/
 # Runtime data
 data/
 backtest/
+
+# Local-only collector/runtime files
+src/main.rs
+src/recorder.rs
 
 # Large local assets
 logo.png

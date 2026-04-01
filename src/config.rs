@@ -25,6 +25,7 @@ fn default_options_engine_config() -> OptionsEngineConfig {
         profit_target_pct: 55.0,
         stop_loss_pct: 35.0,
         min_confidence: 60.0,
+        expiry_day_min_confidence: 60.0,
         scan_interval_secs: 45,
         max_daily_trades: 5,
     }
@@ -220,6 +221,9 @@ pub struct OptionsEngineConfig {
     #[serde(default = "default_min_confidence")]
     pub min_confidence: f64,
 
+    #[serde(default = "default_expiry_day_min_confidence")]
+    pub expiry_day_min_confidence: f64,
+
     #[serde(default = "default_scan_interval")]
     pub scan_interval_secs: u64,
 
@@ -233,6 +237,7 @@ fn default_max_daily_loss()   -> f64 { 30.0 }
 fn default_profit_target()    -> f64 { 55.0 }
 fn default_stop_loss()        -> f64 { 35.0 }
 fn default_min_confidence()   -> f64 { 60.0 }
+fn default_expiry_day_min_confidence() -> f64 { 60.0 }
 fn default_scan_interval()    -> u64 { 45 }
 fn default_max_daily_trades() -> u32 { 3 }
 

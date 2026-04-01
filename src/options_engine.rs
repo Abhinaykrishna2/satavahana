@@ -660,6 +660,7 @@ pub struct OptionsEngine {
     profit_target_pct: f64,
     stop_loss_pct: f64,
     min_confidence: f64,
+    expiry_day_min_confidence: f64,
 
     risk_free_rate: f64,
     dividend_yield: f64,
@@ -768,6 +769,7 @@ impl OptionsEngine {
             profit_target_pct: cfg.profit_target_pct.clamp(1.0, 200.0),
             stop_loss_pct: cfg.stop_loss_pct.clamp(1.0, 95.0),
             min_confidence: cfg.min_confidence.clamp(0.0, 100.0),
+            expiry_day_min_confidence: cfg.expiry_day_min_confidence.clamp(0.0, 100.0),
             risk_free_rate,
             dividend_yield,
             scan_count: 0,
@@ -775,7 +777,7 @@ impl OptionsEngine {
             replay_last_scan_ms: None,
             warmup_until_ms: None,
             scan_interval_secs: cfg.scan_interval_secs.max(1),
-            max_daily_trades: cfg.max_daily_trades.clamp(1, 50),
+            max_daily_trades: cfg.max_daily_trades.min(50),
             execution_buy_offset_inr: 0.0,
             execution_sell_offset_inr: 0.0,
             signals_generated: 0,
@@ -823,6 +825,18 @@ impl OptionsEngine {
             .with_timezone(&ist)
             .format("%Y-%m-%d")
             .to_string()
+    }
+
+    fn min_confidence_floor_for(
+        &self,
+        snap: &ChainSnapshot,
+        primary_strategy: StrategyType,
+    ) -> f64 {
+        if snap.days_to_expiry < 0.5 && primary_strategy == StrategyType::GammaScalp {
+            self.expiry_day_min_confidence.min(self.min_confidence)
+        } else {
+            self.min_confidence
+        }
     }
 
     fn reset_daily_state_if_needed(&mut self) {
@@ -1405,8 +1419,8 @@ impl OptionsEngine {
             info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             info!("  OPTIONS SIGNAL ENGINE — ACTIVE");
             info!("  Capital: ₹{:.0} | Target: ₹50,000", self.risk.capital);
-            info!("  Profit target: {:.0}% | Stop: {:.0}% | Min confidence: {:.0}",
-                self.profit_target_pct, self.stop_loss_pct, self.min_confidence);
+            info!("  Profit target: {:.0}% | Stop: {:.0}% | Min confidence: {:.0} | Expiry gamma floor: {:.0}",
+                self.profit_target_pct, self.stop_loss_pct, self.min_confidence, self.expiry_day_min_confidence);
             info!("  Scan interval: {}s", self.scan_interval_secs);
             info!("  Max daily trades: {}", self.max_daily_trades);
             info!("  Strategies: GammaScalp | IVExpansion | TrendFollow | MaxPain | OIDivergence | GEX");
@@ -1525,13 +1539,6 @@ impl OptionsEngine {
                 ist_mins / 60, ist_mins % 60);
         }
 
-        // Midday uses a floor of 70 to keep IVExpansion reachable (max ~73),
-        // but never drop below min_confidence so the configured floor is always respected.
-        let midday_threshold = if matches!(session, SessionPhase::Midday) {
-            self.min_confidence.max(70.0)
-        } else {
-            self.min_confidence
-        };
         let mut pending_batch: Vec<(Signal, usize)> = Vec::new();
 
         let now_ms = self.current_time_ms();
@@ -1545,19 +1552,38 @@ impl OptionsEngine {
                     .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal))
                     .map(|s| s.action)
                     .unwrap_or(SignalAction::Hold);
+                let regular_floor = self.min_confidence;
+                let expiry_gamma_floor = self.expiry_day_min_confidence.min(self.min_confidence);
+                let admission_threshold_for = |signal: &Signal| {
+                    let base = if signal.strategy == StrategyType::GammaScalp && snap.days_to_expiry < 0.5 {
+                        expiry_gamma_floor
+                    } else {
+                        regular_floor
+                    };
+                    if matches!(session, SessionPhase::Midday)
+                        && !(signal.strategy == StrategyType::GammaScalp && snap.days_to_expiry < 0.5)
+                    {
+                        base.max(70.0)
+                    } else {
+                        base
+                    }
+                };
                 self.last_scan_result.insert(snap.underlying.clone(), LastScanResult {
                     action: dominant_action,
                     best_score,
                     scanned_at_ms: now_ms,
                 });
                 let best = best_score as i32;
+                let signals_above = signals.iter()
+                    .filter(|s| s.confidence >= admission_threshold_for(s))
+                    .count();
                 warn!("Scan #{} {} {:?} spot={:.0} atm_iv={:.1}% iv_rank={:.0} pcr={:.2} best_score={} threshold={:.0} signals_above={}",
                     self.scan_count, snap.underlying, session, snap.spot,
                     snap.atm_iv * 100.0, snap.iv_rank, snap.pcr_oi,
-                    best, midday_threshold,
-                    signals.iter().filter(|s| s.confidence >= midday_threshold).count());
+                    best, self.min_confidence,
+                    signals_above);
                 for signal in signals {
-                    if signal.confidence >= midday_threshold {
+                    if signal.confidence >= admission_threshold_for(&signal) {
                         pending_batch.push((signal, snap_idx));
                     }
                 }
@@ -1600,8 +1626,17 @@ impl OptionsEngine {
         if in_warmup {
             info!("Warmup active: {} signal(s) suppressed (clock {} ms)", pending_batch.len(), self.current_time_ms());
         } else {
+            let mut immediate_expiry_gamma = false;
             for (signal, _) in pending_batch {
+                if signal.strategy == StrategyType::GammaScalp
+                    && signal.entry_ctx.days_to_expiry < 0.5
+                {
+                    immediate_expiry_gamma = true;
+                }
                 self.pending_signals.push_back(signal);
+            }
+            if immediate_expiry_gamma {
+                self.execute_pending_signals();
             }
         }
 
@@ -1732,12 +1767,18 @@ impl OptionsEngine {
             return;
         }
 
-        let min_delay_ms: u64 = 30_000;
         let max_age_ms = self.scan_interval_secs.saturating_mul(2_000);
 
         let pending: Vec<Signal> = self.pending_signals.drain(..).collect();
         let mut requeue: Vec<Signal> = Vec::new();
         for mut signal in pending {
+            let min_delay_ms: u64 = if signal.strategy == StrategyType::GammaScalp
+                && signal.entry_ctx.days_to_expiry < 0.5
+            {
+                5_000
+            } else {
+                30_000
+            };
             let age_ms = self.current_time_ms().saturating_sub(signal.timestamp_ms);
             if age_ms < min_delay_ms {
                 // Too young — re-queue; enforce per-signal delay, not just oldest.
@@ -2449,21 +2490,19 @@ impl OptionsEngine {
 
         // Symmetric PCR conviction floors.
         //
-        // For PE: PCR 0.83–0.90 = mild put-writer activity, ambiguous directional edge.
-        //         Require PCR ≤ 0.82 (clear net-put-writing dominance) before shorting
-        //         via puts; weaker signals are frequently wrong in mean-reverting tape.
+        // For PE: PCR 0.89+ starts to lose bearish clarity, but 0.83–0.88 can still be
+        //         actionable when multiple bearish strategies align. Keep a floor, but
+        //         avoid filtering out expiry-week downside continuation setups entirely.
         //
-        // For CE: PCR 1.20–1.24 = mild call-writing / slight bullish tilt.
-        //         The Bullish regime threshold is already PCR > 1.20; a signal barely
-        //         above that (1.21–1.24) carries the same ambiguity. Require PCR ≥ 1.25
-        //         for CE entries so only confirmed put-writing excess triggers a long call.
-        if dominant_action == SignalAction::BuyPE && snap.pcr_oi > 0.82 {
-            warn!("  {} gen_signals: PE blocked — PCR {:.2} > 0.82 (weak bearish conviction)",
+        // For CE: PCR 1.23+ is enough to confirm bullish skew when trend/GEX/IV agree.
+        //         The older 1.25 floor filtered out valid March expiry-week winners.
+        if dominant_action == SignalAction::BuyPE && snap.pcr_oi > 0.88 {
+            warn!("  {} gen_signals: PE blocked — PCR {:.2} > 0.88 (weak bearish conviction)",
                 snap.underlying, snap.pcr_oi);
             return signals;
         }
-        if dominant_action == SignalAction::BuyCE && snap.pcr_oi < 1.25 {
-            warn!("  {} gen_signals: CE blocked — PCR {:.2} < 1.25 (weak bullish conviction)",
+        if dominant_action == SignalAction::BuyCE && snap.pcr_oi < 1.23 {
+            warn!("  {} gen_signals: CE blocked — PCR {:.2} < 1.23 (weak bullish conviction)",
                 snap.underlying, snap.pcr_oi);
             return signals;
         }
@@ -2493,9 +2532,26 @@ impl OptionsEngine {
         };
 
         let n_dominant = dominant_signals.len();
+        let confidence_floor = self.min_confidence_floor_for(snap, primary_strategy);
         warn!("  {} gen_signals: dominant={:?} composite={:.1} threshold={:.0} strategies={}",
-            snap.underlying, dominant_action, composite_score, self.min_confidence, n_dominant);
-        if composite_score < self.min_confidence { return signals; }
+            snap.underlying, dominant_action, composite_score, confidence_floor, n_dominant);
+        if composite_score < confidence_floor { return signals; }
+
+        let session_now = self.current_session();
+        if matches!(session_now, SessionPhase::Midday)
+            && snap.days_to_expiry > 3.5
+            && matches!(dominant_action, SignalAction::BuyPE)
+            && snap.iv_rank >= 70.0
+            && snap.pcr_oi >= 0.85
+        {
+            warn!(
+                "  {} gen_signals: PE blocked — midday 4+DTE bearish flow with rich IV {:.0}% and mild PCR {:.2} is treated as a no-trade",
+                snap.underlying,
+                snap.iv_rank,
+                snap.pcr_oi
+            );
+            return signals;
+        }
 
         let target_strike = self.pick_strike(snap, &dominant_action, lot_size);
         let option_price = match dominant_action {
@@ -2512,7 +2568,7 @@ impl OptionsEngine {
         // not a single fixed config value. Confidence and DTE apply as scalars.
         let (effective_target_pct, effective_stop_pct) = {
             // Confidence multiplier: 0.90x at threshold → 1.15x at threshold+30.
-            let conf_norm = ((composite_score - self.min_confidence) / 30.0).clamp(0.0, 1.0);
+            let conf_norm = ((composite_score - confidence_floor) / 30.0).clamp(0.0, 1.0);
             let conf_mult = 0.90 + conf_norm * 0.25;
 
             if compressive {
@@ -2540,7 +2596,6 @@ impl OptionsEngine {
         };
 
         let effective_target_pct = {
-            let session_now = self.current_session();
             if matches!(session_now, SessionPhase::Afternoon) {
                 let ts_ms = self.current_time_ms();
                 let now_utc = Utc.timestamp_millis_opt(ts_ms as i64).single().unwrap_or_else(Utc::now);
@@ -2593,9 +2648,15 @@ impl OptionsEngine {
         let risk_reward = if max_loss > 0.0 { max_profit / max_loss } else { 0.0 };
 
         // Reject trades without sufficient risk-reward edge.
-        // 1.3:1 minimum prevents marginal trades that are more coin-flip than edge.
-        if risk_reward < 1.3 {
-            warn!("  {} signal rejected: R:R {:.2}:1 below 1.3 floor", snap.underlying, risk_reward);
+        // Short-dated high-confidence trades often model with lower static R:R because
+        // gamma compresses both target and stop; keep the standard 1.3 floor elsewhere.
+        let min_risk_reward = if snap.days_to_expiry <= 3.5 && composite_score >= 62.0 {
+            0.95
+        } else {
+            1.30
+        };
+        if risk_reward < min_risk_reward {
+            warn!("  {} signal rejected: R:R {:.2}:1 below {:.2} floor", snap.underlying, risk_reward, min_risk_reward);
             return signals;
         }
 

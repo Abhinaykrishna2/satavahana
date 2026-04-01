@@ -78,6 +78,11 @@ stop_loss_pct = 35.0
 # 58 = balanced. Raise to 65+ for fewer, higher-quality signals.
 min_confidence = 58.0
 
+# Optional expiry-day carve-out for pure gamma scalp setups.
+# Keeps the regular floor at 58 while allowing same-day expiry gamma trades
+# to trigger from 51+ when that exact strategy is the dominant signal.
+expiry_day_min_confidence = 51.0
+
 # How often to run the full chain scan (seconds)
 # 45 = scan every 45s during market hours
 scan_interval_secs = 45
