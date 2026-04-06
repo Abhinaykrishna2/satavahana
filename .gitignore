@@ -22,8 +22,10 @@ CLAUDE.md
 .DS_Store
 Thumbs.db
 
-# Logs
+# Logs and runtime output
+logs/
 *.log
+*.log.gz
 
 # User options folder (as requested)
 usoptions/

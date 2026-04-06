@@ -356,9 +356,65 @@ struct PendingEntryOrder {
 struct PendingExitOrder {
     pos_id: u64,
     tag: String,
+    tradingsymbol: String,
+    total_quantity: u32,
     placed_ms: u64,
     last_status_poll_ms: u64,
     reason: String,
+    cancel_requested: bool,
+    last_cancel_attempt_ms: u64,
+    market_fallback_sent: bool,
+    total_filled_quantity: u32,
+    total_filled_notional: f64,
+    current_order_filled_quantity: u32,
+    current_order_filled_notional: f64,
+}
+
+impl PendingExitOrder {
+    fn remaining_quantity(&self) -> u32 {
+        self.total_quantity.saturating_sub(self.total_filled_quantity)
+    }
+
+    fn avg_fill_price(&self) -> Option<f64> {
+        if self.total_filled_quantity == 0 {
+            None
+        } else {
+            Some(self.total_filled_notional / self.total_filled_quantity as f64)
+        }
+    }
+
+    fn record_fill_progress(&mut self, update: &OrderUpdate) {
+        let Some(filled_quantity) = update.filled_quantity else {
+            return;
+        };
+        if filled_quantity < self.current_order_filled_quantity {
+            return;
+        }
+
+        let average_price = update.average_price.unwrap_or(0.0).max(0.0);
+        let order_notional = average_price * filled_quantity as f64;
+        let delta_qty = filled_quantity.saturating_sub(self.current_order_filled_quantity);
+        let delta_notional = order_notional - self.current_order_filled_notional;
+
+        if delta_qty > 0 {
+            self.total_filled_quantity = self.total_filled_quantity.saturating_add(delta_qty);
+        }
+        if delta_qty > 0 || delta_notional.abs() > 0.0001 {
+            self.total_filled_notional = (self.total_filled_notional + delta_notional).max(0.0);
+            self.current_order_filled_quantity = filled_quantity;
+            self.current_order_filled_notional = order_notional.max(0.0);
+        }
+    }
+
+    fn prepare_market_fallback(&mut self, now_ms: u64) {
+        self.placed_ms = now_ms;
+        self.last_status_poll_ms = 0;
+        self.cancel_requested = false;
+        self.last_cancel_attempt_ms = 0;
+        self.market_fallback_sent = true;
+        self.current_order_filled_quantity = 0;
+        self.current_order_filled_notional = 0.0;
+    }
 }
 
 /// Why a pending limit entry order was cancelled by the engine (not the broker).
@@ -1193,14 +1249,23 @@ impl OptionsEngine {
                     tradingsymbol,
                     quantity: filled_qty,
                     side: OrderSide::Sell,
-                    limit_price: None,
+                    limit_price: Some(avg_price),
                 }));
                 self.pending_exit_orders.push(PendingExitOrder {
                     pos_id,
                     tag: exit_tag.clone(),
+                    tradingsymbol: pending.tradingsymbol.clone(),
+                    total_quantity: filled_qty,
                     placed_ms: now_ms,
                     last_status_poll_ms: 0,
                     reason: "PARTIAL FILL EXIT".to_string(),
+                    cancel_requested: false,
+                    last_cancel_attempt_ms: 0,
+                    market_fallback_sent: false,
+                    total_filled_quantity: 0,
+                    total_filled_notional: 0.0,
+                    current_order_filled_quantity: 0,
+                    current_order_filled_notional: 0.0,
                 });
                 self.send_order_command(OrderCommand::StatusByTag { tag: exit_tag });
             }
@@ -1220,14 +1285,47 @@ impl OptionsEngine {
     }
 
     fn handle_exit_order_update(&mut self, idx: usize, update: OrderUpdate) {
+        if let Some(pending) = self.pending_exit_orders.get_mut(idx) {
+            pending.record_fill_progress(&update);
+        }
+
         if let Some(msg) = update.message.as_deref() {
-            if update.source == "place_error" {
-                warn!("Exit order {} failed to place: {}", update.tag, msg);
-                let pending = self.pending_exit_orders.remove(idx);
-                if let Some(pos) = self.positions.iter_mut().find(|p| p.id == pending.pos_id) {
-                    pos.exit_pending = false;
+            match update.source.as_str() {
+                "place_error" => {
+                    let pending = self.pending_exit_orders.remove(idx);
+                    let is_untracked = Self::is_untracked_exit_reason(&pending.reason);
+                    if pending.total_filled_quantity > 0 {
+                        error!(
+                            "Exit order {} failed to place after partial fill {}/{}: {} — manual intervention required",
+                            pending.tag,
+                            pending.total_filled_quantity,
+                            pending.total_quantity,
+                            msg
+                        );
+                    } else if is_untracked {
+                        error!(
+                            "[{}] SELL failed to place tag={} err={} — broker position may still be OPEN. MANUAL INTERVENTION REQUIRED.",
+                            pending.reason, pending.tag, msg
+                        );
+                    } else {
+                        warn!("Exit order {} failed to place: {}", pending.tag, msg);
+                    }
+
+                    if !is_untracked {
+                        if let Some(pos) = self.positions.iter_mut().find(|p| p.id == pending.pos_id) {
+                            pos.exit_pending = pending.total_filled_quantity > 0;
+                        }
+                    }
+                    return;
                 }
-                return;
+                "cancel_error" => {
+                    warn!("Exit order {} cancel failed (will retry): {}", update.tag, msg);
+                    return;
+                }
+                "status_error" => {
+                    warn!("Exit order {} status lookup issue: {}", update.tag, msg);
+                }
+                _ => {}
             }
         }
         let status = update.status.unwrap_or_default();
@@ -1236,39 +1334,25 @@ impl OptionsEngine {
         let is_complete = status_upper == "COMPLETE";
         let is_terminal_reject = status_upper == "REJECTED" || status_upper == "CANCELLED" || status_upper == "CANCELED" || status_upper == "EXPIRED";
 
-        // Exits that have no matching engine Position (EMERGENCY FLATTEN, PARTIAL FILL EXIT)
-        // are untracked by design — handle them separately before the normal path.
-        let is_untracked = self
-            .pending_exit_orders
-            .get(idx)
-            .map(|p| p.reason == "EMERGENCY FLATTEN" || p.reason == "PARTIAL FILL EXIT")
-            .unwrap_or(false);
-
         if is_complete {
-            let avg_price = update.average_price.unwrap_or(0.0);
             let pending = self.pending_exit_orders.remove(idx);
-            if is_untracked {
-                warn!(
-                    "[{}] SELL complete tag={} avg=₹{:.2} — broker position closed",
-                    pending.reason, pending.tag, avg_price
-                );
-            } else if let Some(pos_idx) = self.positions.iter().position(|p| p.id == pending.pos_id) {
-                self.finalize_position_close(pos_idx, avg_price, pending.reason);
-            }
+            let avg_price = pending
+                .avg_fill_price()
+                .unwrap_or(update.average_price.unwrap_or(0.0));
+            self.finish_completed_exit(pending, avg_price);
         } else if is_terminal_reject {
-            let pending = self.pending_exit_orders.remove(idx);
-            if is_untracked {
-                // SELL itself failed — broker-side position may still be open.
-                error!(
-                    "[{}] SELL REJECTED ({}) tag={} — broker position may still be OPEN. MANUAL INTERVENTION REQUIRED.",
-                    pending.reason, status_upper, pending.tag
-                );
-            } else {
-                warn!("Exit order {} terminal status {}. Will re-attempt exit later.", pending.tag, status_upper);
-                if let Some(pos) = self.positions.iter_mut().find(|p| p.id == pending.pos_id) {
-                    pos.exit_pending = false;
-                }
+            let needs_market_fallback = self
+                .pending_exit_orders
+                .get(idx)
+                .map(|p| p.cancel_requested && !p.market_fallback_sent)
+                .unwrap_or(false);
+            if needs_market_fallback {
+                self.launch_exit_market_fallback(idx, &status_upper);
+                return;
             }
+
+            let pending = self.pending_exit_orders.remove(idx);
+            self.handle_failed_exit(pending, &status_upper);
         }
     }
 
@@ -1276,6 +1360,9 @@ impl OptionsEngine {
         if !self.live_mode_enabled() || (self.pending_entry_orders.is_empty() && self.pending_exit_orders.is_empty()) {
             return;
         }
+        // Give a limit exit a brief chance to cross naturally, then cancel it and
+        // fall back to a market sell so positions cannot remain exit_pending forever.
+        const EXIT_LIMIT_TIMEOUT_MS: u64 = 15_000;
         const CANCEL_RETRY_INTERVAL_MS: u64 = 15_000;
         let now = self.current_time_ms();
         let mut status_tags: Vec<String> = Vec::new();
@@ -1347,6 +1434,35 @@ impl OptionsEngine {
         }
 
         for pending in self.pending_exit_orders.iter_mut() {
+            if pending.cancel_requested {
+                if now.saturating_sub(pending.last_cancel_attempt_ms) >= CANCEL_RETRY_INTERVAL_MS {
+                    pending.last_cancel_attempt_ms = now;
+                    cancel_tags.push(pending.tag.clone());
+                    status_tags.push(pending.tag.clone());
+                    warn!(
+                        "Exit cancel retry [{}] tag={} — awaiting broker confirmation",
+                        pending.reason,
+                        pending.tag
+                    );
+                }
+                continue;
+            }
+
+            if !pending.market_fallback_sent
+                && now.saturating_sub(pending.placed_ms) >= EXIT_LIMIT_TIMEOUT_MS
+            {
+                pending.cancel_requested = true;
+                pending.last_cancel_attempt_ms = now;
+                cancel_tags.push(pending.tag.clone());
+                status_tags.push(pending.tag.clone());
+                warn!(
+                    "Exit order [timeout {}s] tag={} — cancelling stale limit sell before MARKET fallback",
+                    EXIT_LIMIT_TIMEOUT_MS / 1000,
+                    pending.tag
+                );
+                continue;
+            }
+
             if now.saturating_sub(pending.last_status_poll_ms) >= self.order_status_poll_interval_ms {
                 pending.last_status_poll_ms = now;
                 status_tags.push(pending.tag.clone());
@@ -1384,6 +1500,117 @@ impl OptionsEngine {
             self.pending_capital_reserved = (self.pending_capital_reserved - pending.estimated_capital).max(0.0);
         }
         self.open_filled_position_from_pending(pending, broker_avg_price)
+    }
+
+    fn is_untracked_exit_reason(reason: &str) -> bool {
+        reason == "EMERGENCY FLATTEN" || reason == "PARTIAL FILL EXIT"
+    }
+
+    fn finish_completed_exit(&mut self, pending: PendingExitOrder, avg_price: f64) {
+        if Self::is_untracked_exit_reason(&pending.reason) {
+            warn!(
+                "[{}] SELL complete tag={} avg=₹{:.2} — broker position closed",
+                pending.reason, pending.tag, avg_price
+            );
+        } else if let Some(pos_idx) = self.positions.iter().position(|p| p.id == pending.pos_id) {
+            self.finalize_position_close(pos_idx, avg_price, pending.reason);
+        }
+    }
+
+    fn handle_failed_exit(&mut self, pending: PendingExitOrder, status_upper: &str) {
+        let is_untracked = Self::is_untracked_exit_reason(&pending.reason);
+
+        if pending.total_filled_quantity >= pending.total_quantity && pending.total_quantity > 0 {
+            let avg_price = pending.avg_fill_price().unwrap_or(0.0);
+            self.finish_completed_exit(pending, avg_price);
+            return;
+        }
+
+        if is_untracked {
+            error!(
+                "[{}] SELL {} tag={} filled {}/{} — broker position may still be OPEN. MANUAL INTERVENTION REQUIRED.",
+                pending.reason,
+                status_upper,
+                pending.tag,
+                pending.total_filled_quantity,
+                pending.total_quantity
+            );
+            return;
+        }
+
+        if let Some(pos) = self.positions.iter_mut().find(|p| p.id == pending.pos_id) {
+            if pending.total_filled_quantity == 0 {
+                warn!(
+                    "Exit order {} terminal status {}. Will re-attempt exit later.",
+                    pending.tag, status_upper
+                );
+                pos.exit_pending = false;
+            } else {
+                error!(
+                    "Exit order {} terminal status {} after partial fill {}/{} — manual intervention required; engine position left exit_pending to avoid oversell.",
+                    pending.tag,
+                    status_upper,
+                    pending.total_filled_quantity,
+                    pending.total_quantity
+                );
+                pos.exit_pending = true;
+            }
+        }
+    }
+
+    fn launch_exit_market_fallback(&mut self, idx: usize, terminal_status: &str) {
+        let Some(snapshot) = self.pending_exit_orders.get(idx).cloned() else {
+            return;
+        };
+        let remaining_qty = snapshot.remaining_quantity();
+        if remaining_qty == 0 {
+            let pending = self.pending_exit_orders.remove(idx);
+            let avg_price = pending.avg_fill_price().unwrap_or(0.0);
+            self.finish_completed_exit(pending, avg_price);
+            return;
+        }
+
+        // Look up current LTP from the position's option token for the LIMIT fallback.
+        let fallback_price = self
+            .positions
+            .iter()
+            .find(|p| p.id == snapshot.pos_id)
+            .and_then(|pos| self.store.get(pos.option_token))
+            .map(|tick| tick.ltp)
+            .filter(|&ltp| ltp > 0.0)
+            .or_else(|| {
+                // Untracked exits (EMERGENCY FLATTEN etc) have no matching Position;
+                // use the original entry price as a conservative floor.
+                self.positions
+                    .iter()
+                    .find(|p| p.id == snapshot.pos_id)
+                    .map(|p| p.entry_price)
+            })
+            .unwrap_or(0.05); // absolute floor: tick size minimum
+
+        warn!(
+            "Exit order {} timed out as {} after filling {}/{} — sending LIMIT fallback @₹{:.2} for remaining {}",
+            snapshot.tag,
+            terminal_status,
+            snapshot.total_filled_quantity,
+            snapshot.total_quantity,
+            fallback_price,
+            remaining_qty
+        );
+
+        let now_ms = self.current_time_ms();
+        if let Some(pending) = self.pending_exit_orders.get_mut(idx) {
+            pending.prepare_market_fallback(now_ms);
+        }
+
+        self.send_order_command(OrderCommand::Place(PlaceOrderCmd {
+            tag: snapshot.tag.clone(),
+            tradingsymbol: snapshot.tradingsymbol,
+            quantity: remaining_qty,
+            side: OrderSide::Sell,
+            limit_price: Some(fallback_price),
+        }));
+        self.send_order_command(OrderCommand::StatusByTag { tag: snapshot.tag });
     }
 
     fn flatten_stale_filled_entry(&mut self, idx: usize, broker_avg_price: f64) {
@@ -3661,7 +3888,7 @@ impl OptionsEngine {
             tradingsymbol,
             quantity,
             side: OrderSide::Buy,
-            limit_price: None,
+            limit_price: Some(signal.option_price),
         }));
         self.send_order_command(OrderCommand::StatusByTag { tag });
     }
@@ -3704,20 +3931,30 @@ impl OptionsEngine {
             let quantity = signal.lots.saturating_mul(signal.lot_size);
             if quantity > 0 {
                 let now_ms = self.current_time_ms();
+                let exit_symbol = pending.tradingsymbol.clone();
                 self.send_order_command(OrderCommand::Place(PlaceOrderCmd {
                     tag: exit_tag.clone(),
-                    tradingsymbol: pending.tradingsymbol,
+                    tradingsymbol: exit_symbol.clone(),
                     quantity,
                     side: OrderSide::Sell,
-                    limit_price: None,
+                    limit_price: Some(broker_avg_price),
                 }));
                 // Track via PendingExitOrder so status is polled and rejections surface.
                 self.pending_exit_orders.push(PendingExitOrder {
                     pos_id: pending.pos_id, // no matching Position; handled below
                     tag: exit_tag.clone(),
+                    tradingsymbol: exit_symbol,
+                    total_quantity: quantity,
                     placed_ms: now_ms,
                     last_status_poll_ms: 0,
                     reason: "EMERGENCY FLATTEN".to_string(),
+                    cancel_requested: false,
+                    last_cancel_attempt_ms: 0,
+                    market_fallback_sent: false,
+                    total_filled_quantity: 0,
+                    total_filled_notional: 0.0,
+                    current_order_filled_quantity: 0,
+                    current_order_filled_notional: 0.0,
                 });
                 self.send_order_command(OrderCommand::StatusByTag { tag: exit_tag });
             }
@@ -3797,16 +4034,25 @@ impl OptionsEngine {
                     tradingsymbol: tradingsymbol.clone(),
                     quantity,
                     side: OrderSide::Sell,
-                    limit_price: None,
+                    limit_price: Some(current_price),
                 }));
                 self.send_order_command(OrderCommand::StatusByTag { tag: exit_tag.clone() });
                 
                 self.pending_exit_orders.push(PendingExitOrder {
                     pos_id,
                     tag: exit_tag,
+                    tradingsymbol,
+                    total_quantity: quantity,
                     placed_ms: self.current_time_ms(),
                     last_status_poll_ms: self.current_time_ms(),
                     reason,
+                    cancel_requested: false,
+                    last_cancel_attempt_ms: 0,
+                    market_fallback_sent: false,
+                    total_filled_quantity: 0,
+                    total_filled_notional: 0.0,
+                    current_order_filled_quantity: 0,
+                    current_order_filled_notional: 0.0,
                 });
             } else {
                 self.finalize_position_close(idx, current_price, reason);
@@ -4171,9 +4417,20 @@ impl OptionsEngine {
 mod tests {
     use super::{
         nearest_affordable_otm_idx,
+        OptionsEngine,
+        PendingExitOrder,
+        Position,
+        SessionPhase,
+        SignalAction,
         StrikeScanDirection,
+        StrategyType,
         MIN_TRADEABLE_OPTION_PRICE,
     };
+    use crate::config::OptionsEngineConfig;
+    use crate::execution::{OrderCommand, OrderSide, OrderUpdate};
+    use crate::ledger::EntryContext;
+    use crate::store::TickStore;
+    use std::collections::HashMap;
 
     #[test]
     fn finds_pe_strike_beyond_old_five_strike_limit() {
@@ -4248,5 +4505,147 @@ mod tests {
 
         assert_eq!(idx, Some(2));
         assert_eq!(checked, 3);
+    }
+
+    #[test]
+    fn timed_out_limit_exit_falls_back_to_market_and_closes_position() {
+        let cfg = OptionsEngineConfig {
+            enabled: true,
+            initial_capital: 10_000.0,
+            max_daily_loss_pct: 30.0,
+            profit_target_pct: 55.0,
+            stop_loss_pct: 35.0,
+            min_confidence: 60.0,
+            expiry_day_min_confidence: 60.0,
+            scan_interval_secs: 45,
+            max_daily_trades: 3,
+        };
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_exit_timeout_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+
+        let mut engine = OptionsEngine::new(
+            Vec::new(),
+            TickStore::new(),
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+        engine.set_clock_override_ms(20_000);
+
+        engine.positions.push(Position {
+            id: 1,
+            underlying: "NIFTY".to_string(),
+            tradingsymbol: "NIFTY26APR22000CE".to_string(),
+            action: SignalAction::BuyCE,
+            strike: 22_000.0,
+            expiry: "2026-04-30".to_string(),
+            option_token: 101,
+            lots: 1,
+            lot_size: 50,
+            entry_price: 100.0,
+            target_price: 120.0,
+            stop_price: 85.0,
+            entry_time_ms: 0,
+            entry_datetime: "2026-04-06 09:30:00".to_string(),
+            strategy: StrategyType::Composite,
+            is_open: true,
+            exit_price: 0.0,
+            exit_time_ms: 0,
+            pnl: 0.0,
+            pnl_pct: 0.0,
+            exit_reason: String::new(),
+            capital_deployed: 5_000.0,
+            entry_ctx: EntryContext {
+                confidence: 75.0,
+                session: SessionPhase::Morning.to_string(),
+                ..EntryContext::default()
+            },
+            breakeven_stop_set: false,
+            exit_pending: true,
+            checkpoints_evaluated: 0,
+        });
+        engine.pending_exit_orders.push(PendingExitOrder {
+            pos_id: 1,
+            tag: "SATAEXIT1".to_string(),
+            tradingsymbol: "NIFTY26APR22000CE".to_string(),
+            total_quantity: 50,
+            placed_ms: 0,
+            last_status_poll_ms: 0,
+            reason: "TARGET HIT".to_string(),
+            cancel_requested: false,
+            last_cancel_attempt_ms: 0,
+            market_fallback_sent: false,
+            total_filled_quantity: 0,
+            total_filled_notional: 0.0,
+            current_order_filled_quantity: 0,
+            current_order_filled_notional: 0.0,
+        });
+
+        engine.poll_pending_orders();
+        assert!(engine.pending_exit_orders[0].cancel_requested);
+
+        match order_rx.try_recv().expect("cancel command") {
+            OrderCommand::CancelByTag { tag } => assert_eq!(tag, "SATAEXIT1"),
+            other => panic!("expected cancel command, got {:?}", other),
+        }
+        match order_rx.try_recv().expect("status command") {
+            OrderCommand::StatusByTag { tag } => assert_eq!(tag, "SATAEXIT1"),
+            other => panic!("expected status command, got {:?}", other),
+        }
+
+        engine.handle_order_update(OrderUpdate {
+            tag: "SATAEXIT1".to_string(),
+            order_id: None,
+            status: Some("CANCELLED".to_string()),
+            average_price: Some(0.0),
+            filled_quantity: Some(0),
+            pending_quantity: Some(50),
+            source: "status_poll".to_string(),
+            message: None,
+        });
+
+        assert!(engine.pending_exit_orders[0].market_fallback_sent);
+        assert!(!engine.pending_exit_orders[0].cancel_requested);
+
+        match order_rx.try_recv().expect("market fallback order") {
+            OrderCommand::Place(cmd) => {
+                assert_eq!(cmd.tag, "SATAEXIT1");
+                assert_eq!(cmd.quantity, 50);
+                assert_eq!(cmd.side, OrderSide::Sell);
+                assert!(cmd.limit_price.is_some(), "fallback should use LIMIT, not MARKET");
+                // No tick in store, so falls back to position entry_price (100.0)
+                assert!((cmd.limit_price.unwrap() - 100.0).abs() < 0.01);
+            }
+            other => panic!("expected place command, got {:?}", other),
+        }
+        match order_rx.try_recv().expect("fallback status command") {
+            OrderCommand::StatusByTag { tag } => assert_eq!(tag, "SATAEXIT1"),
+            other => panic!("expected status command, got {:?}", other),
+        }
+
+        engine.handle_order_update(OrderUpdate {
+            tag: "SATAEXIT1".to_string(),
+            order_id: None,
+            status: Some("COMPLETE".to_string()),
+            average_price: Some(101.5),
+            filled_quantity: Some(50),
+            pending_quantity: Some(0),
+            source: "status_poll".to_string(),
+            message: None,
+        });
+
+        assert!(engine.pending_exit_orders.is_empty());
+        assert!(!engine.positions[0].is_open);
+        assert!(!engine.positions[0].exit_pending);
+        assert!((engine.positions[0].exit_price - 101.5).abs() < 0.01);
+        assert_eq!(engine.positions[0].exit_reason, "TARGET HIT");
     }
 }
