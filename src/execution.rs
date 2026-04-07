@@ -3,6 +3,7 @@ use crate::config::ExecutionConfig;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tracing::{error, info, warn};
 
@@ -14,7 +15,10 @@ pub async fn fetch_live_available_funds(
     access_token: &str,
 ) -> Result<f64, String> {
     let auth_header = format!("token {}:{}", api_key, access_token);
-    let client = Client::new();
+    let client = Client::builder()
+                .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+                .build()
+                .expect("failed to build HTTP client");
     let resp = client
         .get(KITE_MARGINS_URL)
         .header("X-Kite-Version", "3")
@@ -139,7 +143,10 @@ impl OrderExecutor {
         update_tx: UnboundedSender<OrderUpdate>,
     ) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+                .build()
+                .expect("failed to build HTTP client"),
             auth_header,
             cfg,
             rx,

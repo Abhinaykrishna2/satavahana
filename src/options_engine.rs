@@ -1811,6 +1811,32 @@ impl OptionsEngine {
                     signals_above);
                 for signal in signals {
                     if signal.confidence >= admission_threshold_for(&signal) {
+                        // Morning session on expiry day: require multi-strategy confluence.
+                        // Single-strategy Gamma Scalp alone in the morning chop loses to
+                        // whipsaws. This doesn't block afternoon signals where GEX+OI+PCR align.
+                        if matches!(session, SessionPhase::Morning)
+                            && snap.days_to_expiry < 0.5
+                            && signal.strategy == StrategyType::GammaScalp
+                            && signal.confidence < 70.0
+                        {
+                            warn!("  {} Morning 0-DTE single-strategy gate: score {:.0} < 70 required for morning expiry",
+                                snap.underlying, signal.confidence);
+                            continue;
+                        }
+                        // 0-DTE Morning CE: block when IV Rank is at session floor.
+                        // Belt-and-suspenders guard complementing Gate C in generate_signals.
+                        // Even if a high-confidence composite signal bypasses Gate C (e.g. a
+                        // future code path change), this admission gate ensures no CE trade
+                        // enters on expiry morning when IV has no room to expand.
+                        if matches!(session, SessionPhase::Morning)
+                            && snap.days_to_expiry < 0.5
+                            && signal.action == SignalAction::BuyCE
+                            && snap.iv_rank < 5.0
+                        {
+                            warn!("  {} Morning 0-DTE CE gate: IV Rank {:.1}% at session floor — no IV edge",
+                                snap.underlying, snap.iv_rank);
+                            continue;
+                        }
                         pending_batch.push((signal, snap_idx));
                     }
                 }
@@ -2667,6 +2693,18 @@ impl OptionsEngine {
             return signals;
         }
 
+        // Gate C: 0-DTE + IV at session floor + bullish PCR → CE entry has no IV tailwind.
+        // All three conditions must hold simultaneously (this is the Apr 07 failure signature).
+        // On 0-DTE expiry mornings, if IV rank is at or near zero (options priced at annual
+        // lows) AND PCR is mildly bullish, a CE buy has zero IV expansion tailwind. The
+        // premium is already minimal and any adverse tick accelerates the loss via gamma.
+        // Feb 24 (WIN) is preserved: iv_rank=57% → fails the iv_rank<2.0 check.
+        if snap.days_to_expiry < 0.5 && snap.iv_rank < 2.0 && snap.pcr_oi > 1.0 {
+            warn!("  {} 0-DTE CE gated: IV Rank {:.1}% (session floor) + PCR {:.2} — no IV edge for CE on expiry morning",
+                snap.underlying, snap.iv_rank, snap.pcr_oi);
+            return signals;
+        }
+
         if let Some(s) = self.strategy_gamma_scalp(snap)   { scored.push(s); }
         // IVExpansion requires IV to expand — blocked in compressed regimes where
         // low volatility is likely to persist, directly contradicting the entry thesis.
@@ -3057,11 +3095,14 @@ impl OptionsEngine {
                 picked_price,
                 otm_steps,
             );
-            // Don't go more than 3 strikes OTM -- stay close to ATM for delta/gamma exposure
-            if otm_steps > 3 {
+            // PE: max 2 OTM — deep OTM puts need large spot drops to profit; every
+            // winning PE in backtest used 0-1 OTM. CE: max 3 — markets trend up
+            // more smoothly and 3-OTM CEs have delivered (Apr 02: +₹6,134).
+            let max_otm = if *action == SignalAction::BuyPE { 2 } else { 3 };
+            if otm_steps > max_otm {
                 warn!(
-                    "  pick_strike {} {:?}: {} OTM steps exceeds max 3, skipping",
-                    snap.underlying, action, otm_steps
+                    "  pick_strike {} {:?}: {} OTM steps exceeds max {}, skipping",
+                    snap.underlying, action, otm_steps, max_otm
                 );
                 return None;
             }

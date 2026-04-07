@@ -339,15 +339,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             config.greeks.dividend_yield,
             "logs",
         );
-        // Suppress signals for the first 15 minutes of live operation so OI/IV
-        // baselines can accumulate before the engine is allowed to trade.
-        let warmup_end_ms = std::time::SystemTime::now()
+        // Warmup duration depends on whether this is a cold start or a mid-session restart.
+        // Cold start (before 09:30 IST): 15 min — engine needs to build OI/IV baselines
+        //   from scratch as the market opens.
+        // Mid-session restart (09:30 IST onwards): 3 min — tick store already warm from
+        //   the previous run; just enough time to re-sync the scan clock and pending queue.
+        let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64
-            + 15 * 60 * 1_000;
-        options_signal_engine.set_warmup_until_ms(warmup_end_ms);
-        info!("  Options warmup: signals suppressed for 15 min after startup");
+            .as_millis() as u64;
+        let ist_offset_ms = (5 * 3600 + 30 * 60) * 1_000_u64;
+        let ist_ms_today = (now_ms + ist_offset_ms) % (24 * 3600 * 1_000);
+        let ist_mins_today = ist_ms_today / 60_000;
+        // 09:30 IST = 570 minutes from midnight
+        let warmup_secs: u64 = if ist_mins_today < 570 { 15 * 60 } else { 3 * 60 };
+        options_signal_engine.set_warmup_until_ms(now_ms + warmup_secs * 1_000);
+        info!("  Options warmup: signals suppressed for {} min after startup ({})",
+            warmup_secs / 60,
+            if warmup_secs == 15 * 60 { "cold start" } else { "mid-session restart" });
 
         options_signal_engine.set_capital_refresh_credentials(
             auth.api_key.clone(),
