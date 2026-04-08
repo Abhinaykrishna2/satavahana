@@ -4250,32 +4250,27 @@ impl OptionsEngine {
 
             let hold_mins = (now_ms.saturating_sub(entry_time_ms)) as f64 / 60_000.0;
 
-            let range = (target_price - entry_price).max(0.01);
-            let gain_frac = (current_price - entry_price) / range;
-
-            // Minimum hold before each checkpoint can fire:
-            //   CP1 (40%): 5 min  — avoids open-tick noise triggering early stop-to-near-entry
-            //   CP2 (65%): 5 min  — same gate
-            //   CP3 (85%): 10 min — locks in 15%; needs confirmed move, not a 30s spike
-            let new_cp = if gain_frac >= 0.85 && hold_mins >= 10.0 { 3 }
-                         else if gain_frac >= 0.65 && hold_mins >= 5.0 { 2 }
-                         else if gain_frac >= 0.40 && hold_mins >= 5.0 { 1 }
-                         else { cp };
-
-            if new_cp > cp {
+            // Continuous trailing stop — variable lookback:
+            // Activates at +7.5% gain (min 3-min hold).
+            // Below +25%: 1 step behind (2.5% buffer) — tight enough to capture moves.
+            // At +25% and above: 2 steps behind (5.0% buffer) — let big winners breathe.
+            // e.g.: +7.5%→stop +5%; +10%→+7.5%; ... +25%→+20%; +27.5%→+22.5%; etc.
+            // Stop only ever ratchets up — never down.
+            let abs_gain_pct = (current_price - entry_price) / entry_price * 100.0;
+            if abs_gain_pct >= 7.5 && hold_mins >= 3.0 {
+                let step = 2.5_f64;
+                let lookback = if abs_gain_pct >= 25.0 { step * 2.0 } else { step };
+                let lock_pct = (abs_gain_pct / step).floor() * step - lookback;
+                let new_stop = entry_price * (1.0 + lock_pct / 100.0);
                 let pos = &mut self.positions[i];
-                let new_stop = match new_cp {
-                    1 => entry_price * 0.97,   // -3% below entry: trim risk, absorb noise
-                    2 => entry_price * 1.05,   // +5% locked in
-                    _ => entry_price * 1.15,   // +15% locked in
-                };
-                if pos.stop_price < new_stop {
+                if new_stop > pos.stop_price {
                     pos.stop_price = new_stop;
-                    info!("  Profit lock CP{}: position #{} {} stop → ₹{:.2} (current ₹{:.2}, target ₹{:.2})",
-                        new_cp, pos.id, pos.underlying, pos.stop_price, current_price, pos.target_price);
+                    let new_cp = ((lock_pct - 5.0) / step).max(0.0) as u32 + 1;
+                    pos.checkpoints_evaluated = new_cp;
+                    pos.breakeven_stop_set = true;
+                    info!("  Trail +{:.1}% (lock +{:.1}%): pos #{} {} stop → ₹{:.2} (ltp ₹{:.2})",
+                        abs_gain_pct, lock_pct, pos.id, pos.underlying, pos.stop_price, current_price);
                 }
-                pos.checkpoints_evaluated = new_cp;
-                pos.breakeven_stop_set = new_cp >= 1;
             }
         }
 
