@@ -268,6 +268,9 @@ pub struct ChainSnapshot {
     pub net_gex: f64,
     pub days_to_expiry: f64,
     pub regime: MarketRegime,
+    /// Overnight gap: (today_open - prev_session_close) / prev_session_close * 100.
+    /// Positive = gap up, negative = gap down. Zero when prev_close unavailable.
+    pub overnight_gap_pct: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -2222,10 +2225,14 @@ impl OptionsEngine {
         };
         let strike_mid = liquid_center.unwrap_or_else(|| (min_strike + max_strike) / 2.0);
 
-        let spot_from_token = self.underlying_tokens.get(underlying)
-            .and_then(|tok| self.store.get(*tok))
-            .map(|t| t.ltp)
-            .filter(|v| *v > 0.0);
+        let underlying_raw = self.underlying_tokens.get(underlying)
+            .and_then(|tok| self.store.get(*tok));
+        let spot_from_token = underlying_raw.as_ref().map(|t| t.ltp).filter(|v| *v > 0.0);
+        // ohlc.close is the previous session's official closing price, broadcast in every
+        // exchange tick. Used for overnight gap computation.
+        let prev_session_close = underlying_raw.as_ref()
+            .map(|t| t.ohlc.close)
+            .filter(|v| *v > 10.0);
         let synthetic_spot = self.estimate_synthetic_spot(&strike_map, t_years);
 
         let spot = match (spot_from_token, synthetic_spot) {
@@ -2391,6 +2398,32 @@ impl OptionsEngine {
 
         let regime = self.detect_regime(pcr_oi, atm_iv, spot, &strikes_mut);
 
+        // Overnight gap: how far is today's spot from yesterday's official close?
+        // Primary source: underlying index token's ohlc.close (live engine where index token
+        // is subscribed). Fallback: put-call parity on ATM options — each option tick carries
+        // its own previous day close price, so S_yesterday ≈ K_atm + CE_close - PE_close.
+        // The parity error is ~20 pts on a 23000 index (0.09%), negligible vs 2.5% gate.
+        let overnight_gap_pct = {
+            // Primary: index token close (works in live engine)
+            let from_index = prev_session_close.map(|c| (spot - c) / c * 100.0);
+            // Fallback: put-call parity from ATM options (works in backtest from CSV close field)
+            let from_parity = self.contracts.iter()
+                .find(|c| c.underlying == underlying && c.expiry == expiry
+                    && c.option_type == OptionType::CE
+                    && (c.strike - atm_strike).abs() < 1.0)
+                .and_then(|ce_c| {
+                    let pe_c = self.contracts.iter().find(|c|
+                        c.underlying == underlying && c.expiry == expiry
+                        && c.option_type == OptionType::PE
+                        && (c.strike - atm_strike).abs() < 1.0)?;
+                    let ce_close = self.store.get(ce_c.instrument_token).filter(|t| t.ohlc.close > 0.1)?.ohlc.close;
+                    let pe_close = self.store.get(pe_c.instrument_token).filter(|t| t.ohlc.close > 0.1)?.ohlc.close;
+                    let synth_prev = atm_strike + ce_close - pe_close;
+                    if synth_prev > 5000.0 { Some((spot - synth_prev) / synth_prev * 100.0) } else { None }
+                });
+            from_index.or(from_parity).unwrap_or(0.0)
+        };
+
         Some(ChainSnapshot {
             underlying: underlying.to_string(),
             spot,
@@ -2410,6 +2443,7 @@ impl OptionsEngine {
             net_gex,
             days_to_expiry,
             regime,
+            overnight_gap_pct,
         })
     }
 
@@ -2702,6 +2736,46 @@ impl OptionsEngine {
         if snap.days_to_expiry < 0.5 && snap.iv_rank < 2.0 && snap.pcr_oi > 1.0 {
             warn!("  {} 0-DTE CE gated: IV Rank {:.1}% (session floor) + PCR {:.2} — no IV edge for CE on expiry morning",
                 snap.underlying, snap.iv_rank, snap.pcr_oi);
+            return signals;
+        }
+
+        // Gate D: Large overnight gap on multi-day contracts (Apr 08 fingerprint).
+        // After a prior session with extreme vol (iv_rank=100%, crash or gap-down), the
+        // market may open with a relief-rally gap the following day. Options are repriced
+        // overnight to reflect the new spot level, but the directional strategies (TrendFollow,
+        // OIDivergence) still read residual crash OI/regime data as bearish — creating a
+        // false-confidence signal on the wrong side of the gap. Entering a PE into a gap-up
+        // (or CE into a gap-down) is fighting the opening momentum in a regime that has
+        // already re-priced. The 2.5% threshold is calibrated to April 2026 data where
+        // Apr 08 saw a +4.2% gap from Apr 07's crash. All 13 winning days had gaps < 2.5%.
+        // Exemption: 0-DTE/1-DTE (DTE <= 1.5) where gamma rules supersede gap context.
+        if snap.overnight_gap_pct.abs() > 2.5 && snap.days_to_expiry > 1.5 {
+            warn!("  {} Gate D: {:.1}% overnight gap with {:.2} DTE — post-gap regime unreliable, entry blocked",
+                snap.underlying, snap.overnight_gap_pct, snap.days_to_expiry);
+            return signals;
+        }
+
+        // Gate E: Compressed spot range + StrongBearish PCR extreme + mid-DTE entry
+        // (Apr 10 fingerprint). When spot is in a tight compression range (compressive=true)
+        // AND pcr_oi is into StrongBearish territory (< 0.69, below the 0.70 regime boundary),
+        // it signals MM range-defense positioning: option writers are aggressively writing
+        // calls to pin the range, creating artificial OI skew that OIDivergence and
+        // TrendFollow misread as directional conviction. When the range breaks, it often
+        // resolves against the PE position because the call-writing overhead was absorbing
+        // natural demand above. DTE window [1.5, 5.0]: below 1.5 gamma-scalp logic applies;
+        // above 5.0 the regime has room to legitimately develop (Apr 01 DTE=6.13, PCR=0.662
+        // → won because regime transitioned to STRONG BEAR mid-hold).
+        // PCR threshold 0.71: saves Mar 27 (PCR=0.733, 2.2pt margin) while blocking Apr 10
+        // where PCR oscillated between 0.667–0.70 through the compressive morning session.
+        // Safe for all 13 wins: zero wins have compressive + PCR<0.71 + DTE[1.5,5.0] together.
+        if compressive
+            && snap.pcr_oi < 0.71
+            && snap.days_to_expiry >= 1.5
+            && snap.days_to_expiry <= 5.0
+        {
+            warn!("  {} Gate E: COMPRESSED range + StrongBearish PCR {:.3} + {:.2} DTE — \
+                 MM range-defense skew, not directional pressure; entry blocked",
+                snap.underlying, snap.pcr_oi, snap.days_to_expiry);
             return signals;
         }
 
@@ -4235,10 +4309,10 @@ impl OptionsEngine {
         // on intraday volatility when the underlying is still trending in our direction.
         let now_ms = self.current_time_ms();
         for i in 0..self.positions.len() {
-            let (is_open, option_token, entry_price, target_price, cp, entry_time_ms) = {
+            let (is_open, option_token, entry_price, target_price, cp, entry_time_ms, entry_dte) = {
                 let pos = &self.positions[i];
                 (pos.is_open, pos.option_token, pos.entry_price, pos.target_price,
-                 pos.checkpoints_evaluated, pos.entry_time_ms)
+                 pos.checkpoints_evaluated, pos.entry_time_ms, pos.entry_ctx.days_to_expiry)
             };
             if !is_open || cp >= 3 { continue; }
 
@@ -4250,28 +4324,33 @@ impl OptionsEngine {
 
             let hold_mins = (now_ms.saturating_sub(entry_time_ms)) as f64 / 60_000.0;
 
-            // Continuous trailing stop — variable lookback:
-            // Activates at +7.5% gain (min 3-min hold).
-            // Below +25%: 1 step behind (2.5% buffer) — tight enough to capture moves.
-            // At +25% and above: 2 steps behind (5.0% buffer) — let big winners breathe.
-            // e.g.: +7.5%→stop +5%; +10%→+7.5%; ... +25%→+20%; +27.5%→+22.5%; etc.
-            // Stop only ever ratchets up — never down.
-            let abs_gain_pct = (current_price - entry_price) / entry_price * 100.0;
-            if abs_gain_pct >= 7.5 && hold_mins >= 3.0 {
-                let step = 2.5_f64;
-                let lookback = if abs_gain_pct >= 25.0 { step * 2.0 } else { step };
-                let lock_pct = (abs_gain_pct / step).floor() * step - lookback;
-                let new_stop = entry_price * (1.0 + lock_pct / 100.0);
-                let pos = &mut self.positions[i];
-                if new_stop > pos.stop_price {
-                    pos.stop_price = new_stop;
-                    let new_cp = ((lock_pct - 5.0) / step).max(0.0) as u32 + 1;
-                    pos.checkpoints_evaluated = new_cp;
-                    pos.breakeven_stop_set = true;
-                    info!("  Trail +{:.1}% (lock +{:.1}%): pos #{} {} stop → ₹{:.2} (ltp ₹{:.2})",
-                        abs_gain_pct, lock_pct, pos.id, pos.underlying, pos.stop_price, current_price);
+            // Trailing stop only on 0-DTE and 1-DTE positions (fast gamma, moves are decisive).
+            // On 2+ DTE the fixed entry stop/target has enough room; trailing would cut winners short.
+            if entry_dte <= 1.5 {
+                // Continuous trailing stop — variable lookback:
+                // Activates at +7.5% gain (min 3-min hold).
+                // Below +25%: 1 step behind (2.5% buffer).
+                // At +25% and above: 2 steps behind (5.0% buffer) — let big winners breathe.
+                // e.g.: +7.5%→stop +5%; +10%→+7.5%; ... +25%→+20%; +27.5%→+22.5%; etc.
+                // Stop only ever ratchets up — never down.
+                let abs_gain_pct = (current_price - entry_price) / entry_price * 100.0;
+                if abs_gain_pct >= 7.5 && hold_mins >= 3.0 {
+                    let step = 2.5_f64;
+                    let lookback = if abs_gain_pct >= 25.0 { step * 2.0 } else { step };
+                    let lock_pct = (abs_gain_pct / step).floor() * step - lookback;
+                    let new_stop = entry_price * (1.0 + lock_pct / 100.0);
+                    let pos = &mut self.positions[i];
+                    if new_stop > pos.stop_price {
+                        pos.stop_price = new_stop;
+                        let new_cp = ((lock_pct - 5.0) / step).max(0.0) as u32 + 1;
+                        pos.checkpoints_evaluated = new_cp;
+                        pos.breakeven_stop_set = true;
+                        info!("  Trail +{:.1}% (lock +{:.1}%): pos #{} {} stop → ₹{:.2} (ltp ₹{:.2}) [0/1-DTE]",
+                            abs_gain_pct, lock_pct, pos.id, pos.underlying, pos.stop_price, current_price);
+                    }
                 }
             }
+            // 2+ DTE: no trailing — fixed stop and target set at entry manage the position.
         }
 
         for i in 0..self.positions.len() {

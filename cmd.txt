@@ -1,0 +1,60 @@
+# SATAVAHANA — COMMAND REFERENCE
+# ================================
+
+# BUILD
+cargo build --release
+
+
+# START ENGINE (caffeinated, stderr to log, stdout discarded)
+nohup caffeinate -i ./target/release/satavahana >/dev/null 2>>logs/collector.log &
+echo $! > logs/collector.pid
+echo "Started PID $(cat logs/collector.pid)"
+
+# STOP ENGINE
+kill $(cat logs/collector.pid)
+
+
+# INSPECT LIVE LOG — general tail
+tail -f logs/collector.log
+
+# INSPECT LIVE LOG — suppress Greeks noise, show only scans/signals/warns
+tail -f logs/collector.log | grep -v GREEKS
+
+# CHECK LATEST SCAN LINE (spot, iv_rank, pcr, best_score)
+tail -200 logs/collector.log | grep "^.*Scan #"
+
+# CHECK IF ENGINE IS ALIVE
+kill -0 $(cat logs/collector.pid) && echo "alive" || echo "dead"
+
+# CHECK OPEN POSITIONS / PORTFOLIO SUMMARY
+tail -200 logs/collector.log | grep -A 12 "PORTFOLIO SUMMARY"
+
+# CHECK SIGNALS AND TRADES FOR TODAY
+cat logs/$(date +%Y-%m-%d)_options_signals.csv
+cat logs/$(date +%Y-%m-%d)_options_trades.csv
+
+
+# END OF DAY — TRIM + COMPRESS DATA
+# (replace YYYY-MM-DD with today's date)
+awk -F',' 'NR==1 || $1 <= "YYYY-MM-DDT15:31:00"' data/YYYY-MM-DD_options_ticks.csv > /tmp/trimmed.csv \
+  && mv /tmp/trimmed.csv data/YYYY-MM-DD_options_ticks.csv
+gzip data/YYYY-MM-DD_options_ticks.csv
+
+# APPEND COLLECTOR LOG TO ARCHIVE AND REMOVE PLAIN LOG
+gzip -c logs/collector.log >> logs/collector.log.gz && rm logs/collector.log
+
+
+# BACKTEST A SINGLE DAY
+./target/release/backtest_options --max-daily-trades 1 =(gunzip -c data/YYYY-MM-DD_options_ticks.csv.gz)
+
+# BACKTEST ALL DAYS
+for f in data/*.csv.gz; do
+  date=$(basename $f | cut -d_ -f1)
+  out=$(./target/release/backtest_options --max-daily-trades 1 =(gunzip -c $f) 2>&1)
+  wl=$(echo "$out" | grep "Wins/Losses" | awk '{print $3}')
+  pnl=$(echo "$out" | grep "Net P&L" | awk '{print $4}')
+  printf "%-12s  W/L=%-4s  %s\n" "$date" "$wl" "$pnl"
+done 2>&1 | grep -v "^Spot"
+
+# READ COMPRESSED LOGS
+zcat logs/collector.log.gz | grep "pattern" | tail -50
