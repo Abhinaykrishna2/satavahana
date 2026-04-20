@@ -492,6 +492,30 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         });
 
+    // Warmup: 5 min if nearest expiry is 0-1 days from replay date, 15 min otherwise.
+    // replay_date from filename may be None (zsh tmp path) — fall back to date prefix
+    // of the first recv_ts row, which is always "YYYY-MM-DD..." regardless of path.
+    let warmup_secs: u64 = {
+        use chrono::NaiveDate;
+        let replay_day = replay_date.as_deref()
+            .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+            .or_else(|| {
+                let mut peek = csv::Reader::from_path(&options_file).ok()?;
+                let hdrs = peek.headers().ok()?.clone();
+                let i = col_idx(&hdrs, "recv_ts").ok()?;
+                let rec = peek.records().next()?.ok()?;
+                let ts = rec.get(i)?;
+                NaiveDate::parse_from_str(&ts[..10.min(ts.len())], "%Y-%m-%d").ok()
+            });
+        let nearest_expiry = contracts.iter()
+            .filter_map(|c| NaiveDate::parse_from_str(&c.expiry, "%Y-%m-%d").ok())
+            .min();
+        match (replay_day, nearest_expiry) {
+            (Some(day), Some(exp)) if (exp - day).num_days() <= 1 => 5 * 60,
+            _ => 15 * 60,
+        }
+    };
+
     let store = TickStore::new();
     let underlying_tokens: HashMap<String, u32> = HashMap::new();
     let mut engine = OptionsEngine::new_with_date(
@@ -526,9 +550,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let i_last_qty = col_idx(&headers, "last_qty")?;
     let i_exchange_ts = col_idx(&headers, "exchange_ts")?;
 
-    // 15-minute warmup: engine builds OI/IV baselines but suppresses signal generation.
-    // Mirrors the live OpeningBell run-in; warmup_end set after first valid tick.
-    const WARMUP_SECS: u64 = 15 * 60;
     let mut warmup_armed = false;
 
     let mut rows_seen: u64 = 0;
@@ -603,10 +624,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
 
         if !warmup_armed && causal_ts_ms > 0 {
-            engine.set_warmup_until_ms(causal_ts_ms + WARMUP_SECS * 1_000);
+            engine.set_warmup_until_ms(causal_ts_ms + warmup_secs * 1_000);
             eprintln!(
                 "Warmup set: suppressing signals for first {}min (until replay clock +{}s)",
-                WARMUP_SECS / 60, WARMUP_SECS
+                warmup_secs / 60, warmup_secs
             );
             warmup_armed = true;
         }

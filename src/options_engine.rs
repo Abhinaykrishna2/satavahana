@@ -888,14 +888,10 @@ impl OptionsEngine {
 
     fn min_confidence_floor_for(
         &self,
-        snap: &ChainSnapshot,
-        primary_strategy: StrategyType,
+        _snap: &ChainSnapshot,
+        _primary_strategy: StrategyType,
     ) -> f64 {
-        if snap.days_to_expiry < 0.5 && primary_strategy == StrategyType::GammaScalp {
-            self.expiry_day_min_confidence.min(self.min_confidence)
-        } else {
-            self.min_confidence
-        }
+        self.min_confidence
     }
 
     fn reset_daily_state_if_needed(&mut self) {
@@ -1783,13 +1779,8 @@ impl OptionsEngine {
                     .map(|s| s.action)
                     .unwrap_or(SignalAction::Hold);
                 let regular_floor = self.min_confidence;
-                let expiry_gamma_floor = self.expiry_day_min_confidence.min(self.min_confidence);
                 let admission_threshold_for = |signal: &Signal| {
-                    let base = if signal.strategy == StrategyType::GammaScalp && snap.days_to_expiry < 0.5 {
-                        expiry_gamma_floor
-                    } else {
-                        regular_floor
-                    };
+                    let base = regular_floor;
                     if matches!(session, SessionPhase::Midday)
                         && !(signal.strategy == StrategyType::GammaScalp && snap.days_to_expiry < 0.5)
                     {
@@ -4322,35 +4313,28 @@ impl OptionsEngine {
             };
             if entry_price <= 0.0 { continue; }
 
+            // Continuous trailing stop — all DTE, min 3-min hold:
+            // Activates at +7.5% gain. Steps in 2.5% increments, always 2.5% behind.
+            // At +25%+: 5% buffer to let big winners breathe.
+            // e.g.: +7.5%→stop+5%, +10%→+7.5%, +25%→+20%, +27.5%→+22.5%
+            // Stop only ever moves up, never down.
             let hold_mins = (now_ms.saturating_sub(entry_time_ms)) as f64 / 60_000.0;
-
-            // Trailing stop only on 0-DTE and 1-DTE positions (fast gamma, moves are decisive).
-            // On 2+ DTE the fixed entry stop/target has enough room; trailing would cut winners short.
-            if entry_dte <= 1.5 {
-                // Continuous trailing stop — variable lookback:
-                // Activates at +7.5% gain (min 3-min hold).
-                // Below +25%: 1 step behind (2.5% buffer).
-                // At +25% and above: 2 steps behind (5.0% buffer) — let big winners breathe.
-                // e.g.: +7.5%→stop +5%; +10%→+7.5%; ... +25%→+20%; +27.5%→+22.5%; etc.
-                // Stop only ever ratchets up — never down.
-                let abs_gain_pct = (current_price - entry_price) / entry_price * 100.0;
-                if abs_gain_pct >= 7.5 && hold_mins >= 3.0 {
-                    let step = 2.5_f64;
-                    let lookback = if abs_gain_pct >= 25.0 { step * 2.0 } else { step };
-                    let lock_pct = (abs_gain_pct / step).floor() * step - lookback;
-                    let new_stop = entry_price * (1.0 + lock_pct / 100.0);
-                    let pos = &mut self.positions[i];
-                    if new_stop > pos.stop_price {
-                        pos.stop_price = new_stop;
-                        let new_cp = ((lock_pct - 5.0) / step).max(0.0) as u32 + 1;
-                        pos.checkpoints_evaluated = new_cp;
-                        pos.breakeven_stop_set = true;
-                        info!("  Trail +{:.1}% (lock +{:.1}%): pos #{} {} stop → ₹{:.2} (ltp ₹{:.2}) [0/1-DTE]",
-                            abs_gain_pct, lock_pct, pos.id, pos.underlying, pos.stop_price, current_price);
-                    }
+            let abs_gain_pct = (current_price - entry_price) / entry_price * 100.0;
+            if abs_gain_pct >= 7.5 && hold_mins >= 3.0 {
+                let step = 2.5_f64;
+                let lookback = if abs_gain_pct >= 25.0 { step * 2.0 } else { step };
+                let lock_pct = (abs_gain_pct / step).floor() * step - lookback;
+                let new_stop = entry_price * (1.0 + lock_pct / 100.0);
+                let pos = &mut self.positions[i];
+                if new_stop > pos.stop_price {
+                    pos.stop_price = new_stop;
+                    let new_cp = ((lock_pct - 5.0) / step).max(0.0) as u32 + 1;
+                    pos.checkpoints_evaluated = new_cp;
+                    pos.breakeven_stop_set = true;
+                    info!("  Trail +{:.1}% (lock +{:.1}%): pos #{} {} stop → ₹{:.2} (ltp ₹{:.2})",
+                        abs_gain_pct, lock_pct, pos.id, pos.underlying, pos.stop_price, current_price);
                 }
             }
-            // 2+ DTE: no trailing — fixed stop and target set at entry manage the position.
         }
 
         for i in 0..self.positions.len() {

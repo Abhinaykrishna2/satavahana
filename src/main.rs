@@ -330,6 +330,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if let Some(funds) = live_starting_capital_override {
             oecfg.initial_capital = funds.max(0.0);
         }
+        // Warmup: 5 min on 0-1 DTE (catch opening gamma), 15 min otherwise.
+        // Mid-session restart (after 09:30) always uses 3 min.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let ist_offset_ms = (5 * 3600 + 30 * 60) * 1_000_u64;
+        let ist_ms_today = (now_ms + ist_offset_ms) % (24 * 3600 * 1_000);
+        let ist_mins_today = ist_ms_today / 60_000;
+        let warmup_secs: u64 = if ist_mins_today >= 570 {
+            3 * 60
+        } else {
+            use chrono::NaiveDate;
+            let today_ist = chrono::Utc::now()
+                .checked_add_signed(chrono::Duration::hours(5) + chrono::Duration::minutes(30))
+                .map(|dt| dt.date_naive());
+            let min_dte = options_chain.iter()
+                .filter_map(|c| NaiveDate::parse_from_str(&c.expiry, "%Y-%m-%d").ok())
+                .filter_map(|exp| today_ist.map(|t| (exp - t).num_days()))
+                .min()
+                .unwrap_or(99);
+            if min_dte <= 1 { 5 * 60 } else { 15 * 60 }
+        };
+
         let mut options_signal_engine = OptionsEngine::new(
             options_chain,
             store.clone(),
@@ -339,24 +363,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             config.greeks.dividend_yield,
             "logs",
         );
-        // Warmup duration depends on whether this is a cold start or a mid-session restart.
-        // Cold start (before 09:30 IST): 15 min — engine needs to build OI/IV baselines
-        //   from scratch as the market opens.
-        // Mid-session restart (09:30 IST onwards): 3 min — tick store already warm from
-        //   the previous run; just enough time to re-sync the scan clock and pending queue.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        let ist_offset_ms = (5 * 3600 + 30 * 60) * 1_000_u64;
-        let ist_ms_today = (now_ms + ist_offset_ms) % (24 * 3600 * 1_000);
-        let ist_mins_today = ist_ms_today / 60_000;
-        // 09:30 IST = 570 minutes from midnight
-        let warmup_secs: u64 = if ist_mins_today < 570 { 15 * 60 } else { 3 * 60 };
         options_signal_engine.set_warmup_until_ms(now_ms + warmup_secs * 1_000);
-        info!("  Options warmup: signals suppressed for {} min after startup ({})",
-            warmup_secs / 60,
-            if warmup_secs == 15 * 60 { "cold start" } else { "mid-session restart" });
+        info!("  Options warmup: signals suppressed for {} min after startup", warmup_secs / 60);
 
         options_signal_engine.set_capital_refresh_credentials(
             auth.api_key.clone(),
