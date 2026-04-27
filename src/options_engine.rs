@@ -367,6 +367,8 @@ struct PendingExitOrder {
     cancel_requested: bool,
     last_cancel_attempt_ms: u64,
     market_fallback_sent: bool,
+    /// Best available execution reference when the broker omits average_price on COMPLETE.
+    fallback_book_price: f64,
     total_filled_quantity: u32,
     total_filled_notional: f64,
     current_order_filled_quantity: u32,
@@ -382,8 +384,15 @@ impl PendingExitOrder {
         if self.total_filled_quantity == 0 {
             None
         } else {
-            Some(self.total_filled_notional / self.total_filled_quantity as f64)
+            let avg = self.total_filled_notional / self.total_filled_quantity as f64;
+            (avg > 0.0).then_some(avg)
         }
+    }
+
+    fn best_effort_fill_price(&self, update_average_price: Option<f64>) -> Option<f64> {
+        self.avg_fill_price()
+            .or_else(|| update_average_price.filter(|price| *price > 0.0))
+            .or_else(|| (self.fallback_book_price > 0.0).then_some(self.fallback_book_price))
     }
 
     fn record_fill_progress(&mut self, update: &OrderUpdate) {
@@ -409,12 +418,15 @@ impl PendingExitOrder {
         }
     }
 
-    fn prepare_market_fallback(&mut self, now_ms: u64) {
+    fn prepare_market_fallback(&mut self, now_ms: u64, fallback_book_price: f64) {
         self.placed_ms = now_ms;
         self.last_status_poll_ms = 0;
         self.cancel_requested = false;
         self.last_cancel_attempt_ms = 0;
         self.market_fallback_sent = true;
+        if fallback_book_price > 0.0 {
+            self.fallback_book_price = fallback_book_price;
+        }
         self.current_order_filled_quantity = 0;
         self.current_order_filled_notional = 0.0;
     }
@@ -1026,6 +1038,10 @@ impl OptionsEngine {
     }
 
     async fn sync_capital_from_kite(&mut self) {
+        if !self.live_mode_enabled() {
+            self.capital_sync_needed = false;
+            return;
+        }
         if self.kite_api_key.is_empty() {
             return;
         }
@@ -1248,7 +1264,7 @@ impl OptionsEngine {
                     tradingsymbol,
                     quantity: filled_qty,
                     side: OrderSide::Sell,
-                    limit_price: Some(avg_price),
+                    limit_price: None,
                 }));
                 self.pending_exit_orders.push(PendingExitOrder {
                     pos_id,
@@ -1261,6 +1277,7 @@ impl OptionsEngine {
                     cancel_requested: false,
                     last_cancel_attempt_ms: 0,
                     market_fallback_sent: false,
+                    fallback_book_price: avg_price.max(pending.signal_price),
                     total_filled_quantity: 0,
                     total_filled_notional: 0.0,
                     current_order_filled_quantity: 0,
@@ -1334,10 +1351,20 @@ impl OptionsEngine {
         let is_terminal_reject = status_upper == "REJECTED" || status_upper == "CANCELLED" || status_upper == "CANCELED" || status_upper == "EXPIRED";
 
         if is_complete {
+            let Some(pending) = self.pending_exit_orders.get(idx).cloned() else {
+                return;
+            };
+            let Some(avg_price) = pending.best_effort_fill_price(update.average_price) else {
+                error!(
+                    "Exit order COMPLETE but avg_price unavailable for tag={} pos_id={} — keeping exit pending for another status poll",
+                    pending.tag, pending.pos_id
+                );
+                if let Some(pending) = self.pending_exit_orders.get_mut(idx) {
+                    pending.last_status_poll_ms = 0;
+                }
+                return;
+            };
             let pending = self.pending_exit_orders.remove(idx);
-            let avg_price = pending
-                .avg_fill_price()
-                .unwrap_or(update.average_price.unwrap_or(0.0));
             self.finish_completed_exit(pending, avg_price);
         } else if is_terminal_reject {
             let needs_market_fallback = self
@@ -1569,7 +1596,7 @@ impl OptionsEngine {
             return;
         }
 
-        // Look up current LTP from the position's option token for the LIMIT fallback.
+        // Use current LTP as a bookkeeping reference for the broker MARKET fallback.
         let fallback_price = self
             .positions
             .iter()
@@ -1588,7 +1615,7 @@ impl OptionsEngine {
             .unwrap_or(0.05); // absolute floor: tick size minimum
 
         warn!(
-            "Exit order {} timed out as {} after filling {}/{} — sending LIMIT fallback @₹{:.2} for remaining {}",
+            "Exit order {} timed out as {} after filling {}/{} — sending MARKET fallback (reference ₹{:.2}) for remaining {}",
             snapshot.tag,
             terminal_status,
             snapshot.total_filled_quantity,
@@ -1599,7 +1626,7 @@ impl OptionsEngine {
 
         let now_ms = self.current_time_ms();
         if let Some(pending) = self.pending_exit_orders.get_mut(idx) {
-            pending.prepare_market_fallback(now_ms);
+            pending.prepare_market_fallback(now_ms, fallback_price);
         }
 
         self.send_order_command(OrderCommand::Place(PlaceOrderCmd {
@@ -1607,7 +1634,7 @@ impl OptionsEngine {
             tradingsymbol: snapshot.tradingsymbol,
             quantity: remaining_qty,
             side: OrderSide::Sell,
-            limit_price: Some(fallback_price),
+            limit_price: None,
         }));
         self.send_order_command(OrderCommand::StatusByTag { tag: snapshot.tag });
     }
@@ -4025,7 +4052,7 @@ impl OptionsEngine {
             self.entry_rejections += 1;
             // This path should be rare with Issue 1 fixed (capital held until
             // broker confirmation), but can still occur if risk capital was genuinely
-            // exhausted by a concurrent position.  Place an emergency MARKET SELL and
+            // exhausted by a concurrent position. Place an emergency MARKET SELL and
             // track it in pending_exit_orders so status is polled and failures are
             // visible.  pos_id has no matching Position — handle_exit_order_update
             // will log ERROR if the SELL itself fails.
@@ -4043,7 +4070,7 @@ impl OptionsEngine {
                     tradingsymbol: exit_symbol.clone(),
                     quantity,
                     side: OrderSide::Sell,
-                    limit_price: Some(broker_avg_price),
+                    limit_price: None,
                 }));
                 // Track via PendingExitOrder so status is polled and rejections surface.
                 self.pending_exit_orders.push(PendingExitOrder {
@@ -4057,6 +4084,7 @@ impl OptionsEngine {
                     cancel_requested: false,
                     last_cancel_attempt_ms: 0,
                     market_fallback_sent: false,
+                    fallback_book_price: entry_fill_price,
                     total_filled_quantity: 0,
                     total_filled_notional: 0.0,
                     current_order_filled_quantity: 0,
@@ -4155,6 +4183,7 @@ impl OptionsEngine {
                     cancel_requested: false,
                     last_cancel_attempt_ms: 0,
                     market_fallback_sent: false,
+                    fallback_book_price: current_price,
                     total_filled_quantity: 0,
                     total_filled_notional: 0.0,
                     current_order_filled_quantity: 0,
@@ -4171,11 +4200,12 @@ impl OptionsEngine {
 
     fn finalize_position_close(&mut self, idx: usize, exit_fill_price: f64, reason: String) {
         let exit_time_ms = self.current_time_ms();
+        let should_sync_capital = self.live_mode_enabled();
         let (
             trade_id,
             entry_ctx,
             underlying,
-            tradingsymbol,
+            _tradingsymbol,
             option_type_str,
             strike,
             expiry,
@@ -4202,7 +4232,7 @@ impl OptionsEngine {
             pos.exit_price = exit_fill_price;
             pos.exit_time_ms = exit_time_ms;
             pos.exit_reason = reason.clone();
-            self.capital_sync_needed = true;
+            self.capital_sync_needed = should_sync_capital;
 
             let gross_pnl = (exit_fill_price - pos.entry_price) * pos.lot_size as f64 * pos.lots as f64;
             let entry_costs = entry_transaction_cost_per_lot(pos.entry_price, pos.lot_size) * pos.lots as f64;
@@ -4300,12 +4330,11 @@ impl OptionsEngine {
         // on intraday volatility when the underlying is still trending in our direction.
         let now_ms = self.current_time_ms();
         for i in 0..self.positions.len() {
-            let (is_open, option_token, entry_price, target_price, cp, entry_time_ms, entry_dte) = {
+            let (is_open, option_token, entry_price, entry_time_ms) = {
                 let pos = &self.positions[i];
-                (pos.is_open, pos.option_token, pos.entry_price, pos.target_price,
-                 pos.checkpoints_evaluated, pos.entry_time_ms, pos.entry_ctx.days_to_expiry)
+                (pos.is_open, pos.option_token, pos.entry_price, pos.entry_time_ms)
             };
-            if !is_open || cp >= 3 { continue; }
+            if !is_open { continue; }
 
             let current_price = match self.store.get(option_token) {
                 Some(t) if t.ltp > 0.0 => t.ltp,
@@ -4517,9 +4546,11 @@ mod tests {
     use super::{
         nearest_affordable_otm_idx,
         OptionsEngine,
+        PendingEntryOrder,
         PendingExitOrder,
         Position,
         SessionPhase,
+        Signal,
         SignalAction,
         StrikeScanDirection,
         StrategyType,
@@ -4528,8 +4559,62 @@ mod tests {
     use crate::config::OptionsEngineConfig;
     use crate::execution::{OrderCommand, OrderSide, OrderUpdate};
     use crate::ledger::EntryContext;
+    use crate::models::{Tick, TickMode};
     use crate::store::TickStore;
     use std::collections::HashMap;
+
+    fn test_config() -> OptionsEngineConfig {
+        OptionsEngineConfig {
+            enabled: true,
+            initial_capital: 10_000.0,
+            max_daily_loss_pct: 30.0,
+            profit_target_pct: 55.0,
+            stop_loss_pct: 35.0,
+            min_confidence: 60.0,
+            expiry_day_min_confidence: 60.0,
+            scan_interval_secs: 45,
+            max_daily_trades: 3,
+        }
+    }
+
+    fn test_entry_context() -> EntryContext {
+        EntryContext {
+            confidence: 75.0,
+            session: SessionPhase::Morning.to_string(),
+            ..EntryContext::default()
+        }
+    }
+
+    fn test_position(exit_pending: bool) -> Position {
+        Position {
+            id: 1,
+            underlying: "NIFTY".to_string(),
+            tradingsymbol: "NIFTY26APR22000CE".to_string(),
+            action: SignalAction::BuyCE,
+            strike: 22_000.0,
+            expiry: "2026-04-30".to_string(),
+            option_token: 101,
+            lots: 1,
+            lot_size: 50,
+            entry_price: 100.0,
+            target_price: 120.0,
+            stop_price: 85.0,
+            entry_time_ms: 0,
+            entry_datetime: "2026-04-06 09:30:00".to_string(),
+            strategy: StrategyType::Composite,
+            is_open: true,
+            exit_price: 0.0,
+            exit_time_ms: 0,
+            pnl: 0.0,
+            pnl_pct: 0.0,
+            exit_reason: String::new(),
+            capital_deployed: 5_000.0,
+            entry_ctx: test_entry_context(),
+            breakeven_stop_set: false,
+            exit_pending,
+            checkpoints_evaluated: 0,
+        }
+    }
 
     #[test]
     fn finds_pe_strike_beyond_old_five_strike_limit() {
@@ -4608,17 +4693,7 @@ mod tests {
 
     #[test]
     fn timed_out_limit_exit_falls_back_to_market_and_closes_position() {
-        let cfg = OptionsEngineConfig {
-            enabled: true,
-            initial_capital: 10_000.0,
-            max_daily_loss_pct: 30.0,
-            profit_target_pct: 55.0,
-            stop_loss_pct: 35.0,
-            min_confidence: 60.0,
-            expiry_day_min_confidence: 60.0,
-            scan_interval_secs: 45,
-            max_daily_trades: 3,
-        };
+        let cfg = test_config();
         let log_dir = std::env::temp_dir().join(format!(
             "satavahana_exit_timeout_test_{}",
             std::process::id()
@@ -4639,38 +4714,7 @@ mod tests {
         engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
         engine.set_clock_override_ms(20_000);
 
-        engine.positions.push(Position {
-            id: 1,
-            underlying: "NIFTY".to_string(),
-            tradingsymbol: "NIFTY26APR22000CE".to_string(),
-            action: SignalAction::BuyCE,
-            strike: 22_000.0,
-            expiry: "2026-04-30".to_string(),
-            option_token: 101,
-            lots: 1,
-            lot_size: 50,
-            entry_price: 100.0,
-            target_price: 120.0,
-            stop_price: 85.0,
-            entry_time_ms: 0,
-            entry_datetime: "2026-04-06 09:30:00".to_string(),
-            strategy: StrategyType::Composite,
-            is_open: true,
-            exit_price: 0.0,
-            exit_time_ms: 0,
-            pnl: 0.0,
-            pnl_pct: 0.0,
-            exit_reason: String::new(),
-            capital_deployed: 5_000.0,
-            entry_ctx: EntryContext {
-                confidence: 75.0,
-                session: SessionPhase::Morning.to_string(),
-                ..EntryContext::default()
-            },
-            breakeven_stop_set: false,
-            exit_pending: true,
-            checkpoints_evaluated: 0,
-        });
+        engine.positions.push(test_position(true));
         engine.pending_exit_orders.push(PendingExitOrder {
             pos_id: 1,
             tag: "SATAEXIT1".to_string(),
@@ -4682,6 +4726,7 @@ mod tests {
             cancel_requested: false,
             last_cancel_attempt_ms: 0,
             market_fallback_sent: false,
+            fallback_book_price: 100.0,
             total_filled_quantity: 0,
             total_filled_notional: 0.0,
             current_order_filled_quantity: 0,
@@ -4719,9 +4764,7 @@ mod tests {
                 assert_eq!(cmd.tag, "SATAEXIT1");
                 assert_eq!(cmd.quantity, 50);
                 assert_eq!(cmd.side, OrderSide::Sell);
-                assert!(cmd.limit_price.is_some(), "fallback should use LIMIT, not MARKET");
-                // No tick in store, so falls back to position entry_price (100.0)
-                assert!((cmd.limit_price.unwrap() - 100.0).abs() < 0.01);
+                assert!(cmd.limit_price.is_none(), "fallback should use MARKET");
             }
             other => panic!("expected place command, got {:?}", other),
         }
@@ -4746,5 +4789,180 @@ mod tests {
         assert!(!engine.positions[0].exit_pending);
         assert!((engine.positions[0].exit_price - 101.5).abs() < 0.01);
         assert_eq!(engine.positions[0].exit_reason, "TARGET HIT");
+    }
+
+    #[test]
+    fn complete_exit_without_average_price_uses_reference_price() {
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_exit_no_avg_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+
+        let mut engine = OptionsEngine::new(
+            Vec::new(),
+            TickStore::new(),
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+
+        let (order_tx, _order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+        engine.positions.push(test_position(true));
+        engine.pending_exit_orders.push(PendingExitOrder {
+            pos_id: 1,
+            tag: "SATAEXIT1".to_string(),
+            tradingsymbol: "NIFTY26APR22000CE".to_string(),
+            total_quantity: 50,
+            placed_ms: 0,
+            last_status_poll_ms: 0,
+            reason: "TARGET HIT".to_string(),
+            cancel_requested: false,
+            last_cancel_attempt_ms: 0,
+            market_fallback_sent: true,
+            fallback_book_price: 102.25,
+            total_filled_quantity: 0,
+            total_filled_notional: 0.0,
+            current_order_filled_quantity: 0,
+            current_order_filled_notional: 0.0,
+        });
+
+        engine.handle_order_update(OrderUpdate {
+            tag: "SATAEXIT1".to_string(),
+            order_id: None,
+            status: Some("COMPLETE".to_string()),
+            average_price: Some(0.0),
+            filled_quantity: Some(50),
+            pending_quantity: Some(0),
+            source: "status_poll".to_string(),
+            message: None,
+        });
+
+        assert!(engine.pending_exit_orders.is_empty());
+        assert!(!engine.positions[0].is_open);
+        assert!(!engine.positions[0].exit_pending);
+        assert!((engine.positions[0].exit_price - 102.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn simulated_close_does_not_request_capital_sync() {
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_sim_close_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+
+        let mut engine = OptionsEngine::new(
+            Vec::new(),
+            TickStore::new(),
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+
+        engine.positions.push(test_position(false));
+        engine.close_position_at(0, 101.0, "TARGET HIT ₹101.00".to_string());
+
+        assert!(!engine.capital_sync_needed);
+        assert!(!engine.positions[0].is_open);
+    }
+
+    #[test]
+    fn emergency_flatten_uses_market_sell_when_capital_is_exhausted() {
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_emergency_flatten_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+
+        let store = TickStore::new();
+        store.update(Tick {
+            token: 101,
+            ltp: 101.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
+
+        let mut engine = OptionsEngine::new(
+            Vec::new(),
+            store,
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+        engine.risk.capital = 100.0;
+
+        let signal = Signal {
+            id: 1,
+            underlying: "NIFTY".to_string(),
+            expiry: "2026-04-30".to_string(),
+            action: SignalAction::BuyCE,
+            strike: 22_000.0,
+            option_price: 100.0,
+            target_price: 120.0,
+            stop_price: 85.0,
+            lots: 1,
+            lot_size: 50,
+            capital_required: 5_000.0,
+            confidence: 75.0,
+            strategy: StrategyType::Composite,
+            reasons: Vec::new(),
+            timestamp_ms: 0,
+            session: SessionPhase::Morning,
+            breakeven_move_pct: 0.0,
+            max_loss: 0.0,
+            max_profit_target: 0.0,
+            risk_reward: 1.0,
+            entry_ctx: test_entry_context(),
+        };
+
+        let pending = PendingEntryOrder {
+            pos_id: 1,
+            signal,
+            token: 101,
+            tradingsymbol: "NIFTY26APR22000CE".to_string(),
+            estimated_capital: 5_000.0,
+            tag: "SATAENTRY1".to_string(),
+            placed_ms: 0,
+            last_status_poll_ms: 0,
+            cancel_requested: false,
+            cancel_reason: None,
+            last_cancel_attempt_ms: 0,
+            released_after_timeout: false,
+            order_id: Some("order1".to_string()),
+            signal_price: 100.0,
+            placed_at_scan_count: 0,
+        };
+
+        assert!(!engine.open_filled_position_from_pending(pending, 0.0));
+        assert_eq!(engine.pending_exit_orders.len(), 1);
+        assert_eq!(engine.pending_exit_orders[0].reason, "EMERGENCY FLATTEN");
+
+        match order_rx.try_recv().expect("emergency sell order") {
+            OrderCommand::Place(cmd) => {
+                assert_eq!(cmd.tag, "SATAEXIT1");
+                assert_eq!(cmd.quantity, 50);
+                assert_eq!(cmd.side, OrderSide::Sell);
+                assert!(cmd.limit_price.is_none(), "emergency flatten should use MARKET");
+            }
+            other => panic!("expected place command, got {:?}", other),
+        }
+        match order_rx.try_recv().expect("emergency sell status") {
+            OrderCommand::StatusByTag { tag } => assert_eq!(tag, "SATAEXIT1"),
+            other => panic!("expected status command, got {:?}", other),
+        }
     }
 }

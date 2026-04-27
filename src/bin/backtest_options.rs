@@ -200,7 +200,9 @@ fn parse_option_type(s: &str) -> Option<OptionType> {
 fn default_lot_size(underlying: &str) -> u32 {
     match underlying {
         "NIFTY"      => 65,
-        "NIFTYNXT50" => 25,
+        "NIFTYNXT50" => 65,
+        "FINNIFTY"   => 60,
+        "MIDCPNIFTY" => 120,
         _ => 25,
     }
 }

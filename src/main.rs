@@ -366,11 +366,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         options_signal_engine.set_warmup_until_ms(now_ms + warmup_secs * 1_000);
         info!("  Options warmup: signals suppressed for {} min after startup", warmup_secs / 60);
 
-        options_signal_engine.set_capital_refresh_credentials(
-            auth.api_key.clone(),
-            auth.access_token.clone(),
-        );
         if let Some(tx) = live_order_tx.clone() {
+            options_signal_engine.set_capital_refresh_credentials(
+                auth.api_key.clone(),
+                auth.access_token.clone(),
+            );
             options_signal_engine.set_live_order_bridge(
                 tx,
                 live_order_updates_rx.take(),

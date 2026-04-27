@@ -263,9 +263,9 @@ impl OrderExecutor {
             ("tag", cmd.tag.clone()),
         ];
         if let Some(price) = cmd.limit_price {
-            // Round to 2 decimal places — Kite requires ₹0.05 tick on options but
-            // accepts 2-dp values; the exchange itself enforces tick rounding.
-            params.push(("price", format!("{:.2}", price)));
+            // Round to nearest ₹0.05 tick (NSE NFO options requirement).
+            let ticked = (price / 0.05).round() * 0.05;
+            params.push(("price", format!("{:.2}", ticked)));
         }
 
         let resp = self

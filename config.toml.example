@@ -32,10 +32,11 @@ strike_min = 0.0
 strike_max = 999999.0
 # Strike step size (used only for display/logging; filtering is by strike_min/max)
 strike_step = 50.0
-# Global default: keep only the N nearest strikes per underlying on EACH side of ATM.
-# 15 each side = 32 contracts per underlying (2 ATM + 15 CE + 15 PE).
+# Global default: keep the ATM strike plus the N nearest strikes on EACH side.
+# Both CE and PE are retained for every kept strike.
+# 15 each side = up to 62 contracts per underlying (31 strikes × 2 option sides).
 # Applies to NIFTY and NIFTYNXT50 (most liquid — use more strikes for chain-level OI coverage).
-# Total tokens: NIFTY(32) + NIFTYNXT50(32) + FINNIFTY(12) + 3 index = 79 — well within 3000.
+# Total tokens with the defaults below: NIFTY(62) + NIFTYNXT50(62) + FINNIFTY(22) + 3 index = 149.
 nearest_strikes = 15
 # Per-underlying override: FINNIFTY data quality is lower (illiquid OTM strikes, zero-LTP rows).
 # Restrict to 5 each side to keep only the liquid near-ATM zone.

@@ -264,7 +264,24 @@ pub async fn build_options_chain(
                 fallback
             }
         } else {
-            expiries[0].clone()
+            // Skip expiries with DTE <= 1: on 0/1-DTE days trade next week's expiry instead.
+            use chrono::{NaiveDate, Utc, Duration};
+            let today_ist = (Utc::now() + Duration::hours(5) + Duration::minutes(30)).date_naive();
+            let selected = expiries.iter()
+                .find(|e| {
+                    NaiveDate::parse_from_str(e, "%Y-%m-%d")
+                        .map(|exp| (exp - today_ist).num_days() > 1)
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .unwrap_or_else(|| expiries[0].clone());
+            if selected != expiries[0] {
+                info!(
+                    "  {} nearest expiry {} is 0/1-DTE — skipping to next expiry {}",
+                    underlying, expiries[0], selected
+                );
+            }
+            selected
         };
 
         info!(
@@ -433,10 +450,8 @@ pub async fn build_options_chain(
                 }
             };
 
-            // Directional strike selection:
-            //   ATM (nearest strike to spot): both CE + PE
-            //   per_underlying_n strikes ABOVE ATM: CE only  (upside coverage)
-            //   per_underlying_n strikes BELOW ATM: PE only  (downside coverage)
+            // Strike selection keeps both CE and PE for the ATM strike plus the nearest
+            // N strikes above and below ATM. Strategy code later decides direction.
             let mut strikes: Vec<f64> = contracts.iter()
                 .filter(|c| c.underlying == *underlying)
                 .map(|c| c.strike)
@@ -451,7 +466,8 @@ pub async fn build_options_chain(
                 .unwrap_or(spot);
             let atm_key = (atm_strike * 100.0) as u64;
 
-            // Keep both CE and PE for N strikes above and below ATM
+            // Keep both CE and PE for the ATM strike plus the nearest N strikes above
+            // and below ATM.
             let above_strikes: std::collections::HashSet<u64> = strikes.iter()
                 .filter(|&&s| s > atm_strike)
                 .take(per_underlying_n as usize)
@@ -548,7 +564,16 @@ pub fn build_options_chain_sync(
         let selected = if let Some(pref) = preferred_expiry {
             if expiries.iter().any(|e| e == pref) { pref.to_string() } else { expiries[0].clone() }
         } else {
-            expiries[0].clone()
+            use chrono::{NaiveDate, Utc, Duration};
+            let today_ist = (Utc::now() + Duration::hours(5) + Duration::minutes(30)).date_naive();
+            expiries.iter()
+                .find(|e| {
+                    NaiveDate::parse_from_str(e, "%Y-%m-%d")
+                        .map(|exp| (exp - today_ist).num_days() > 1)
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .unwrap_or_else(|| expiries[0].clone())
         };
         selected_expiry_by_underlying.insert(underlying.clone(), selected);
     }

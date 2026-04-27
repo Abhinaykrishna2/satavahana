@@ -197,9 +197,9 @@ impl OptionsJournal {
         holding_mins: f64,
     ) {
         self.total_trades += 1;
-        let outcome = if net_pnl >= 0.0 { "WIN" } else { "LOSS" };
+        let outcome = if net_pnl > 0.0 { "WIN" } else { "LOSS" };
 
-        if net_pnl >= 0.0 {
+        if net_pnl > 0.0 {
             self.wins += 1;
             self.winning_pcr.push(entry_ctx.pcr_oi);
             self.winning_iv_rank.push(entry_ctx.iv_rank);
@@ -215,7 +215,7 @@ impl OptionsJournal {
         let strat = entry_ctx.strategy.clone();
         let entry = self.strategy_stats.entry(strat).or_insert((0, 0, 0, 0.0));
         entry.0 += 1;
-        if net_pnl >= 0.0 { entry.1 += 1; } else { entry.2 += 1; }
+        if net_pnl > 0.0 { entry.1 += 1; } else { entry.2 += 1; }
         entry.3 += net_pnl;
 
         let row = format!(
