@@ -13,18 +13,36 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
 const NSE_OPTIONS_EXCHANGE_TXN_RATE: f64 = 0.000311;
+const LIVE_ENTRY_LIMIT_PAYUP_INR: f64 = 0.25;
 // Options below ₹30 are typically deep OTM or near-expiry junk — bid-ask spread
 // alone can be ₹2-5 (7-16% of price), making fills far worse than the mid-price.
 const MIN_TRADEABLE_OPTION_PRICE: f64 = 30.0;
 
-fn entry_transaction_cost_per_lot(entry_price: f64, lot_size: u32) -> f64 {
+/// Flat Zerodha options brokerage per EXECUTED ORDER (not per lot). Bug 5: this was
+/// baked into the per-lot cost and multiplied by lots, over-charging multi-lot orders
+/// and (via affordability/Kelly) under-sizing them. It is now added once per order.
+const OPT_BROKERAGE_FLAT: f64 = 20.0;
+
+/// Flat brokerage + 18% GST on it, charged ONCE per executed order (₹20 → ₹23.60).
+fn options_brokerage_per_order() -> f64 {
+    OPT_BROKERAGE_FLAT * 1.18
+}
+
+/// Per-LOT entry transaction cost EXCLUDING the flat per-order brokerage (everything
+/// here genuinely scales with lots). GST here is only on the per-lot fees.
+fn entry_cost_per_lot_excl_brokerage(entry_price: f64, lot_size: u32) -> f64 {
     let premium = entry_price * lot_size as f64;
-    let brokerage = 20.0_f64;
     let exchange_txn = NSE_OPTIONS_EXCHANGE_TXN_RATE * premium;
     let sebi = 0.000001 * premium;
     let stamp_duty = 0.00003 * premium;
-    let gst = 0.18 * (brokerage + exchange_txn + sebi);
-    brokerage + exchange_txn + sebi + stamp_duty + gst
+    let gst = 0.18 * (exchange_txn + sebi);
+    exchange_txn + sebi + stamp_duty + gst
+}
+
+/// Total ENTRY-order cost for `lots` lots: per-lot fees × lots + ONE flat brokerage.
+fn entry_order_cost(entry_price: f64, lot_size: u32, lots: u32) -> f64 {
+    entry_cost_per_lot_excl_brokerage(entry_price, lot_size) * lots as f64
+        + options_brokerage_per_order()
 }
 
 fn options_sell_stt_rate(exit_time_ms: u64) -> f64 {
@@ -42,28 +60,49 @@ fn options_sell_stt_rate(exit_time_ms: u64) -> f64 {
     }
 }
 
-fn exit_transaction_cost_per_lot(exit_price: f64, lot_size: u32, exit_time_ms: u64) -> f64 {
+/// Per-LOT exit transaction cost EXCLUDING the flat per-order brokerage.
+fn exit_cost_per_lot_excl_brokerage(exit_price: f64, lot_size: u32, exit_time_ms: u64) -> f64 {
     let premium = exit_price * lot_size as f64;
-    let brokerage = 20.0_f64;
     let stt_sell = options_sell_stt_rate(exit_time_ms) * premium;
     let exchange_txn = NSE_OPTIONS_EXCHANGE_TXN_RATE * premium;
     let sebi = 0.000001 * premium;
-    let gst = 0.18 * (brokerage + exchange_txn + sebi);
-    brokerage + stt_sell + exchange_txn + sebi + gst
+    let gst = 0.18 * (exchange_txn + sebi);
+    stt_sell + exchange_txn + sebi + gst
 }
 
-fn round_trip_transaction_cost_per_lot(
+/// Total EXIT-order cost for `lots` lots: per-lot fees × lots + ONE flat brokerage.
+fn exit_order_cost(exit_price: f64, lot_size: u32, lots: u32, exit_time_ms: u64) -> f64 {
+    exit_cost_per_lot_excl_brokerage(exit_price, lot_size, exit_time_ms) * lots as f64
+        + options_brokerage_per_order()
+}
+
+/// Total round-trip cost for `lots` lots: entry order + exit order (each pays one flat
+/// brokerage — two legs, two ₹20 charges, regardless of lot count).
+fn round_trip_order_cost(
     entry_price: f64,
     exit_price: f64,
     lot_size: u32,
+    lots: u32,
     assumed_exit_time_ms: u64,
 ) -> f64 {
-    entry_transaction_cost_per_lot(entry_price, lot_size)
-        + exit_transaction_cost_per_lot(exit_price, lot_size, assumed_exit_time_ms)
+    entry_order_cost(entry_price, lot_size, lots)
+        + exit_order_cost(exit_price, lot_size, lots, assumed_exit_time_ms)
 }
 
 fn one_lot_entry_cost(entry_price: f64, lot_size: u32) -> f64 {
-    entry_price * lot_size as f64 + entry_transaction_cost_per_lot(entry_price, lot_size)
+    entry_price * lot_size as f64 + entry_order_cost(entry_price, lot_size, 1)
+}
+
+fn entry_cutoff_ist_mins_for_dte(days_to_expiry: f64) -> u32 {
+    if days_to_expiry > 1.0 {
+        14 * 60 + 55
+    } else {
+        15 * 60
+    }
+}
+
+fn past_entry_cutoff_ist(ist_mins: u32, days_to_expiry: f64) -> bool {
+    ist_mins >= entry_cutoff_ist_mins_for_dte(days_to_expiry)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,6 +207,7 @@ impl std::fmt::Display for SignalAction {
 pub enum StrategyType {
     GammaScalp,
     IVExpansion,
+    SpotReversal,
     TrendFollow,
     MaxPainConvergence,
     OIDivergence,
@@ -181,6 +221,7 @@ impl std::fmt::Display for StrategyType {
         match self {
             StrategyType::GammaScalp        => write!(f, "Gamma Scalp (0-2 DTE)"),
             StrategyType::IVExpansion       => write!(f, "IV Expansion (Event)"),
+            StrategyType::SpotReversal      => write!(f, "Spot Reversal Break"),
             StrategyType::TrendFollow       => write!(f, "Trend Follow + OI"),
             StrategyType::MaxPainConvergence => write!(f, "Max Pain Gravity"),
             StrategyType::OIDivergence      => write!(f, "OI Divergence Flow"),
@@ -485,11 +526,12 @@ struct RiskEngine {
     total_loss_amount: f64,
     daily_start_capital: f64,
     max_daily_loss_fraction: f64,
+    max_daily_profit_fraction: f64,
     kelly_scale: f64,
 }
 
 impl RiskEngine {
-    fn new(initial_capital: f64, max_daily_loss_fraction: f64) -> Self {
+    fn new(initial_capital: f64, max_daily_loss_fraction: f64, max_daily_profit_fraction: f64) -> Self {
         Self {
             capital: initial_capital,
             initial_capital,
@@ -500,6 +542,7 @@ impl RiskEngine {
             total_loss_amount: 0.0,
             daily_start_capital: initial_capital,
             max_daily_loss_fraction: max_daily_loss_fraction.clamp(0.01, 0.95),
+            max_daily_profit_fraction: max_daily_profit_fraction.clamp(0.01, 5.0),
             kelly_scale: 0.5,
         }
     }
@@ -539,10 +582,14 @@ impl RiskEngine {
     fn size_lots(&self, option_price: f64, lot_size: u32, stop_loss_pct: f64) -> u32 {
         let available = self.available_capital();
         let sizing_capital = available.min(self.daily_start_capital);
+        // Per-lot cost EXCLUDES the flat per-order brokerage (bug 5) — that is subtracted
+        // once below, not multiplied into every lot, so affordability/Kelly aren't biased
+        // against larger orders.
         let cost_per_lot = option_price * lot_size as f64
-            + entry_transaction_cost_per_lot(option_price, lot_size);
+            + entry_cost_per_lot_excl_brokerage(option_price, lot_size);
         if cost_per_lot <= 0.0 { return 0; }
-        let affordable = (sizing_capital / cost_per_lot).floor() as u32;
+        let deployable = (sizing_capital - options_brokerage_per_order()).max(0.0);
+        let affordable = (deployable / cost_per_lot).floor() as u32;
         if affordable == 0 { return 0; }
 
         let kelly = self.kelly_fraction();
@@ -550,9 +597,21 @@ impl RiskEngine {
         let risk_per_lot = (stop_loss_pct * option_price * lot_size as f64).max(1.0);
         let lots_from_risk = (max_risk_capital / risk_per_lot).floor() as u32;
 
-        let lots_from_exposure = (sizing_capital * (kelly * 2.5).min(0.95) / cost_per_lot).floor() as u32;
+        let lots_from_exposure = (deployable * (kelly * 2.5).min(0.95) / cost_per_lot).floor() as u32;
 
-        lots_from_risk.min(lots_from_exposure).min(4).max(1).min(affordable)
+        // STRICT half-Kelly: NO `.max(1)` floor. If one lot's stop-risk exceeds the
+        // half-Kelly budget (`lots_from_risk == 0`), return 0 → the caller SKIPS the
+        // trade rather than forcing an oversized bet. Consequence (by design): on
+        // wide-stop / low-conviction days the options engine takes NO trade — a no-trade
+        // day is correct behavior here, not a bug.
+        lots_from_risk.min(lots_from_exposure).min(4).min(affordable)
+    }
+
+    fn max_one_lot_entry_cost_by_exposure(&self) -> f64 {
+        let available = self.available_capital();
+        let sizing_capital = available.min(self.daily_start_capital);
+        let deployable = (sizing_capital - options_brokerage_per_order()).max(0.0);
+        deployable * (self.kelly_fraction() * 2.5).min(0.95) + options_brokerage_per_order()
     }
 
     fn reserve_capital(&mut self, amount: f64) -> bool {
@@ -574,8 +633,20 @@ impl RiskEngine {
     }
 
     fn circuit_breaker_triggered(&self) -> bool {
-        let daily_loss = self.daily_start_capital - self.capital;
-        daily_loss > self.daily_start_capital * self.max_daily_loss_fraction
+        self.circuit_reason().is_some()
+    }
+
+    /// Returns the tripped circuit ("LOWER -15% loss" / "UPPER +35% profit") or None.
+    /// P&L here is net of fees/costs because `capital` is updated with net trade P&L.
+    fn circuit_reason(&self) -> Option<&'static str> {
+        let daily_pnl = self.capital - self.daily_start_capital;
+        if daily_pnl <= -(self.daily_start_capital * self.max_daily_loss_fraction) {
+            Some("LOWER circuit (daily loss limit)")
+        } else if daily_pnl >= self.daily_start_capital * self.max_daily_profit_fraction {
+            Some("UPPER circuit (daily profit limit — anti-overtrade)")
+        } else {
+            None
+        }
     }
 
     fn record_trade(&mut self, pnl: f64) {
@@ -783,6 +854,11 @@ pub struct OptionsEngine {
     capital_sync_needed: bool,
 
     log_dir: String,
+
+    // Account-level shared circuit (halts entries + receives net P&L). None = solo.
+    shared_circuit: Option<crate::portfolio::SharedCircuit>,
+    /// Per-underlying spot price-action series → technical directional gate.
+    spot_series: std::collections::HashMap<String, crate::technicals::SpotSeries>,
 }
 
 impl OptionsEngine {
@@ -819,6 +895,7 @@ impl OptionsEngine {
     ) -> Self {
         let initial_capital = cfg.initial_capital.max(0.0);
         let max_daily_loss_fraction = (cfg.max_daily_loss_pct / 100.0).clamp(0.01, 0.95);
+        let max_daily_profit_fraction = (cfg.max_daily_profit_pct / 100.0).clamp(0.01, 5.0);
         let journal = OptionsJournal::new(log_dir, initial_capital, replay_date)
             .unwrap_or_else(|e| {
                 warn!("Failed to open options journal in '{}': {}", log_dir, e);
@@ -832,7 +909,7 @@ impl OptionsEngine {
             iv_history: IVHistory::new(),
             spot_history: HashMap::new(),
             prev_oi: HashMap::new(),
-            risk: RiskEngine::new(initial_capital, max_daily_loss_fraction),
+            risk: RiskEngine::new(initial_capital, max_daily_loss_fraction, max_daily_profit_fraction),
             journal,
             positions: Vec::new(),
             next_pos_id: 1,
@@ -848,7 +925,8 @@ impl OptionsEngine {
             replay_last_scan_ms: None,
             warmup_until_ms: None,
             scan_interval_secs: cfg.scan_interval_secs.max(1),
-            max_daily_trades: cfg.max_daily_trades.min(50),
+            // 0 = unlimited (rely on the daily P&L circuits instead of a count cap).
+            max_daily_trades: if cfg.max_daily_trades == 0 { u32::MAX } else { cfg.max_daily_trades.min(50) },
             execution_buy_offset_inr: 0.0,
             execution_sell_offset_inr: 0.0,
             signals_generated: 0,
@@ -876,7 +954,14 @@ impl OptionsEngine {
             kite_access_token: String::new(),
             capital_sync_needed: false,
             log_dir: log_dir.to_string(),
+            shared_circuit: None,
+            spot_series: std::collections::HashMap::new(),
         }
+    }
+
+    /// Attach the account-level shared circuit (halts entries + receives net P&L).
+    pub fn set_shared_circuit(&mut self, c: crate::portfolio::SharedCircuit) {
+        self.shared_circuit = Some(c);
     }
 
     fn current_time_ms(&self) -> u64 {
@@ -928,6 +1013,15 @@ impl OptionsEngine {
             .filter(|p| !p.released_after_timeout)
             .count() as u32;
         self.daily_trades_opened.saturating_add(pending)
+    }
+
+    fn effective_daily_trade_cap(&self, signal: &Signal) -> u32 {
+        let dynamic_cap = self.dynamic_daily_trade_cap(signal);
+        if self.max_daily_trades == 0 {
+            dynamic_cap
+        } else {
+            dynamic_cap.min(self.max_daily_trades)
+        }
     }
 
     fn set_clock_override_ms(&mut self, timestamp_ms: u64) {
@@ -1046,8 +1140,19 @@ impl OptionsEngine {
             return;
         }
         let open = self.positions.iter().filter(|p| p.is_open).count();
-        if open > 0 {
-            info!("  Capital sync deferred: {} open position(s); will retry after close", open);
+        let pending_entries = self
+            .pending_entry_orders
+            .iter()
+            .filter(|p| !p.released_after_timeout)
+            .count();
+        let pending_exits = self.pending_exit_orders.len();
+        if open > 0 || pending_entries > 0 || pending_exits > 0 {
+            info!(
+                "  Capital sync deferred: {} open position(s), {} pending entry order(s), {} pending exit order(s); will retry when flat",
+                open,
+                pending_entries,
+                pending_exits
+            );
             return;
         }
         match crate::execution::fetch_live_available_funds(
@@ -1109,6 +1214,16 @@ impl OptionsEngine {
 
     fn available_capital_for_new_orders(&self) -> f64 {
         (self.risk.available_capital() - self.pending_capital_reserved).max(0.0)
+    }
+
+    fn live_entry_limit_price(&self, token: u32, signal_price: f64) -> f64 {
+        let current_price = self
+            .store
+            .get(token)
+            .map(|tick| tick.ltp)
+            .filter(|price| price.is_finite() && *price > 0.0)
+            .unwrap_or(signal_price);
+        (current_price + LIVE_ENTRY_LIMIT_PAYUP_INR).max(0.05)
     }
 
     fn recent_stop_loss_block(
@@ -1509,12 +1624,21 @@ impl OptionsEngine {
         }
         let pending = self.pending_entry_orders.remove(idx);
         if !pending.released_after_timeout {
-            self.pending_capital_reserved = (self.pending_capital_reserved - pending.estimated_capital).max(0.0);
+            self.pending_capital_reserved =
+                (self.pending_capital_reserved - pending.estimated_capital).max(0.0);
         }
         if count_as_rejection {
             self.entry_rejections += 1;
         }
         warn!("Pending entry released [{}] tag={}", reason, pending.tag);
+        // This live entry never became a position. If options now holds no open
+        // position and no other live entry in flight, free the global position slot
+        // so the next signal (any engine) can claim it.
+        if let Some(c) = &self.shared_circuit {
+            if !self.has_live_commitment() {
+                crate::portfolio::release(c, "options");
+            }
+        }
     }
 
     fn promote_filled_entry(&mut self, idx: usize, broker_avg_price: f64) -> bool {
@@ -1523,7 +1647,15 @@ impl OptionsEngine {
         }
         let pending = self.pending_entry_orders.remove(idx);
         if !pending.released_after_timeout {
-            self.pending_capital_reserved = (self.pending_capital_reserved - pending.estimated_capital).max(0.0);
+            self.pending_capital_reserved =
+                (self.pending_capital_reserved - pending.estimated_capital).max(0.0);
+        }
+        // A live entry just became a real position. Ensure options holds the global
+        // slot — normally it claimed at submit (this is a no-op), but if the slot was
+        // freed by a timeout-release and the order then filled late, re-grab it so the
+        // lock reflects the open live position.
+        if let Some(c) = &self.shared_circuit {
+            let _ = crate::portfolio::try_claim(c, "options");
         }
         self.open_filled_position_from_pending(pending, broker_avg_price)
     }
@@ -1538,7 +1670,16 @@ impl OptionsEngine {
                 "[{}] SELL complete tag={} avg=₹{:.2} — broker position closed",
                 pending.reason, pending.tag, avg_price
             );
-        } else if let Some(pos_idx) = self.positions.iter().position(|p| p.id == pending.pos_id) {
+            if let Some(c) = &self.shared_circuit {
+                if !self.has_live_commitment() {
+                    crate::portfolio::release(c, "options");
+                }
+            }
+        } else if let Some(pos_idx) = self
+            .positions
+            .iter()
+            .position(|p| p.id == pending.pos_id)
+        {
             self.finalize_position_close(pos_idx, avg_price, pending.reason);
         }
     }
@@ -1675,7 +1816,7 @@ impl OptionsEngine {
             info!("  Profit target: {:.0}% | Stop: {:.0}% | Min confidence: {:.0} | Expiry gamma floor: {:.0}",
                 self.profit_target_pct, self.stop_loss_pct, self.min_confidence, self.expiry_day_min_confidence);
             info!("  Scan interval: {}s", self.scan_interval_secs);
-            info!("  Max daily trades: {}", self.max_daily_trades);
+            info!("  Max daily trades: {}", if self.max_daily_trades == u32::MAX { "unlimited (P&L circuits only)".to_string() } else { self.max_daily_trades.to_string() });
             info!("  Strategies: GammaScalp | IVExpansion | TrendFollow | MaxPain | OIDivergence | GEX");
             info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
@@ -1737,7 +1878,33 @@ impl OptionsEngine {
         })
     }
 
+    /// Release the global one-position slot iff options holds NO commitment (no open
+    /// position, no in-flight entry order, and no untracked/fallback exit order).
+    /// State-based safety net mirroring micro's
+    /// per-tick `release_lock_if_idle`: if a live entry order's terminal broker update
+    /// never arrives, the event-driven releases can't fire, so this frees the slot at
+    /// the next scan rather than wedging trading for the day. Safe because it is
+    /// STATE-based, never time-based — it can never evict a legitimately open position.
+    /// `release` is a no-op unless options is the holder.
+    fn release_lock_if_idle(&mut self) {
+        if let Some(c) = &self.shared_circuit {
+            if !self.has_live_commitment() {
+                crate::portfolio::release(c, "options");
+            }
+        }
+    }
+
+    fn has_live_commitment(&self) -> bool {
+        self.positions.iter().any(|p| p.is_open)
+            || self
+                .pending_entry_orders
+                .iter()
+                .any(|p| !p.released_after_timeout)
+            || !self.pending_exit_orders.is_empty()
+    }
+
     fn run_full_scan(&mut self) {
+        self.release_lock_if_idle();
         self.execute_pending_signals();
 
         self.reset_daily_state_if_needed();
@@ -1770,10 +1937,19 @@ impl OptionsEngine {
             snapshots.push(snap);
         }
 
-        let circuit_broken = self.risk.circuit_breaker_triggered();
+        // Halt on EITHER the engine's own circuit OR the account-level shared circuit.
+        let account_halt = self
+            .shared_circuit
+            .as_ref()
+            .map_or(false, |c| !crate::portfolio::can_enter(c));
+        let circuit_broken = self.risk.circuit_breaker_triggered() || account_halt;
         if circuit_broken {
-            warn!("⛔ CIRCUIT BREAKER: Daily loss exceeded {:.0}% of starting capital. NO NEW TRADES.",
-                self.risk.max_daily_loss_fraction * 100.0);
+            let reason = if account_halt {
+                "ACCOUNT circuit (-15%/+25% combined)"
+            } else {
+                self.risk.circuit_reason().unwrap_or("daily limit reached")
+            };
+            warn!("⛔ CIRCUIT BREAKER: {}. NO NEW TRADES today.", reason);
         }
 
         // Hard entry cutoff: no new position entries after 15:00 IST.
@@ -1797,6 +1973,25 @@ impl OptionsEngine {
         let now_ms = self.current_time_ms();
         if !circuit_broken && !past_entry_cutoff && !matches!(session, SessionPhase::OpeningBell | SessionPhase::Closing) {
             for (snap_idx, snap) in snapshots.iter().enumerate() {
+                if past_entry_cutoff_ist(ist_mins, snap.days_to_expiry) {
+                    let cutoff = entry_cutoff_ist_mins_for_dte(snap.days_to_expiry);
+                    warn!(
+                        "Entry cutoff: no new {} signals after {:02}:{:02} IST for {:.1} DTE (current {:02}:{:02})",
+                        snap.underlying,
+                        cutoff / 60,
+                        cutoff % 60,
+                        snap.days_to_expiry,
+                        ist_mins / 60,
+                        ist_mins % 60
+                    );
+                    self.last_scan_result.insert(snap.underlying.clone(), LastScanResult {
+                        action: SignalAction::Hold,
+                        best_score: 0.0,
+                        scanned_at_ms: now_ms,
+                    });
+                    continue;
+                }
+
                 let signals = self.generate_signals(snap);
                 let best_score = signals.iter().map(|s| s.confidence).fold(0.0_f64, f64::max);
                 // Dominant action: take from the highest-scoring signal (all signals from one
@@ -2007,13 +2202,32 @@ impl OptionsEngine {
     fn execute_pending_signals(&mut self) {
         if self.pending_signals.is_empty() { return; }
 
-        if self.risk.circuit_breaker_triggered() {
+        let account_halt = self
+            .shared_circuit
+            .as_ref()
+            .map_or(false, |c| !crate::portfolio::can_enter(c));
+        if self.risk.circuit_breaker_triggered() || account_halt {
             let n = self.pending_signals.len();
             if n > 0 {
                 warn!("Circuit breaker active: discarding {} pending signal(s)", n);
                 self.pending_signals.clear();
             }
             return;
+        }
+
+        // Global one-position lock: if any engine already holds the single open slot,
+        // a fresh options signal is CANCELLED (one trade at a time across the account).
+        // This is a cheap pre-filter; the authoritative grab is the atomic try_claim at
+        // the open-commit in open_simulated_position.
+        if let Some(c) = &self.shared_circuit {
+            if crate::portfolio::is_locked(c) {
+                let n = self.pending_signals.len();
+                if n > 0 {
+                    warn!("Position open elsewhere: cancelling {} pending options signal(s)", n);
+                    self.pending_signals.clear();
+                }
+                return;
+            }
         }
 
         let session = self.current_session();
@@ -2046,9 +2260,23 @@ impl OptionsEngine {
         let pending: Vec<Signal> = self.pending_signals.drain(..).collect();
         let mut requeue: Vec<Signal> = Vec::new();
         for mut signal in pending {
+            if past_entry_cutoff_ist(exec_ist_mins, signal.entry_ctx.days_to_expiry) {
+                let cutoff = entry_cutoff_ist_mins_for_dte(signal.entry_ctx.days_to_expiry);
+                warn!(
+                    "Pending signal #{} discarded: {:.1} DTE entry cutoff {:02}:{:02} IST reached",
+                    signal.id,
+                    signal.entry_ctx.days_to_expiry,
+                    cutoff / 60,
+                    cutoff % 60
+                );
+                continue;
+            }
+
             let min_delay_ms: u64 = if signal.strategy == StrategyType::GammaScalp
                 && signal.entry_ctx.days_to_expiry < 0.5
             {
+                5_000
+            } else if signal.strategy == StrategyType::SpotReversal || signal.confidence >= 90.0 {
                 5_000
             } else {
                 30_000
@@ -2066,16 +2294,26 @@ impl OptionsEngine {
             }
 
             let token = match signal.action {
-                SignalAction::BuyCE => self.contracts.iter()
-                    .find(|c| c.underlying == signal.underlying
-                        && c.strike == signal.strike
-                        && c.option_type == OptionType::CE)
+                SignalAction::BuyCE => self
+                    .contracts
+                    .iter()
+                    .find(|c| {
+                        c.underlying == signal.underlying
+                            && c.expiry == signal.expiry
+                            && c.strike == signal.strike
+                            && c.option_type == OptionType::CE
+                    })
                     .map(|c| c.instrument_token)
                     .unwrap_or(0),
-                SignalAction::BuyPE => self.contracts.iter()
-                    .find(|c| c.underlying == signal.underlying
-                        && c.strike == signal.strike
-                        && c.option_type == OptionType::PE)
+                SignalAction::BuyPE => self
+                    .contracts
+                    .iter()
+                    .find(|c| {
+                        c.underlying == signal.underlying
+                            && c.expiry == signal.expiry
+                            && c.strike == signal.strike
+                            && c.option_type == OptionType::PE
+                    })
                     .map(|c| c.instrument_token)
                     .unwrap_or(0),
                 _ => 0,
@@ -2678,6 +2916,17 @@ impl OptionsEngine {
     fn generate_signals(&mut self, snap: &ChainSnapshot) -> Vec<Signal> {
         let mut signals = Vec::new();
 
+        // Feed this scan's spot into the per-underlying price-action series (drives the
+        // technical gate below). No look-ahead: the just-fed tick only opens an in-progress
+        // bar; the bias reads CLOSED bars (prior scans) only.
+        if snap.spot > 0.0 {
+            let now = self.current_time_ms();
+            self.spot_series
+                .entry(snap.underlying.clone())
+                .or_default()
+                .ingest(now, snap.spot);
+        }
+
         let lot_size = match self.contracts.iter().find(|c| c.underlying == snap.underlying).map(|c| c.lot_size) {
             Some(ls) => ls,
             None => {
@@ -2803,6 +3052,7 @@ impl OptionsEngine {
         if !compressive {
             if let Some(s) = self.strategy_iv_expansion(snap) { scored.push(s); }
         }
+        if let Some(s) = self.strategy_spot_reversal(snap) { scored.push(s); }
         if let Some(s) = self.strategy_trend_follow(snap)  { scored.push(s); }
         if let Some(s) = self.strategy_max_pain(snap)      { scored.push(s); }
         if let Some(s) = self.strategy_oi_divergence(snap) {
@@ -2845,6 +3095,69 @@ impl OptionsEngine {
             return signals;
         }
 
+        let dominant_has_spot_reversal = scored.iter().any(|(a, _, strat, _)| {
+            *a == dominant_action && *strat == StrategyType::SpotReversal
+        });
+
+        let mut technical_note: Option<String> = None;
+
+        // ── Technical confirmation gate (HARD veto on direction conflict) ──
+        // Only trade when the chain's chosen direction AGREES with the spot's price-action
+        // bias. A BuyPE (bearish) into a CONFIRMED uptrend — exactly today's losing trade —
+        // is vetoed. Neutral/unformed bias passes (no protection until indicators form).
+        if let Some(series) = self.spot_series.get(&snap.underlying) {
+            let b = series.bias();
+            let summary = series
+                .technical_summary()
+                .unwrap_or_else(|| "technical panel still warming".to_string());
+            let desired_direction = match dominant_action {
+                SignalAction::BuyCE => crate::technicals::Direction::Bull,
+                SignalAction::BuyPE => crate::technicals::Direction::Bear,
+                _ => crate::technicals::Direction::Neutral,
+            };
+            let scalp = series
+                .scalp_assessment(desired_direction)
+                .map(|s| {
+                    format!(
+                        " | scalp {:?} alignment {}/{}: {}",
+                        s.direction, s.aligned, s.observed, s.summary
+                    )
+                })
+                .unwrap_or_default();
+            technical_note = Some(format!(
+                "Technicals {:?} strength {:.0}%: {}{}",
+                b.direction,
+                b.strength * 100.0,
+                summary,
+                scalp
+            ));
+            let veto = match dominant_action {
+                SignalAction::BuyCE => !series.allows_bullish(),
+                SignalAction::BuyPE => !series.allows_bearish(),
+                _ => false,
+            };
+            if veto && !dominant_has_spot_reversal {
+                warn!(
+                    "  {} gen_signals: {:?} VETOED by technicals — price-action bias {:?} (strength {:.2}) conflicts; {}",
+                    snap.underlying,
+                    dominant_action,
+                    b.direction,
+                    b.strength,
+                    summary
+                );
+                return signals;
+            } else if veto {
+                warn!(
+                    "  {} gen_signals: {:?} allowed by spot-reversal break despite slower bias {:?} (strength {:.2}); {}",
+                    snap.underlying,
+                    dominant_action,
+                    b.direction,
+                    b.strength,
+                    summary
+                );
+            }
+        }
+
         // Symmetric PCR conviction floors.
         //
         // For PE: PCR 0.89+ starts to lose bearish clarity, but 0.83–0.88 can still be
@@ -2853,14 +3166,16 @@ impl OptionsEngine {
         //
         // For CE: PCR 1.23+ is enough to confirm bullish skew when trend/GEX/IV agree.
         //         The older 1.25 floor filtered out valid March expiry-week winners.
-        if dominant_action == SignalAction::BuyPE && snap.pcr_oi > 0.88 {
-            warn!("  {} gen_signals: PE blocked — PCR {:.2} > 0.88 (weak bearish conviction)",
-                snap.underlying, snap.pcr_oi);
+        let pe_pcr_ceiling = if dominant_has_spot_reversal { 1.05 } else { 0.88 };
+        let ce_pcr_floor = if dominant_has_spot_reversal { 0.95 } else { 1.23 };
+        if dominant_action == SignalAction::BuyPE && snap.pcr_oi > pe_pcr_ceiling {
+            warn!("  {} gen_signals: PE blocked — PCR {:.2} > {:.2} (weak bearish conviction)",
+                snap.underlying, snap.pcr_oi, pe_pcr_ceiling);
             return signals;
         }
-        if dominant_action == SignalAction::BuyCE && snap.pcr_oi < 1.23 {
-            warn!("  {} gen_signals: CE blocked — PCR {:.2} < 1.23 (weak bullish conviction)",
-                snap.underlying, snap.pcr_oi);
+        if dominant_action == SignalAction::BuyCE && snap.pcr_oi < ce_pcr_floor {
+            warn!("  {} gen_signals: CE blocked — PCR {:.2} < {:.2} (weak bullish conviction)",
+                snap.underlying, snap.pcr_oi, ce_pcr_floor);
             return signals;
         }
 
@@ -2871,7 +3186,7 @@ impl OptionsEngine {
             return signals;
         }
 
-        let (composite_score, merged_reasons, primary_strategy) = {
+        let (composite_score, mut merged_reasons, primary_strategy) = {
 
             let max_score = dominant_signals.iter().map(|(_, s, _, _)| *s).fold(0.0_f64, f64::max);
             let sum_all = dominant_signals.iter().map(|(_, s, _, _)| *s).sum::<f64>();
@@ -2887,6 +3202,9 @@ impl OptionsEngine {
             reasons.dedup_by(|a, b| a.0 == b.0);
             (composite, reasons, strategy)
         };
+        if let Some(note) = technical_note {
+            merged_reasons.push((note, 0.0));
+        }
 
         let n_dominant = dominant_signals.len();
         let confidence_floor = self.min_confidence_floor_for(snap, primary_strategy);
@@ -2975,9 +3293,10 @@ impl OptionsEngine {
         }
         if lots == 0 { return signals; }
 
-        let entry_cost_per_lot = entry_transaction_cost_per_lot(option_price, lot_size);
-        let cost_per_lot = option_price * lot_size as f64 + entry_cost_per_lot;
-        let capital_required = cost_per_lot * lots as f64;
+        // Flat brokerage is per order, not per lot (bug 5): premium scales with lots,
+        // brokerage is added once via entry_order_cost.
+        let capital_required = option_price * lot_size as f64 * lots as f64
+            + entry_order_cost(option_price, lot_size, lots);
         if capital_required > self.risk.available_capital() {
             return signals;
         }
@@ -2989,19 +3308,9 @@ impl OptionsEngine {
         let breakeven_move_pct = (straddle_prem / snap.spot) * 100.0;
 
         let max_loss = (option_price - stop_price) * lot_size as f64 * lots as f64
-            + round_trip_transaction_cost_per_lot(
-                option_price,
-                stop_price,
-                lot_size,
-                self.current_time_ms(),
-            ) * lots as f64;
+            + round_trip_order_cost(option_price, stop_price, lot_size, lots, self.current_time_ms());
         let max_profit = (target_price - option_price) * lot_size as f64 * lots as f64
-            - round_trip_transaction_cost_per_lot(
-                option_price,
-                target_price,
-                lot_size,
-                self.current_time_ms(),
-            ) * lots as f64;
+            - round_trip_order_cost(option_price, target_price, lot_size, lots, self.current_time_ms());
         let risk_reward = if max_loss > 0.0 { max_profit / max_loss } else { 0.0 };
 
         // Reject trades without sufficient risk-reward edge.
@@ -3112,7 +3421,9 @@ impl OptionsEngine {
 
 
     fn pick_strike<'a>(&self, snap: &'a ChainSnapshot, action: &SignalAction, lot_size: u32) -> Option<&'a StrikeLevel> {
-        let deployable_capital = self.available_capital_for_new_orders();
+        let cash_capital = self.available_capital_for_new_orders();
+        let sizing_capital = self.risk.max_one_lot_entry_cost_by_exposure();
+        let deployable_capital = cash_capital.min(sizing_capital);
 
         let atm_idx = snap.strikes.iter()
             .enumerate()
@@ -3140,11 +3451,12 @@ impl OptionsEngine {
         let candidate_cost = one_lot_entry_cost(price, lot_size);
 
         warn!(
-            "  pick_strike {} {:?} lot={} cap={:.0} candidate={:.0} price={:.1} one_lot_cost={:.0}",
+            "  pick_strike {} {:?} lot={} cap={:.0} sizing_cap={:.0} candidate={:.0} price={:.1} one_lot_cost={:.0}",
             snap.underlying,
             action,
             lot_size,
-            deployable_capital,
+            cash_capital,
+            sizing_capital,
             candidate.strike,
             price,
             candidate_cost,
@@ -3347,6 +3659,93 @@ impl OptionsEngine {
 
         if score < 25.0 { return None; }
         Some((action, score.min(100.0), StrategyType::IVExpansion, reasons))
+    }
+
+    fn strategy_spot_reversal(&self, snap: &ChainSnapshot) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
+        let session = self.current_session();
+        if matches!(session, SessionPhase::OpeningBell | SessionPhase::Closing | SessionPhase::AfterMarket | SessionPhase::PreOpen) {
+            return None;
+        }
+
+        let reversal = self.spot_series.get(&snap.underlying)?.reversal_break()?;
+        let action = match reversal.direction {
+            crate::technicals::Direction::Bear => SignalAction::BuyPE,
+            crate::technicals::Direction::Bull => SignalAction::BuyCE,
+            crate::technicals::Direction::Neutral => return None,
+        };
+
+        // Price action can lead OI/PCR, but do not fight a strongly opposite chain.
+        if action == SignalAction::BuyPE && snap.pcr_oi > 1.05 {
+            return None;
+        }
+        if action == SignalAction::BuyCE && snap.pcr_oi < 0.95 {
+            return None;
+        }
+
+        // Avoid buying options at the top of their own session IV range unless the
+        // absolute IV regime is genuinely stressed.
+        if snap.iv_rank > 75.0 && snap.atm_iv < 0.38 {
+            return None;
+        }
+        if snap.atm_iv <= 0.0 || snap.atm_iv > 0.45 {
+            return None;
+        }
+
+        let mut score = 0.0_f64;
+        let mut reasons = Vec::new();
+        let direction_text = match action {
+            SignalAction::BuyPE => "rejected recent high",
+            SignalAction::BuyCE => "reclaimed from recent low",
+            _ => return None,
+        };
+        score += 38.0;
+        reasons.push((
+            format!(
+                "Spot {} over {} closed bars: {:.2}% move / {:.1} ATR",
+                direction_text,
+                reversal.lookback_bars,
+                reversal.move_pct * 100.0,
+                reversal.atr_multiple
+            ),
+            38.0,
+        ));
+
+        let atr_score = (reversal.atr_multiple * 8.0).clamp(12.0, 24.0);
+        score += atr_score;
+        reasons.push((
+            format!("Price-action break strength {:.1} ATR", reversal.atr_multiple),
+            atr_score,
+        ));
+
+        if snap.iv_rank >= 1.0 && snap.iv_rank < 65.0 {
+            score += 10.0;
+            reasons.push((format!("IV Rank {:.0}%: options still affordable for reversal", snap.iv_rank), 10.0));
+        }
+
+        if snap.atm_iv < 0.16 {
+            score += 8.0;
+            reasons.push((format!("ATM IV {:.1}%: premium not structurally rich", snap.atm_iv * 100.0), 8.0));
+        }
+
+        match action {
+            SignalAction::BuyPE if snap.pcr_oi < 1.0 => {
+                score += 8.0;
+                reasons.push((format!("PCR {:.2}: not opposing bearish reversal", snap.pcr_oi), 8.0));
+            }
+            SignalAction::BuyCE if snap.pcr_oi > 1.0 => {
+                score += 8.0;
+                reasons.push((format!("PCR {:.2}: not opposing bullish reversal", snap.pcr_oi), 8.0));
+            }
+            _ => {
+                score += 4.0;
+                reasons.push((format!("PCR {:.2}: neutral enough for price-action reversal", snap.pcr_oi), 4.0));
+            }
+        }
+
+        if score < self.min_confidence {
+            return None;
+        }
+        Some((action, score.min(100.0), StrategyType::SpotReversal, reasons))
     }
 
     fn strategy_trend_follow(&self, snap: &ChainSnapshot) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
@@ -3812,14 +4211,16 @@ impl OptionsEngine {
         self.reset_daily_state_if_needed();
         let used_slots = self.daily_trade_slots_used();
         // dynamic_daily_trade_cap adjusts the per-day limit by tier/session/conditions;
-        // max_daily_trades (from config) serves as the hard safety ceiling.
-        let effective_cap = self.dynamic_daily_trade_cap(signal).min(self.max_daily_trades);
+        // max_daily_trades (from config) serves as the hard safety ceiling. A config
+        // value of 0 means "no static count cap"; use the dynamic cap only.
+        let dynamic_cap = self.dynamic_daily_trade_cap(signal);
+        let effective_cap = self.effective_daily_trade_cap(signal);
         if used_slots >= effective_cap {
             self.entry_rejections += 1;
             warn!(
                 "Position rejected (daily trade cap): used {} / {} (dynamic={}, config_max={})",
                 used_slots, effective_cap,
-                self.dynamic_daily_trade_cap(signal),
+                dynamic_cap,
                 self.max_daily_trades
             );
             return;
@@ -3827,18 +4228,26 @@ impl OptionsEngine {
 
         let (token, tradingsymbol) = match signal.action {
             SignalAction::BuyCE => {
-                self.contracts.iter()
-                    .find(|c| c.underlying == signal.underlying
-                        && c.strike == signal.strike
-                        && c.option_type == OptionType::CE)
+                self.contracts
+                    .iter()
+                    .find(|c| {
+                        c.underlying == signal.underlying
+                            && c.expiry == signal.expiry
+                            && c.strike == signal.strike
+                            && c.option_type == OptionType::CE
+                    })
                     .map(|c| (c.instrument_token, c.tradingsymbol.clone()))
                     .unwrap_or((0, String::new()))
             }
             SignalAction::BuyPE => {
-                self.contracts.iter()
-                    .find(|c| c.underlying == signal.underlying
-                        && c.strike == signal.strike
-                        && c.option_type == OptionType::PE)
+                self.contracts
+                    .iter()
+                    .find(|c| {
+                        c.underlying == signal.underlying
+                            && c.expiry == signal.expiry
+                            && c.strike == signal.strike
+                            && c.option_type == OptionType::PE
+                    })
                     .map(|c| (c.instrument_token, c.tradingsymbol.clone()))
                     .unwrap_or((0, String::new()))
             }
@@ -3886,9 +4295,12 @@ impl OptionsEngine {
             return;
         }
 
-        let entry_fill_price = (signal.option_price + self.execution_buy_offset_inr).max(0.05);
-        let entry_costs = entry_transaction_cost_per_lot(entry_fill_price, signal.lot_size)
-            * signal.lots as f64;
+        let entry_fill_price = if self.live_mode_enabled() {
+            self.live_entry_limit_price(token, signal.option_price)
+        } else {
+            (signal.option_price + self.execution_buy_offset_inr).max(0.05)
+        };
+        let entry_costs = entry_order_cost(entry_fill_price, signal.lot_size, signal.lots);
         let capital_deployed = entry_fill_price * signal.lot_size as f64 * signal.lots as f64
             + entry_costs;
 
@@ -3902,7 +4314,16 @@ impl OptionsEngine {
                 );
                 return;
             }
-            self.submit_live_entry_order(signal, token, tradingsymbol, capital_deployed);
+            // The atomic global-slot claim happens inside submit_live_entry_order,
+            // after its quantity/symbol guard, so a claim ALWAYS pairs with a
+            // registered pending entry (no leaked lock on an early return).
+            self.submit_live_entry_order(
+                signal,
+                token,
+                tradingsymbol,
+                capital_deployed,
+                entry_fill_price,
+            );
             return;
         }
 
@@ -3915,6 +4336,17 @@ impl OptionsEngine {
                 self.risk.available_capital()
             );
             return;
+        }
+
+        // Claim the single global position slot (atomic) before committing the paper
+        // fill. If another engine holds it, give the capital back and cancel.
+        if let Some(c) = &self.shared_circuit {
+            if !crate::portfolio::try_claim(c, "options") {
+                self.risk.release_reserved_capital(capital_deployed);
+                self.entry_rejections += 1;
+                warn!("Entry cancelled: global position slot held elsewhere");
+                return;
+            }
         }
 
         self.last_signal_ms.insert(signal.underlying.clone(), self.current_time_ms());
@@ -3976,11 +4408,24 @@ impl OptionsEngine {
         token: u32,
         tradingsymbol: String,
         estimated_capital: f64,
+        limit_price: f64,
     ) {
         let quantity = signal.lots.saturating_mul(signal.lot_size);
         if quantity == 0 || tradingsymbol.is_empty() {
             self.entry_rejections += 1;
             return;
+        }
+
+        // Claim the single global position slot (atomic) right before registering the
+        // order, so a successful claim ALWAYS pairs with a pending entry that
+        // release_pending_entry / promote can later release. If another engine holds
+        // it, cancel — one open trade at a time across the account.
+        if let Some(c) = &self.shared_circuit {
+            if !crate::portfolio::try_claim(c, "options") {
+                self.entry_rejections += 1;
+                warn!("Entry cancelled: global position slot held elsewhere");
+                return;
+            }
         }
 
         let pos_id = { self.next_pos_id += 1; self.next_pos_id - 1 };
@@ -4001,19 +4446,21 @@ impl OptionsEngine {
             last_cancel_attempt_ms: 0,
             released_after_timeout: false,
             order_id: None,
-            signal_price: signal.option_price,
+            signal_price: limit_price,
             placed_at_scan_count: self.scan_count,
         });
         self.last_signal_ms.insert(signal.underlying.clone(), now);
 
         info!(
-            "📨 ENTRY ORDER SUBMITTED | tag={} | {} {} {:.0} {} | qty={} | est capital ₹{:.2}",
+            "📨 ENTRY ORDER SUBMITTED | tag={} | {} {} {:.0} {} | qty={} | limit ₹{:.2} (current+₹{:.2}) | est capital ₹{:.2}",
             tag,
             signal.underlying,
             signal.action,
             signal.strike,
             signal.expiry,
             quantity,
+            limit_price,
+            LIVE_ENTRY_LIMIT_PAYUP_INR,
             estimated_capital
         );
         self.send_order_command(OrderCommand::Place(PlaceOrderCmd {
@@ -4021,7 +4468,7 @@ impl OptionsEngine {
             tradingsymbol,
             quantity,
             side: OrderSide::Buy,
-            limit_price: Some(signal.option_price),
+            limit_price: Some(limit_price),
         }));
         self.send_order_command(OrderCommand::StatusByTag { tag });
     }
@@ -4044,8 +4491,7 @@ impl OptionsEngine {
             (fallback_price + self.execution_buy_offset_inr).max(0.05)
         };
         let entry_datetime = datetime_string_from_ms(self.current_time_ms());
-        let entry_costs = entry_transaction_cost_per_lot(entry_fill_price, signal.lot_size)
-            * signal.lots as f64;
+        let entry_costs = entry_order_cost(entry_fill_price, signal.lot_size, signal.lots);
         let capital_deployed = entry_fill_price * signal.lot_size as f64 * signal.lots as f64
             + entry_costs;
         if !self.risk.reserve_capital(capital_deployed) {
@@ -4091,6 +4537,10 @@ impl OptionsEngine {
                     current_order_filled_notional: 0.0,
                 });
                 self.send_order_command(OrderCommand::StatusByTag { tag: exit_tag });
+            } else if let Some(c) = &self.shared_circuit {
+                if !self.has_live_commitment() {
+                    crate::portfolio::release(c, "options");
+                }
             }
             return false;
         }
@@ -4235,8 +4685,8 @@ impl OptionsEngine {
             self.capital_sync_needed = should_sync_capital;
 
             let gross_pnl = (exit_fill_price - pos.entry_price) * pos.lot_size as f64 * pos.lots as f64;
-            let entry_costs = entry_transaction_cost_per_lot(pos.entry_price, pos.lot_size) * pos.lots as f64;
-            let exit_costs = exit_transaction_cost_per_lot(exit_fill_price, pos.lot_size, exit_time_ms) * pos.lots as f64;
+            let entry_costs = entry_order_cost(pos.entry_price, pos.lot_size, pos.lots);
+            let exit_costs = exit_order_cost(exit_fill_price, pos.lot_size, pos.lots, exit_time_ms);
             let costs = entry_costs + exit_costs;
             pos.pnl = gross_pnl - costs;
             pos.pnl_pct = if pos.capital_deployed > 0.0 {
@@ -4266,6 +4716,13 @@ impl OptionsEngine {
 
         self.risk.release_reserved_capital(capital_deployed);
         self.risk.record_trade(pnl);
+        // Feed the account-level circuit (net, post-cost P&L) and FREE the single
+        // global position slot — this trade is done, the next signal (any engine)
+        // may now claim it. This is the one close chokepoint for paper AND live.
+        if let Some(c) = &self.shared_circuit {
+            crate::portfolio::record(c, pnl);
+            crate::portfolio::release(c, "options");
+        }
         self.positions_closed += 1;
 
         if is_stop {
@@ -4544,11 +5001,17 @@ impl OptionsEngine {
 #[cfg(test)]
 mod tests {
     use super::{
+        entry_cost_per_lot_excl_brokerage,
+        entry_cutoff_ist_mins_for_dte,
+        entry_order_cost,
         nearest_affordable_otm_idx,
+        options_brokerage_per_order,
+        past_entry_cutoff_ist,
         OptionsEngine,
         PendingEntryOrder,
         PendingExitOrder,
         Position,
+        RiskEngine,
         SessionPhase,
         Signal,
         SignalAction,
@@ -4568,6 +5031,7 @@ mod tests {
             enabled: true,
             initial_capital: 10_000.0,
             max_daily_loss_pct: 30.0,
+            max_daily_profit_pct: 35.0,
             profit_target_pct: 55.0,
             stop_loss_pct: 35.0,
             min_confidence: 60.0,
@@ -4583,6 +5047,89 @@ mod tests {
             session: SessionPhase::Morning.to_string(),
             ..EntryContext::default()
         }
+    }
+
+    #[test]
+    fn risk_engine_dual_circuit_is_fee_inclusive() {
+        // record_trade(pnl) feeds NET (post-cost) P&L into `capital`, and the
+        // circuits compare `capital - daily_start_capital`, so they are
+        // fee-inclusive by construction.
+        let mut lower = RiskEngine::new(5_000.0, 0.15, 0.35); // ₹5k start
+        assert!(!lower.circuit_breaker_triggered());
+        lower.record_trade(-740.0);
+        assert!(!lower.circuit_breaker_triggered(), "-14.8% still open");
+        lower.record_trade(-20.0); // total -760 (-15.2%) => lower circuit
+        assert!(lower.circuit_breaker_triggered());
+        assert_eq!(lower.circuit_reason(), Some("LOWER circuit (daily loss limit)"));
+
+        let mut upper = RiskEngine::new(5_000.0, 0.15, 0.35);
+        upper.record_trade(1_700.0); // +34% still open
+        assert!(!upper.circuit_breaker_triggered());
+        upper.record_trade(60.0); // total +1760 (+35.2%) => upper circuit
+        assert!(upper.circuit_breaker_triggered());
+        assert_eq!(
+            upper.circuit_reason(),
+            Some("UPPER circuit (daily profit limit — anti-overtrade)")
+        );
+    }
+
+    #[test]
+    fn zero_config_trade_cap_means_dynamic_cap_only() {
+        let mut cfg = test_config();
+        cfg.max_daily_trades = 0;
+        let store = TickStore::new();
+        let engine = OptionsEngine::new(
+            Vec::new(),
+            store,
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            "/tmp",
+        );
+        let signal = Signal {
+            id: 1,
+            underlying: "NIFTY".to_string(),
+            expiry: "2026-06-23".to_string(),
+            action: SignalAction::BuyPE,
+            strike: 23_900.0,
+            option_price: 90.0,
+            target_price: 110.0,
+            stop_price: 75.0,
+            lots: 1,
+            lot_size: 65,
+            capital_required: 5_900.0,
+            confidence: 75.0,
+            strategy: StrategyType::Composite,
+            reasons: Vec::new(),
+            timestamp_ms: 0,
+            session: SessionPhase::Afternoon,
+            breakeven_move_pct: 1.0,
+            max_loss: 1_000.0,
+            max_profit_target: 1_000.0,
+            risk_reward: 1.5,
+            entry_ctx: EntryContext {
+                days_to_expiry: 4.0,
+                confidence: 75.0,
+                session: SessionPhase::Afternoon.to_string(),
+                ..EntryContext::default()
+            },
+        };
+
+        assert!(engine.dynamic_daily_trade_cap(&signal) > 0);
+        assert_eq!(
+            engine.effective_daily_trade_cap(&signal),
+            engine.dynamic_daily_trade_cap(&signal)
+        );
+    }
+
+    #[test]
+    fn multi_day_entry_cutoff_is_earlier_than_expiry_cutoff() {
+        assert_eq!(entry_cutoff_ist_mins_for_dte(4.0), 14 * 60 + 55);
+        assert_eq!(entry_cutoff_ist_mins_for_dte(0.4), 15 * 60);
+        assert!(!past_entry_cutoff_ist(14 * 60 + 54, 4.0));
+        assert!(past_entry_cutoff_ist(14 * 60 + 55, 4.0));
+        assert!(!past_entry_cutoff_ist(14 * 60 + 55, 0.4));
     }
 
     fn test_position(exit_pending: bool) -> Position {
@@ -4872,6 +5419,210 @@ mod tests {
 
         assert!(!engine.capital_sync_needed);
         assert!(!engine.positions[0].is_open);
+    }
+
+    #[test]
+    fn global_position_lock_blocks_options_and_frees_on_close() {
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_lock_close_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+
+        let mut engine = OptionsEngine::new(
+            Vec::new(),
+            TickStore::new(),
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+        let circuit = crate::portfolio::new_shared(100_000.0, 15.0, 25.0, u32::MAX);
+        engine.set_shared_circuit(circuit.clone());
+
+        // Another engine (micro) holds the single global slot.
+        assert!(crate::portfolio::try_claim(&circuit, "micro"));
+
+        // Options' own idle-release must NOT evict another holder's slot.
+        engine.release_lock_if_idle();
+        assert_eq!(circuit.lock().unwrap().position_holder(), Some("micro"));
+        // ...and options cannot claim while micro holds it (entry would be cancelled).
+        assert!(!crate::portfolio::try_claim(&circuit, "options"));
+
+        // Micro's trade closes → slot frees → options claims, opens, and the REAL close
+        // path (close_position_at -> finalize_position_close) frees the slot again.
+        crate::portfolio::release(&circuit, "micro");
+        assert!(crate::portfolio::try_claim(&circuit, "options"));
+        assert!(crate::portfolio::is_locked(&circuit));
+        engine.positions.push(test_position(false));
+        engine.close_position_at(0, 101.0, "TARGET HIT ₹101.00".to_string());
+        assert!(!engine.positions[0].is_open);
+        assert!(
+            !crate::portfolio::is_locked(&circuit),
+            "the close chokepoint must free the global position slot"
+        );
+    }
+
+    // Bug 5: Zerodha charges ₹20 flat brokerage per ORDER, not per lot.
+    #[test]
+    fn flat_brokerage_is_charged_once_per_order_not_per_lot() {
+        let price = 159.0;
+        let lot = 65u32;
+        let per_lot_excl = entry_cost_per_lot_excl_brokerage(price, lot);
+        let flat = options_brokerage_per_order();
+        assert!((flat - 20.0 * 1.18).abs() < 1e-9, "flat brokerage = ₹20 + 18% GST = ₹23.60");
+
+        let one = entry_order_cost(price, lot, 1);
+        let four = entry_order_cost(price, lot, 4);
+        assert!((one - (per_lot_excl + flat)).abs() < 1e-6, "1 lot = per-lot + ONE brokerage");
+        assert!((four - (4.0 * per_lot_excl + flat)).abs() < 1e-6, "4 lots = 4×per-lot + ONE brokerage");
+        // The old per-lot bug would have added 4× brokerage; the real delta from 1→4 lots
+        // must be exactly 3× the per-lot ex-brokerage cost, with NO extra brokerage.
+        assert!(((four - one) - 3.0 * per_lot_excl).abs() < 1e-6, "added lots must not each pay brokerage");
+        // Sanity: the bug over-charged a 4-lot round trip by 3 extra brokerages PER LEG.
+        let overcharge_per_leg = 3.0 * flat;
+        assert!(overcharge_per_leg > 70.0, "the fixed over-charge was material: ~₹{:.1}/leg", overcharge_per_leg);
+    }
+
+    #[test]
+    fn untracked_pending_exit_holds_and_releases_global_lock() {
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_untracked_exit_lock_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+
+        let mut engine = OptionsEngine::new(
+            Vec::new(),
+            TickStore::new(),
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+        let circuit = crate::portfolio::new_shared(100_000.0, 15.0, 25.0, u32::MAX);
+        engine.set_shared_circuit(circuit.clone());
+
+        assert!(crate::portfolio::try_claim(&circuit, "options"));
+        engine.pending_exit_orders.push(PendingExitOrder {
+            pos_id: 99,
+            tag: "SATAEXIT99".to_string(),
+            tradingsymbol: "NIFTY26APR22000CE".to_string(),
+            total_quantity: 50,
+            placed_ms: 0,
+            last_status_poll_ms: 0,
+            reason: "EMERGENCY FLATTEN".to_string(),
+            cancel_requested: false,
+            last_cancel_attempt_ms: 0,
+            market_fallback_sent: false,
+            fallback_book_price: 100.0,
+            total_filled_quantity: 0,
+            total_filled_notional: 0.0,
+            current_order_filled_quantity: 0,
+            current_order_filled_notional: 0.0,
+        });
+
+        engine.release_lock_if_idle();
+        assert_eq!(
+            circuit.lock().unwrap().position_holder(),
+            Some("options"),
+            "pending emergency exit must keep the global slot held"
+        );
+
+        engine.handle_order_update(OrderUpdate {
+            tag: "SATAEXIT99".to_string(),
+            order_id: None,
+            status: Some("COMPLETE".to_string()),
+            average_price: Some(101.0),
+            filled_quantity: Some(50),
+            pending_quantity: Some(0),
+            source: "status_poll".to_string(),
+            message: None,
+        });
+
+        assert!(engine.pending_exit_orders.is_empty());
+        assert!(
+            !crate::portfolio::is_locked(&circuit),
+            "completed emergency exit must free the global slot"
+        );
+    }
+
+    #[test]
+    fn live_entry_order_pays_up_quarter_rupee_from_current_ltp() {
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_live_entry_payup_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+
+        let store = TickStore::new();
+        store.update(Tick {
+            token: 101,
+            ltp: 100.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
+
+        let mut engine = OptionsEngine::new(
+            Vec::new(),
+            store,
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+
+        let signal = Signal {
+            id: 1,
+            underlying: "NIFTY".to_string(),
+            expiry: "2026-04-30".to_string(),
+            action: SignalAction::BuyCE,
+            strike: 22_000.0,
+            option_price: 99.0,
+            target_price: 120.0,
+            stop_price: 85.0,
+            lots: 1,
+            lot_size: 50,
+            capital_required: 5_000.0,
+            confidence: 75.0,
+            strategy: StrategyType::Composite,
+            reasons: Vec::new(),
+            timestamp_ms: 0,
+            session: SessionPhase::Morning,
+            breakeven_move_pct: 0.0,
+            max_loss: 0.0,
+            max_profit_target: 0.0,
+            risk_reward: 1.0,
+            entry_ctx: test_entry_context(),
+        };
+
+        let limit_price = engine.live_entry_limit_price(101, signal.option_price);
+        engine.submit_live_entry_order(
+            &signal,
+            101,
+            "NIFTY26APR22000CE".to_string(),
+            5_100.0,
+            limit_price,
+        );
+
+        match order_rx.try_recv().expect("entry order") {
+            OrderCommand::Place(cmd) => {
+                assert_eq!(cmd.quantity, 50);
+                assert_eq!(cmd.side, OrderSide::Buy);
+                assert_eq!(cmd.limit_price, Some(100.25));
+            }
+            other => panic!("expected place command, got {:?}", other),
+        }
+        assert_eq!(engine.pending_entry_orders[0].signal_price, 100.25);
     }
 
     #[test]

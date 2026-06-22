@@ -2,8 +2,8 @@
 /// Reads the same options tick CSV format as backtest_options.
 ///
 /// Usage:
-///   cargo run --bin backtest_quant --release -- data/2026-02-24_options_ticks.csv
-///   cargo run --bin backtest_quant --release -- --all   (runs all CSVs in data/)
+///   cargo run --manifest-path src/Cargo.toml --bin backtest_quant --release -- data/2026-02-24_options_ticks.csv
+///   cargo run --manifest-path src/Cargo.toml --bin backtest_quant --release -- --all   (runs all CSVs in data/)
 
 use satavahana::models::{OptionContract, OptionType, Tick, TickMode, OHLC};
 use satavahana::quant_engine::QuantEngine;
@@ -335,7 +335,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         csv_paths.push(candidates.pop().unwrap());
     }
 
-    let run_id = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    // IST-stamped run id (machine timezone-independent).
+    let ist = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+    let run_id = chrono::Utc::now().with_timezone(&ist).format("%Y%m%d_%H%M%S").to_string();
     let run_dir = PathBuf::from(format!("backtest/quant_{}", run_id));
     fs::create_dir_all(&run_dir)?;
 

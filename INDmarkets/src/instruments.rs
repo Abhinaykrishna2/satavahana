@@ -264,24 +264,7 @@ pub async fn build_options_chain(
                 fallback
             }
         } else {
-            // Skip expiries with DTE <= 1: on 0/1-DTE days trade next week's expiry instead.
-            use chrono::{NaiveDate, Utc, Duration};
-            let today_ist = (Utc::now() + Duration::hours(5) + Duration::minutes(30)).date_naive();
-            let selected = expiries.iter()
-                .find(|e| {
-                    NaiveDate::parse_from_str(e, "%Y-%m-%d")
-                        .map(|exp| (exp - today_ist).num_days() > 1)
-                        .unwrap_or(true)
-                })
-                .cloned()
-                .unwrap_or_else(|| expiries[0].clone());
-            if selected != expiries[0] {
-                info!(
-                    "  {} nearest expiry {} is 0/1-DTE — skipping to next expiry {}",
-                    underlying, expiries[0], selected
-                );
-            }
-            selected
+            expiries[0].clone()
         };
 
         info!(
@@ -564,16 +547,7 @@ pub fn build_options_chain_sync(
         let selected = if let Some(pref) = preferred_expiry {
             if expiries.iter().any(|e| e == pref) { pref.to_string() } else { expiries[0].clone() }
         } else {
-            use chrono::{NaiveDate, Utc, Duration};
-            let today_ist = (Utc::now() + Duration::hours(5) + Duration::minutes(30)).date_naive();
-            expiries.iter()
-                .find(|e| {
-                    NaiveDate::parse_from_str(e, "%Y-%m-%d")
-                        .map(|exp| (exp - today_ist).num_days() > 1)
-                        .unwrap_or(true)
-                })
-                .cloned()
-                .unwrap_or_else(|| expiries[0].clone())
+            expiries[0].clone()
         };
         selected_expiry_by_underlying.insert(underlying.clone(), selected);
     }

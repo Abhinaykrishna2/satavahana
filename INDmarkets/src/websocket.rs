@@ -117,8 +117,15 @@ pub fn parse_binary_message(
         return Ok(vec![]);
     }
 
-    let num_packets = BigEndian::read_i16(&data[0..2]) as usize;
-    let mut ticks = Vec::with_capacity(num_packets);
+    let num_packets_raw = BigEndian::read_i16(&data[0..2]);
+    if num_packets_raw <= 0 {
+        return Ok(vec![]);
+    }
+    let num_packets = num_packets_raw as usize;
+    // Cap pre-allocation: each packet carries at least a 2-byte length header, so a
+    // valid message can never contain more than data.len()/2 packets. This prevents
+    // a malformed/huge count from triggering an OOM-sized allocation.
+    let mut ticks = Vec::with_capacity(num_packets.min(data.len() / 2 + 1));
     let mut offset = 2;
 
     for _ in 0..num_packets {
@@ -126,8 +133,13 @@ pub fn parse_binary_message(
             break;
         }
 
-        let packet_len = BigEndian::read_i16(&data[offset..offset + 2]) as usize;
+        let packet_len_raw = BigEndian::read_i16(&data[offset..offset + 2]);
         offset += 2;
+        if packet_len_raw < 0 {
+            warn!("Malformed packet length {} (negative); stopping parse", packet_len_raw);
+            break;
+        }
+        let packet_len = packet_len_raw as usize;
 
         if offset + packet_len > data.len() {
             warn!(
@@ -480,6 +492,23 @@ mod tests {
     #[test]
     fn test_heartbeat_ignored() {
         let data = vec![0u8];
+        let ticks = parse_binary_message(&data).unwrap();
+        assert!(ticks.is_empty());
+    }
+
+    #[test]
+    fn test_negative_packet_count_ignored() {
+        let mut data = Vec::new();
+        data.write_i16::<BigEndian>(-1).unwrap();
+        let ticks = parse_binary_message(&data).unwrap();
+        assert!(ticks.is_empty());
+    }
+
+    #[test]
+    fn test_negative_packet_len_stops_parse() {
+        let mut data = Vec::new();
+        data.write_i16::<BigEndian>(1).unwrap();
+        data.write_i16::<BigEndian>(-8).unwrap();
         let ticks = parse_binary_message(&data).unwrap();
         assert!(ticks.is_empty());
     }

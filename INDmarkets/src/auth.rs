@@ -1,9 +1,12 @@
 
 use hex;
 use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
+
+const TOKEN_CACHE_PATH: &str = "config/.kite_token";
 
 pub struct KiteAuth {
     pub api_key: String,
@@ -29,12 +32,48 @@ impl KiteAuth {
         )
     }
 
+    /// Verify the token is actually accepted by Kite (catches a stale-but-same-day
+    /// cached token that would otherwise 403 silently all session). Ok(()) on a 200
+    /// from /user/profile; Err with the status/message otherwise.
+    pub async fn validate(&self) -> Result<(), String> {
+        let client = reqwest::Client::builder()
+            .build()
+            .map_err(|e| format!("http client build failed: {}", e))?;
+        let resp = client
+            .get("https://api.kite.trade/user/profile")
+            .header("X-Kite-Version", "3")
+            .header("Authorization", self.auth_header())
+            .send()
+            .await
+            .map_err(|e| format!("network error validating token: {}", e))?;
+        let status = resp.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(format!(
+                "HTTP {} from /user/profile: {}",
+                status,
+                body.chars().take(160).collect::<String>()
+            ))
+        }
+    }
+
+    /// Delete the cached token (call when it is found to be invalid).
+    pub fn clear_cached_token() {
+        let path = token_cache_path();
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+            warn!("Cleared invalid token cache at {}", path.display());
+        }
+    }
+
     pub async fn run_login(
         api_key: &str,
         api_secret: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(cached) = load_cached_token() {
-            info!("Reusing access token cached from earlier today (.kite_token)");
+            info!("Reusing access token cached from earlier today ({})", TOKEN_CACHE_PATH);
             return Ok(cached);
         }
 
@@ -91,7 +130,7 @@ impl KiteAuth {
         let access_token = exchange_token(api_key, api_secret, &request_token).await?;
 
         save_cached_token(&access_token);
-        info!("  Access token obtained and cached for today (.kite_token).");
+        info!("  Access token obtained and cached for today ({}).", TOKEN_CACHE_PATH);
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
         Ok(access_token)
@@ -207,8 +246,25 @@ fn today_ist() -> String {
         .to_string()
 }
 
+fn token_cache_path() -> PathBuf {
+    for candidate in [TOKEN_CACHE_PATH, "../config/.kite_token", ".kite_token"] {
+        let path = Path::new(candidate);
+        if path.exists() {
+            return path.to_path_buf();
+        }
+    }
+
+    if Path::new("config").is_dir() {
+        PathBuf::from(TOKEN_CACHE_PATH)
+    } else if Path::new("../config").is_dir() {
+        PathBuf::from("../config/.kite_token")
+    } else {
+        PathBuf::from(TOKEN_CACHE_PATH)
+    }
+}
+
 fn load_cached_token() -> Option<String> {
-    let content = std::fs::read_to_string(".kite_token").ok()?;
+    let content = std::fs::read_to_string(token_cache_path()).ok()?;
     let mut lines = content.lines();
     let date = lines.next()?;
     let token = lines.next()?;
@@ -221,8 +277,16 @@ fn load_cached_token() -> Option<String> {
 
 fn save_cached_token(token: &str) {
     let content = format!("{}\n{}\n", today_ist(), token);
-    if let Err(e) = std::fs::write(".kite_token", &content) {
-        warn!("Could not write .kite_token cache: {}", e);
+    let path = token_cache_path();
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!("Could not create token cache directory {}: {}", parent.display(), e);
+            return;
+        }
+    }
+
+    if let Err(e) = std::fs::write(&path, &content) {
+        warn!("Could not write token cache {}: {}", path.display(), e);
     }
 }
 

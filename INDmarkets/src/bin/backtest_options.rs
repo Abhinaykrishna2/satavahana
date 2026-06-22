@@ -1,4 +1,4 @@
-use satavahana::config::Config;
+use satavahana::config::{default_config_path, Config};
 use tracing_subscriber;
 use satavahana::models::{OHLC, OptionContract, OptionType, Tick, TickMode};
 use satavahana::options_engine::OptionsEngine;
@@ -46,6 +46,7 @@ struct CliArgs {
     capital_mode: CapitalMode,
     fill_offset_inr: f64,
     max_daily_trades: Option<u32>,
+    capital: Option<f64>,
 }
 
 fn print_usage(bin: &str) {
@@ -85,6 +86,7 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
     let mut capital_mode = CapitalMode::Continuous;
     let mut fill_offset_inr = 0.5_f64;
     let mut max_daily_trades: Option<u32> = None;
+    let mut capital: Option<f64> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -113,6 +115,18 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
                     .ok_or_else(|| "Missing value for --max-daily-trades".to_string())?;
                 max_daily_trades = Some(value.parse::<u32>()
                     .map_err(|e| format!("Invalid --max-daily-trades value '{}': {}", value, e))?);
+            }
+            "--capital" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "Missing value for --capital".to_string())?;
+                capital = Some(value.parse::<f64>()
+                    .map_err(|e| format!("Invalid --capital value '{}': {}", value, e))?);
+            }
+            _ if arg.starts_with("--capital=") => {
+                let value = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
+                capital = Some(value.parse::<f64>()
+                    .map_err(|e| format!("Invalid --capital value '{}': {}", value, e))?);
             }
             _ if arg.starts_with("--capital-mode=") => {
                 let value = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
@@ -149,6 +163,7 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
         capital_mode,
         max_daily_trades,
         fill_offset_inr,
+        capital,
     })
 }
 
@@ -195,6 +210,15 @@ fn parse_option_type(s: &str) -> Option<OptionType> {
     }
 }
 
+fn gcd_u32(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let r = a % b;
+        a = b;
+        b = r;
+    }
+    a
+}
+
 /// Canonical lot sizes from SEBI circulars (March 2026). Used as a safe fallback
 /// when a token never shows any non-zero last_qty in the captured data.
 fn default_lot_size(underlying: &str) -> u32 {
@@ -207,19 +231,40 @@ fn default_lot_size(underlying: &str) -> u32 {
     }
 }
 
+fn normalize_inferred_lot_size(underlying: &str, inferred: u32) -> u32 {
+    let canonical_lot_size = default_lot_size(underlying);
+    if inferred > canonical_lot_size && inferred % canonical_lot_size == 0 {
+        canonical_lot_size
+    } else {
+        inferred
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lot_size_inference_uses_gcd_and_canonical_multiple_guard() {
+        assert_eq!(gcd_u32(130, 195), 65);
+        assert_eq!(normalize_inferred_lot_size("NIFTY", 130), 65);
+        assert_eq!(normalize_inferred_lot_size("FINNIFTY", 60), 60);
+        assert_eq!(normalize_inferred_lot_size("UNKNOWN", 75), 25);
+    }
+}
+
 /// Scan the CSV once and return a map of token → inferred lot size.
 ///
-/// Method: minimum non-zero `last_qty` observed across all ticks for each token.
-/// `last_qty` is the quantity of the most-recently executed trade in that tick.
-/// The smallest possible trade is 1 lot, so the minimum non-zero value converges
-/// to the lot size once a 1-lot trade is seen (which is typical for liquid NSE options).
+/// Method: GCD of non-zero `last_qty` observed across all ticks for each token.
+/// `last_qty` is the quantity of the most-recently executed trade in that tick,
+/// so a token that only prints 2-lot and 3-lot trades still converges to 1 lot.
 /// This mirrors what the live system gets from the Kite instruments API — no hardcoding.
 fn infer_lot_sizes_from_csv(
     options_csv: &Path,
     i_token: usize,
     i_last_qty: usize,
 ) -> Result<HashMap<u32, u32>, Box<dyn Error>> {
-    let mut min_last_qty: HashMap<u32, u32> = HashMap::new();
+    let mut qty_gcd: HashMap<u32, u32> = HashMap::new();
     let mut rdr = csv::Reader::from_path(options_csv)?;
     for rec in rdr.records() {
         let rec = rec?;
@@ -229,13 +274,13 @@ fn infer_lot_sizes_from_csv(
         }
         let lq = parse_u32(&rec, i_last_qty);
         if lq > 0 {
-            let e = min_last_qty.entry(token).or_insert(lq);
-            if lq < *e {
-                *e = lq;
-            }
+            qty_gcd
+                .entry(token)
+                .and_modify(|g| *g = gcd_u32(*g, lq))
+                .or_insert(lq);
         }
     }
-    Ok(min_last_qty)
+    Ok(qty_gcd)
 }
 
 fn find_single_file_with_suffix(dir: &Path, suffix: &str) -> Result<PathBuf, Box<dyn Error>> {
@@ -345,7 +390,7 @@ fn build_contracts(options_csv: &Path) -> Result<Vec<OptionContract>, Box<dyn Er
     let i_opt_type   = col_idx(&headers, "option_type")?;
     let i_last_qty   = col_idx(&headers, "last_qty")?;
 
-    // Pass 1: infer lot sizes dynamically from the data (min non-zero last_qty per token).
+    // Pass 1: infer lot sizes dynamically from the data (GCD of non-zero last_qty per token).
     // This replicates what the live system gets from the Kite instruments API without hardcoding.
     let lot_size_map = infer_lot_sizes_from_csv(options_csv, i_token, i_last_qty)?;
 
@@ -384,7 +429,10 @@ fn build_contracts(options_csv: &Path) -> Result<Vec<OptionContract>, Box<dyn Er
         }
         // Use dynamically inferred lot size; fall back to SEBI canonical size if
         // the token never showed any non-zero last_qty in the captured data.
-        let lot_size = lot_size_map.get(&token).copied()
+        let lot_size = lot_size_map
+            .get(&token)
+            .copied()
+            .map(|inferred| normalize_inferred_lot_size(&underlying, inferred))
             .unwrap_or_else(|| default_lot_size(&underlying));
 
         contracts.entry(token).or_insert_with(|| OptionContract {
@@ -419,7 +467,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(format!("Options CSV not found: {}", options_file.display()).into());
     }
 
-    let config = Config::load("config.toml")?;
+    let config = Config::load(default_config_path())?;
     let all_contracts = build_contracts(&options_file)?;
     if all_contracts.is_empty() {
         return Err("No option contracts found in CSV".into());
@@ -461,6 +509,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("max_daily_trades override: {} (config was {})", mdt, engine_cfg.max_daily_trades);
         engine_cfg.max_daily_trades = mdt;
     }
+    if let Some(cap) = cli.capital {
+        eprintln!("capital override: ₹{:.2} (config was ₹{:.2})", cap, engine_cfg.initial_capital);
+        engine_cfg.initial_capital = cap;
+    }
     match cli.capital_mode {
         CapitalMode::Continuous => {
             eprintln!(
@@ -476,7 +528,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    let run_id = chrono::Local::now().format("%Y%m%d_%H%M%S").to_string();
+    // IST-stamped run id (machine timezone-independent).
+    let ist = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+    let now_ist = chrono::Utc::now().with_timezone(&ist);
+    let run_id = format!(
+        "{}_{:03}_{}",
+        now_ist.format("%Y%m%d_%H%M%S"),
+        now_ist.timestamp_subsec_millis(),
+        std::process::id()
+    );
     let run_dir = PathBuf::from(format!("backtest/options_backtest_{}", run_id));
     fs::create_dir_all(&run_dir)?;
 
