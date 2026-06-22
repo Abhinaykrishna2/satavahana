@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use statrs::distribution::{Continuous, ContinuousCDF, Normal};
 use tokio::sync::broadcast;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 pub struct GreeksEngine {
     pub contracts: Vec<OptionContract>,
@@ -118,7 +118,9 @@ impl GreeksEngine {
                 contract.option_type,
             ) {
                 Some(greeks) => {
-                    info!(
+                    // debug! (not info!): this fired ~484k times/session = 95% of the log.
+                    // The same data is persisted to data/*_ticks.csv via record_ticks.
+                    debug!(
                         "📈 GREEKS | {} {} {:.0} {} | LTP: ₹{:.2} | Spot: ₹{:.2} | {} | OI: {} | Vol: {}",
                         contract.underlying,
                         contract.expiry,

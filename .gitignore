@@ -1,17 +1,18 @@
 # Rust
 /target/
+src/target/
 Cargo.lock
 **/*.rs.bk
 *.pdb
 
 # Config files with secrets
-config.toml
+config/config.toml
 CLAUDE.md
 BACKTESTING.md
 PERFORMANCE.md
 
 # Kite session token cache (contains access token — never commit)
-.kite_token
+config/.kite_token
 
 # IDE
 .idea/

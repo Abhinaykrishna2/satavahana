@@ -4,6 +4,25 @@ version = "0.1.0"
 edition = "2021"
 description = "High-performance real-time market data pipeline for Zerodha Kite Connect"
 
+[lib]
+path = "lib.rs"
+
+[[bin]]
+name = "satavahana"
+path = "main.rs"
+
+[[bin]]
+name = "backtest_equity"
+path = "bin/backtest_equity.rs"
+
+[[bin]]
+name = "backtest_options"
+path = "bin/backtest_options.rs"
+
+[[bin]]
+name = "backtest_quant"
+path = "bin/backtest_quant.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

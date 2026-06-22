@@ -1,0 +1,99 @@
+# SATAVAHANA — COMMAND REFERENCE
+# ================================
+# ONE unified engine now runs ALL 12 strategies (6 options + 2 microstructure +
+# 4 quant) in a single process on one tick stream.
+#   no flag  = PAPER  (signals logged, fills simulated, NO real orders)
+#   --live   = REAL orders for every engine + daily circuits (-15% / +35%)
+# Raw tick recording is OFF by default (set [output].record_ticks=true to collect).
+
+# BUILD
+cargo build --release --manifest-path src/Cargo.toml
+
+
+# START — PAPER (default; validate here first)
+nohup caffeinate -i ./src/target/release/satavahana >/dev/null 2>>logs/engine.log &
+echo $! > logs/engine.pid
+echo "Started PID $(cat logs/engine.pid)"
+
+# START — LIVE (REAL money; only after paper validation)
+nohup caffeinate -i ./src/target/release/satavahana --live >/dev/null 2>>logs/engine.log &
+echo $! > logs/engine.pid
+
+# DATA-COLLECTION ONLY (raw ticks): set record_ticks=true in config/config.toml [output]
+
+# STOP ENGINE
+kill $(cat logs/engine.pid)
+
+
+# INSPECT LIVE LOG — general tail
+tail -f logs/collector.log
+
+# INSPECT LIVE LOG — suppress Greeks noise, show only scans/signals/warns
+tail -f logs/collector.log | grep -v GREEKS
+
+# CHECK LATEST SCAN LINE (spot, iv_rank, pcr, best_score)
+tail -200 logs/collector.log | grep "^.*Scan #"
+
+# CHECK IF ENGINE IS ALIVE
+kill -0 $(cat logs/collector.pid) && echo "alive" || echo "dead"
+
+# CHECK OPEN POSITIONS / PORTFOLIO SUMMARY
+tail -200 logs/collector.log | grep -A 12 "PORTFOLIO SUMMARY"
+
+# CHECK SIGNALS AND TRADES FOR TODAY
+cat logs/$(date +%Y-%m-%d)_options_signals.csv
+cat logs/$(date +%Y-%m-%d)_options_trades.csv
+
+
+# END OF DAY — TRIM + COMPRESS DATA
+# (replace YYYY-MM-DD with today's date)
+awk -F',' 'NR==1 || $1 <= "YYYY-MM-DDT15:31:00"' data/YYYY-MM-DD_options_ticks.csv > /tmp/trimmed.csv \
+  && mv /tmp/trimmed.csv data/YYYY-MM-DD_options_ticks.csv
+gzip data/YYYY-MM-DD_options_ticks.csv
+
+# APPEND COLLECTOR LOG TO ARCHIVE AND REMOVE PLAIN LOG
+gzip -c logs/collector.log >> logs/collector.log.gz && rm logs/collector.log
+
+
+# BACKTEST A SINGLE DAY
+./src/target/release/backtest_options --max-daily-trades 1 =(gunzip -c data/YYYY-MM-DD_options_ticks.csv.gz)
+
+# BACKTEST ALL DAYS
+for f in data/*.csv.gz; do
+  date=$(basename $f | cut -d_ -f1)
+  out=$(./src/target/release/backtest_options --max-daily-trades 1 =(gunzip -c $f) 2>&1)
+  wl=$(echo "$out" | grep "Wins/Losses" | awk '{print $3}')
+  pnl=$(echo "$out" | grep "Net P&L" | awk '{print $4}')
+  printf "%-12s  W/L=%-4s  %s\n" "$date" "$wl" "$pnl"
+done 2>&1 | grep -v "^Spot"
+
+# READ COMPRESSED LOGS
+zcat logs/collector.log.gz | grep "pattern" | tail -50
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# LIVE MICROSTRUCTURE ENGINE (Strategy 1 equity imbalance + Strategy 2 gamma)
+# ──────────────────────────────────────────────────────────────────────────
+
+# PAPER dry run (default; simulated fills, no capital at risk). Validate here first.
+./src/target/release/satavahana --micro 2>>logs/micro.log
+
+# PAPER, backgrounded + caffeinated
+nohup caffeinate -i ./src/target/release/satavahana --micro >/dev/null 2>>logs/micro.log &
+echo $! > logs/micro.pid
+
+# LIVE (routes REAL orders to Zerodha — only after paper validation)
+nohup caffeinate -i ./src/target/release/satavahana --live >/dev/null 2>>logs/micro.log &
+echo $! > logs/micro.pid
+
+# Stop
+kill $(cat logs/micro.pid)
+
+# Watch the engine (signals / fills / risk)
+tail -f logs/micro.log | grep -E "OMS|SIGNAL|OPEN|CLOSE|FLATTEN|KILL|Capital"
+
+# Today's microstructure trades (written at shutdown)
+cat logs/$(date +%Y-%m-%d)_microstructure_trades.csv
+
+# NOTE: the default run (no flag) is unchanged — it runs the existing
+# options/quant collector with all previous strategies.

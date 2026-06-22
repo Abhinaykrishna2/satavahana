@@ -87,6 +87,10 @@ pub enum OrderCommand {
     Place(PlaceOrderCmd),
     CancelByTag { tag: String },
     StatusByTag { tag: String },
+    /// Limit-chase re-peg: move the resting LIMIT order (found by tag) to a new
+    /// price. One exchange action, cheaper than cancel+replace and friendlier to
+    /// the 10 orders/sec SEBI cap.
+    ModifyByTag { tag: String, new_price: f64 },
 }
 
 #[derive(Debug, Clone)]
@@ -238,6 +242,9 @@ impl OrderExecutor {
                 OrderCommand::StatusByTag { tag } => {
                     self.log_status_by_tag(&tag).await;
                 }
+                OrderCommand::ModifyByTag { tag, new_price } => {
+                    self.modify_by_tag(&tag, new_price).await;
+                }
             }
         }
 
@@ -336,6 +343,77 @@ impl OrderExecutor {
                 });
             }
         }
+    }
+
+    async fn modify_by_tag(&mut self, tag: &str, new_price: f64) {
+        let Some(known) = self.resolve_order_by_tag(tag, true).await else {
+            warn!("LIVE ORDER modify skipped: no order found for tag={}", tag);
+            return;
+        };
+        match self.modify_order(&known.variety, &known.order_id, new_price).await {
+            Ok(()) => {
+                info!(
+                    "LIVE ORDER modify (chase) | tag={} order_id={} -> ₹{:.2}",
+                    tag, known.order_id, new_price
+                );
+                self.publish(OrderUpdate {
+                    tag: tag.to_string(),
+                    order_id: Some(known.order_id.clone()),
+                    status: None,
+                    average_price: None,
+                    filled_quantity: None,
+                    pending_quantity: None,
+                    source: "modify_ack".to_string(),
+                    message: None,
+                });
+            }
+            Err(e) => {
+                warn!(
+                    "LIVE ORDER modify failed | tag={} order_id={} err={}",
+                    tag, known.order_id, e
+                );
+                self.publish(OrderUpdate {
+                    tag: tag.to_string(),
+                    order_id: Some(known.order_id.clone()),
+                    status: None,
+                    average_price: None,
+                    filled_quantity: None,
+                    pending_quantity: None,
+                    source: "modify_error".to_string(),
+                    message: Some(e),
+                });
+            }
+        }
+    }
+
+    async fn modify_order(&self, variety: &str, order_id: &str, new_price: f64) -> Result<(), String> {
+        let url = format!("{}/{}/{}", KITE_ORDERS_URL, variety, order_id);
+        // Round to the NSE ₹0.05 tick.
+        let ticked = (new_price / 0.05).round() * 0.05;
+        let params = vec![
+            ("order_type", "LIMIT".to_string()),
+            ("price", format!("{:.2}", ticked)),
+        ];
+        let resp = self
+            .client
+            .put(&url)
+            .header("X-Kite-Version", "3")
+            .header("Authorization", &self.auth_header)
+            .form(&params)
+            .send()
+            .await
+            .map_err(|e| format!("network error while modifying order: {}", e))?;
+
+        let http = resp.status();
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("invalid JSON from modify-order response: {}", e))?;
+
+        if !http.is_success() {
+            return Err(format!("HTTP {} from modify-order: {}", http, kite_message(&body)));
+        }
+        Ok(())
     }
 
     async fn cancel_order(&self, variety: &str, order_id: &str) -> Result<(), String> {

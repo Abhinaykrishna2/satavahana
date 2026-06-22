@@ -1,5 +1,5 @@
 # Satavahana — Zerodha Market Data Pipeline Configuration
-# Copy this file to config.toml and fill in your credentials.
+# Copy this file to config/config.toml and fill in your credentials.
 
 [kite]
 # From your Kite Connect app at https://developers.kite.trade
@@ -8,7 +8,7 @@ api_secret = "your_api_secret_here"
 
 # Leave access_token EMPTY (or remove the line) to trigger the automated
 # OAuth login flow on startup — browser opens, you log in, token is captured
-# automatically and cached in .kite_token for the rest of the trading day.
+# automatically and cached in config/.kite_token for the rest of the trading day.
 #
 # Only fill this manually if you want to bypass the login flow.
 access_token = ""
@@ -54,10 +54,16 @@ dividend_yield = 0.0
 min_spread_alert = 0.50
 # Log frequency for options greeks (every N ticks)
 greeks_log_interval = 1
+# Record EVERY raw tick to data/*_ticks.csv. OFF by default — this is the
+# firehose (~25 GB in 2 days). When enabled, the recorder also writes
+# data/YYYY-MM-DD_option_selling_ticks.csv for passive short-premium research
+# on the locked option strikes. Only signal/trade ledgers are written otherwise.
+# Set true ONLY for offline data collection, never for lean live trading.
+record_ticks = false
 
 # ─── NSE Options Signal Engine ───────────────────────────────────────────────
 # Capital path: ₹5,000 → ₹50,000 via 6 quant strategies
-# All fields have safe defaults — this block is OPTIONAL in config.toml
+# All fields have safe defaults — this block is OPTIONAL in config/config.toml
 [options_engine]
 # Your starting trading capital in INR
 initial_capital = 10000.0
@@ -114,3 +120,60 @@ entry_order_timeout_secs = 240
 # A large drop means the market reversed direction — no point filling a stale signal.
 # Default 0.15 = cancel if LTP < limit_price × 0.85 (15% adverse move).
 limit_cancel_reversal_pct = 0.15
+
+# ──────────────────────────────────────────────────────────────────────────
+# LIVE MICROSTRUCTURE ENGINE (NEW — Strategy 1 + Strategy 2)
+# ──────────────────────────────────────────────────────────────────────────
+# Runs ONLY when started with --live / --micro, or when enabled = true here.
+# Without these flags the engine runs the existing options/quant collector path
+# unchanged — all previous strategies remain intact.
+
+[microstructure]
+# Master switch. Also turned on by the --live / --micro CLI flags.
+enabled = false
+
+# Strategy 1 — Micro-Price Transient Imbalance (equity MIS).
+# Disabled for current options-only operation.
+equity_imbalance_enabled = false
+# NSE cash symbols to watch if equity trading is deliberately re-enabled later.
+equity_watchlist = []
+# Raw top-5 OBI (in [-1,1]) at/below which a sell wall is "extreme". -0.4 = asks
+# ~2.3x bids. (Field name kept as obi_z_threshold for back-compat.)
+obi_z_threshold = -0.4
+# Rolling window (snapshots) used to standardize OBI / baseline OFI.
+obi_lookback = 60
+# Require OFI to turn positive (buyers absorbing) before entering long.
+ofi_confirm = true
+
+# Strategy 2 — Tuesday Nifty ATM gamma squeeze (options).
+gamma_squeeze_enabled = true
+# ATM ask-queue depletion must exceed this multiple of its rolling average.
+gamma_depletion_multiple = 5.0
+gamma_ma_window = 30
+nifty_symbol = "NIFTY"
+
+# Sizing / pacing.
+mis_leverage = 5.0
+max_concurrent_positions = 1
+signal_cooldown_secs = 30
+
+[risk]
+# Hard per-trade stop as % of the (hourly-polled) capital.
+per_trade_stop_pct = 1.0
+# LOWER circuit: halt ALL new trades once the day's realized P&L (NET of broker
+# fees + transaction costs) draws down this % of day-start capital.
+daily_loss_circuit_pct = 15.0
+# UPPER circuit: halt ALL new trades once the day's realized P&L gains this % of
+# day-start capital — prevents overtrading a good day.
+daily_profit_circuit_pct = 25.0
+# (Legacy key `daily_kill_pct` is still accepted as an alias for the lower circuit.)
+# IST time to cancel pending orders and square off (before Zerodha auto-square).
+flatten_time = "15:15"
+# Hourly capital sync schedule (IST). First poll at start, then :minute hourly.
+capital_sync_start = "09:14"
+capital_poll_minute = 14
+
+# Extra [execution] keys used by the limit-chase OMS (all optional, shown with
+# defaults): equity_exchange = "NSE", equity_product = "MIS",
+# max_repegs = 5, repeg_tick_threshold = 1, chase_timeout_ms = 3000,
+# min_repeg_interval_ms = 250  (250ms => <=4 modifies/sec, under the 10/sec cap)
