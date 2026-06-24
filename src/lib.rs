@@ -8,6 +8,7 @@ pub mod greeks;
 pub mod ledger;
 pub mod microbook;
 pub mod models;
+pub mod multileg;
 pub mod oms;
 pub mod portfolio;
 pub mod options_engine;

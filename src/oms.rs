@@ -865,7 +865,7 @@ impl PositionManager {
         // single global position slot — this trade is done. Single close chokepoint
         // for paper AND live (live exit fills route here too).
         if let Some(c) = &self.shared_circuit {
-            crate::portfolio::record(c, net);
+            crate::portfolio::record_for(c, "micro", net);
             crate::portfolio::release(c, "micro");
         }
         info!(
@@ -925,7 +925,7 @@ impl PositionManager {
         // slot (one trade at a time across the account — cancel this signal). The
         // authoritative grab is the atomic try_claim in try_open.
         if let Some(c) = &self.shared_circuit {
-            if !crate::portfolio::can_enter(c) || crate::portfolio::is_locked(c) {
+            if !crate::portfolio::can_enter_holder(c, "micro") || crate::portfolio::is_locked(c) {
                 return;
             }
         }
@@ -1436,8 +1436,8 @@ mod tests {
         // The close recorded into the shared circuit → daily cap (1) reached; lock FREE.
         assert!(!crate::portfolio::is_locked(&circuit), "lock is free after the trade closed");
         assert_eq!(
-            crate::portfolio::halt_reason(&circuit),
-            Some("daily trade cap reached — max trades for today taken"),
+            crate::portfolio::halt_reason_for(&circuit, "micro"),
+            Some("daily trade cap reached for this strategy"),
             "halt reason must be the daily cap, not a P&L circuit"
         );
 

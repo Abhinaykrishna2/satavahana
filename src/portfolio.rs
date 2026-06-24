@@ -3,7 +3,7 @@
 //! Each engine (options, microstructure, quant) keeps its own per-trade sizing and
 //! its own local circuit, but they ALL consult one [`PortfolioCircuit`] before
 //! opening a position and report realized (net-of-cost) P&L to it on close. This
-//! makes the daily limit an **account-level** guarantee: "−15% / +25% of day-start
+//! makes the P&L circuit an **account-level** guarantee: "−15% / +25% of day-start
 //! capital, then no more trades anywhere" — not a per-engine limit that the
 //! combined book could breach N times over.
 //!
@@ -22,6 +22,7 @@
 //! hands each engine the full capital.)
 
 use crate::risk::CircuitState;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -70,10 +71,10 @@ pub struct PortfolioCircuit {
     position_holder: Option<&'static str>,
     /// When the slot was claimed — used by the stale-claim watchdog ([`reap_stale`]).
     claimed_at: Option<Instant>,
-    /// Completed trades today (incremented on every close via [`record`]). Drives the
-    /// account-wide daily trade cap.
-    trades_today: u32,
-    /// Hard cap on trades per day across ALL engines (`max 1/day` = no overtrading).
+    /// Completed trades today by engine holder (`options`, `multileg`, `micro`, ...).
+    trades_by_holder: HashMap<&'static str, u32>,
+    /// Hard cap on trades per day per holder (`max 1/day` = one single-leg and one
+    /// multi-leg can both trade, provided the global open-position lock is free).
     /// `u32::MAX` = uncapped. Resets only on process restart (which happens daily via
     /// the stale-token re-login — confirm the engine restarts each trading day).
     max_trades_per_day: u32,
@@ -88,27 +89,39 @@ impl PortfolioCircuit {
             profit_pct: profit_pct.max(0.0),
             position_holder: None,
             claimed_at: None,
-            trades_today: 0,
+            trades_by_holder: HashMap::new(),
             max_trades_per_day: max_trades_per_day.max(1),
         }
     }
 
-    /// Add a closed trade's NET (post-cost) P&L from any engine, and count the trade
-    /// toward the daily cap. Called once per CLOSE — so a rejected/never-filled order
-    /// (e.g. an IP-403'd entry) does NOT burn the day's trade, and a late-fill
-    /// `promote` re-grab still sees `trades_today == 0` and can reacquire the lock.
+    /// Add a closed trade's NET (post-cost) P&L from any engine.
     pub fn record(&mut self, net_pnl: f64) {
+        self.record_for("account", net_pnl);
+    }
+
+    /// Add a closed trade's NET (post-cost) P&L from a specific holder, and count the
+    /// trade toward that holder's daily cap. Called once per CLOSE — so a rejected/never-filled order
+    /// (e.g. an IP-403'd entry) does NOT burn the day's trade, and a late-fill
+    /// `promote` re-grab still sees this holder's count unchanged and can reacquire the lock.
+    pub fn record_for(&mut self, holder: &'static str, net_pnl: f64) {
         if net_pnl.is_finite() {
             self.realized_pnl += net_pnl;
-            self.trades_today = self.trades_today.saturating_add(1);
+            let e = self.trades_by_holder.entry(holder).or_insert(0);
+            *e = e.saturating_add(1);
         }
     }
 
     pub fn trades_today(&self) -> u32 {
-        self.trades_today
+        self.trades_by_holder.values().copied().sum()
+    }
+    pub fn trades_today_for(&self, holder: &'static str) -> u32 {
+        self.trades_by_holder.get(holder).copied().unwrap_or(0)
     }
     pub fn daily_cap_reached(&self) -> bool {
-        self.trades_today >= self.max_trades_per_day
+        self.trades_today() >= self.max_trades_per_day
+    }
+    pub fn daily_cap_reached_for(&self, holder: &'static str) -> bool {
+        self.trades_today_for(holder) >= self.max_trades_per_day
     }
 
     pub fn realized_pnl(&self) -> f64 {
@@ -135,21 +148,29 @@ impl PortfolioCircuit {
     }
 
     pub fn can_enter(&self) -> bool {
-        self.state() == CircuitState::Open && !self.daily_cap_reached()
+        self.state() == CircuitState::Open
+    }
+
+    pub fn can_enter_holder(&self, holder: &'static str) -> bool {
+        self.can_enter() && !self.daily_cap_reached_for(holder)
     }
 
     /// A human-legible reason new entries are blocked account-wide, or `None` if open.
-    /// Keeps the daily-trade cap DISTINCT from a P&L circuit trip so logs (and the user
-    /// asking "why did it stop?") can tell "one trade done today" from "we lost 15%".
     pub fn halt_reason(&self) -> Option<&'static str> {
         match self.state() {
             CircuitState::LowerLoss => Some("LOWER circuit — daily loss limit hit"),
             CircuitState::UpperProfit => Some("UPPER circuit — daily profit limit hit"),
-            CircuitState::Open if self.daily_cap_reached() => {
-                Some("daily trade cap reached — max trades for today taken")
-            }
             CircuitState::Open => None,
         }
+    }
+
+    /// A human-legible reason entries are blocked for a holder. Keeps the per-holder
+    /// daily cap distinct from the account-wide P&L circuit.
+    pub fn halt_reason_for(&self, holder: &'static str) -> Option<&'static str> {
+        self.halt_reason().or_else(|| {
+            self.daily_cap_reached_for(holder)
+                .then_some("daily trade cap reached for this strategy")
+        })
     }
 
     // ─── Global single-position lock ────────────────────────────────────────
@@ -167,7 +188,7 @@ impl PortfolioCircuit {
         if self.position_holder.is_some() {
             return false; // someone already holds the one open-position slot
         }
-        if !self.can_enter() {
+        if !self.can_enter_holder(holder) {
             return false; // circuit tripped — no new entries anywhere
         }
         self.position_holder = Some(holder);
@@ -225,21 +246,38 @@ pub fn new_shared(
     )))
 }
 
-/// Legible reason new entries are halted account-wide (daily cap vs P&L circuit), or None.
+/// Legible reason new entries are halted account-wide (P&L circuit), or None.
 pub fn halt_reason(c: &SharedCircuit) -> Option<&'static str> {
     c.lock().ok().and_then(|g| g.halt_reason())
 }
 
-/// Whether a new entry is allowed account-wide. **Fail-closed**: if the lock is
+/// Legible reason new entries are halted for one holder (P&L circuit or holder cap), or None.
+pub fn halt_reason_for(c: &SharedCircuit, holder: &'static str) -> Option<&'static str> {
+    c.lock().ok().and_then(|g| g.halt_reason_for(holder))
+}
+
+/// Whether a new entry is allowed account-wide by P&L circuit. **Fail-closed**: if the lock is
 /// poisoned (a panicked engine), deny new entries rather than risk trading blind.
 pub fn can_enter(c: &SharedCircuit) -> bool {
     c.lock().map(|g| g.can_enter()).unwrap_or(false)
+}
+
+/// Whether a new entry is allowed for one holder by P&L circuit and holder trade cap.
+pub fn can_enter_holder(c: &SharedCircuit, holder: &'static str) -> bool {
+    c.lock().map(|g| g.can_enter_holder(holder)).unwrap_or(false)
 }
 
 /// Record a closed trade's net P&L into the shared circuit.
 pub fn record(c: &SharedCircuit, net_pnl: f64) {
     if let Ok(mut g) = c.lock() {
         g.record(net_pnl);
+    }
+}
+
+/// Record a closed trade's net P&L for a holder into the shared circuit.
+pub fn record_for(c: &SharedCircuit, holder: &'static str, net_pnl: f64) {
+    if let Ok(mut g) = c.lock() {
+        g.record_for(holder, net_pnl);
     }
 }
 
@@ -300,10 +338,22 @@ mod tests {
         // Two engines each losing 10% would NOT trip a per-engine 15% limit, but
         // together they breach the shared account circuit.
         let c = new_shared(100_000.0, 15.0, 25.0, u32::MAX);
-        record(&c, -10_000.0); // engine A
+        record_for(&c, "options", -10_000.0); // engine A
         assert!(can_enter(&c));
-        record(&c, -6_000.0); // engine B -> combined -16% trips
+        record_for(&c, "multileg", -6_000.0); // engine B -> combined -16% trips
         assert!(!can_enter(&c), "account circuit must trip on COMBINED loss");
+    }
+
+    #[test]
+    fn daily_cap_is_per_holder_not_account_wide() {
+        let c = new_shared(100_000.0, 15.0, 25.0, 1);
+        record_for(&c, "multileg", 1_000.0);
+        assert!(!can_enter_holder(&c, "multileg"), "multi-leg used its one slot");
+        assert!(can_enter_holder(&c, "options"), "single-leg still has its own slot");
+        assert_eq!(
+            halt_reason_for(&c, "multileg"),
+            Some("daily trade cap reached for this strategy")
+        );
     }
 
     #[test]
@@ -355,7 +405,7 @@ mod tests {
     #[test]
     fn claim_is_denied_while_circuit_is_tripped() {
         let c = new_shared(100_000.0, 15.0, 25.0, u32::MAX);
-        record(&c, -16_000.0); // -16% trips the lower circuit
+        record_for(&c, "options", -16_000.0); // -16% trips the lower circuit
         assert!(!try_claim(&c, "options"), "no new position may open once the circuit trips");
         assert!(!is_locked(&c));
     }

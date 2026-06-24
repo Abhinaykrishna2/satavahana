@@ -388,8 +388,9 @@ pub struct RiskConfig {
     /// Minute past each hour to poll live margins for capital sync. Default: 14.
     #[serde(default = "default_capital_poll_minute")]
     pub capital_poll_minute: u32,
-    /// Hard account-wide cap on trades per day across ALL engines — no overtrading.
-    /// 1 = take at most one trade a day, then stop. Default: 1.
+    /// Hard cap on trades per day per strategy holder. The shared portfolio still
+    /// allows only one open position at a time, but a closed multi-leg trade does not
+    /// consume the single-leg quota. 1 = one trade/day per strategy. Default: 1.
     #[serde(default = "default_max_trades_per_day")]
     pub max_trades_per_day: u32,
 }
