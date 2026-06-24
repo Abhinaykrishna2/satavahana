@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 
 const KITE_ORDERS_URL: &str = "https://api.kite.trade/orders";
 const KITE_MARGINS_URL: &str = "https://api.kite.trade/user/margins";
+const KITE_BASKET_MARGIN_URL: &str = "https://api.kite.trade/margins/basket?consider_positions=true";
 
 pub async fn fetch_live_available_funds(
     api_key: &str,
@@ -55,6 +56,78 @@ pub async fn fetch_live_available_funds(
     }
 
     Err(format!("margins response missing usable equity funds fields: {}", body))
+}
+
+#[derive(Debug, Clone)]
+pub struct BasketMarginOrder {
+    pub exchange: String,
+    pub tradingsymbol: String,
+    pub transaction_type: String,
+    pub variety: String,
+    pub product: String,
+    pub order_type: String,
+    pub quantity: u32,
+    pub price: f64,
+}
+
+pub async fn fetch_basket_final_margin(
+    api_key: &str,
+    access_token: &str,
+    orders: &[BasketMarginOrder],
+) -> Result<f64, String> {
+    if orders.is_empty() {
+        return Err("empty basket margin request".to_string());
+    }
+    let auth_header = format!("token {}:{}", api_key, access_token);
+    let client = Client::builder()
+        .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        .build()
+        .expect("failed to build HTTP client");
+    let body: Vec<Value> = orders
+        .iter()
+        .map(|o| {
+            serde_json::json!({
+                "exchange": &o.exchange,
+                "tradingsymbol": &o.tradingsymbol,
+                "transaction_type": &o.transaction_type,
+                "variety": &o.variety,
+                "product": &o.product,
+                "order_type": &o.order_type,
+                "quantity": o.quantity,
+                "price": o.price,
+                "trigger_price": 0
+            })
+        })
+        .collect();
+
+    let resp = client
+        .post(KITE_BASKET_MARGIN_URL)
+        .header("X-Kite-Version", "3")
+        .header("Authorization", auth_header)
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("network error while fetching basket margin: {}", e))?;
+
+    let http = resp.status();
+    let body: Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("invalid JSON from basket-margin response: {}", e))?;
+
+    if !http.is_success() {
+        return Err(format!(
+            "HTTP {} from basket-margin endpoint: {}",
+            http,
+            kite_message(&body)
+        ));
+    }
+
+    body.pointer("/data/final/total")
+        .and_then(|v| v.as_f64())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .ok_or_else(|| format!("basket-margin response missing data.final.total: {}", body))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

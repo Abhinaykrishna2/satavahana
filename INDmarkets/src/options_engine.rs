@@ -1941,7 +1941,7 @@ impl OptionsEngine {
         let account_halt = self
             .shared_circuit
             .as_ref()
-            .map_or(false, |c| !crate::portfolio::can_enter(c));
+            .map_or(false, |c| !crate::portfolio::can_enter_holder(c, "options"));
         let circuit_broken = self.risk.circuit_breaker_triggered() || account_halt;
         if circuit_broken {
             let reason = if account_halt {
@@ -2205,7 +2205,7 @@ impl OptionsEngine {
         let account_halt = self
             .shared_circuit
             .as_ref()
-            .map_or(false, |c| !crate::portfolio::can_enter(c));
+            .map_or(false, |c| !crate::portfolio::can_enter_holder(c, "options"));
         if self.risk.circuit_breaker_triggered() || account_halt {
             let n = self.pending_signals.len();
             if n > 0 {
@@ -4720,7 +4720,7 @@ impl OptionsEngine {
         // global position slot — this trade is done, the next signal (any engine)
         // may now claim it. This is the one close chokepoint for paper AND live.
         if let Some(c) = &self.shared_circuit {
-            crate::portfolio::record(c, pnl);
+            crate::portfolio::record_for(c, "options", pnl);
             crate::portfolio::release(c, "options");
         }
         self.positions_closed += 1;
