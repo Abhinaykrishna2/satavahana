@@ -1422,6 +1422,12 @@ impl MultiLegEngine {
                     a.peak_gain = peak_gain;
                 }
             }
+            // NET (post-cost) P&L the exit would realize right now — same formula as the real close
+            // (realized_pnl), so the hard stop books a loss at 10% of capital, not 10%+costs+slippage.
+            // Backtest manage() mirrors this via pnl().
+            let qty = active.lots.saturating_mul(active.lot_size);
+            let cur_exit_prices = self.exit_prices(&active, &snapshot);
+            let net_now = realized_pnl(&active.legs, &cur_exit_prices, qty, now_ms);
             if mins >= EXIT_MIN {
                 reason = Some(ExitReason::Time);
             } else if active.credit > 0.0 && gain >= 0.5 * active.credit {
@@ -1429,11 +1435,9 @@ impl MultiLegEngine {
             } else if trail_exits(gain, peak_gain, active.credit) {
                 // Half-gain profit trail: a winner that peaked past +15% gives back at most half.
                 reason = Some(ExitReason::Trail);
-            } else if gain * active.lots.saturating_mul(active.lot_size) as f64
-                <= -STOP_FRAC_CAP * self.capital
-            {
-                // Hard rupee stop: cut once the realized loss hits 10% of account capital, regardless
-                // of lots — the active-stop alternative to limiting risk via position size.
+            } else if net_now <= -STOP_FRAC_CAP * self.capital {
+                // Hard rupee stop on realized net: cut once the post-cost loss hits 10% of capital,
+                // regardless of lots — the active-stop alternative to limiting risk via position size.
                 reason = Some(ExitReason::Stop);
             } else if active.max_loss_unit > 0.0 && gain <= -STOP_FRAC_ML * active.max_loss_unit {
                 reason = Some(ExitReason::Stop);

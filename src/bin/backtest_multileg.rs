@@ -32,7 +32,9 @@ fn selling_files_in_data() -> Vec<PathBuf> {
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .map(|n| n.ends_with("_option_selling_ticks.csv") && !n.contains("_trim"))
+                .map(|n| (n.ends_with("_option_selling_ticks.csv")
+                          || n.ends_with("_option_selling_ticks.csv.gz"))
+                         && !n.contains("_trim"))
                 .unwrap_or(false)
         })
         .collect();
