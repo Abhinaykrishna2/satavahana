@@ -37,6 +37,10 @@ usoptions/
 *.csv
 !**/test_fixtures/*.csv
 
+# Python
+__pycache__/
+*.pyc
+
 # Local environments
 venv/
 .venv/
