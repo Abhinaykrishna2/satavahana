@@ -4778,13 +4778,9 @@ impl OptionsEngine {
         // Hard close-all at 15:20 IST regardless of confidence.
         let hard_close_all = close_ist_mins >= 920;
 
-        // Progressive profit lock-in: 3 checkpoints based on % of target distance.
-        //   CP1 (40% of range): stop → entry - 3%   (trim risk, absorb noise)
-        //   CP2 (65% of range): stop → entry + 5%   (locked 5% profit)
-        //   CP3 (85% of range): stop → entry + 15%  (locked 15% profit)
-        // checkpoints_evaluated tracks which level we've reached (0–3).
-        // Thresholds are intentionally conservative — early checkpoints cause false exits
-        // on intraday volatility when the underlying is still trending in our direction.
+        // One-shot profit lock-in: once the option is +15% and has held at least 3 minutes,
+        // move the stop once to roughly entry+2%, then stop trailing. This avoids chopping a
+        // live trend while still preventing a winner from becoming a loser.
         let now_ms = self.current_time_ms();
         for i in 0..self.positions.len() {
             let (is_open, option_token, entry_price, entry_time_ms) = {
@@ -4799,26 +4795,34 @@ impl OptionsEngine {
             };
             if entry_price <= 0.0 { continue; }
 
-            // Continuous trailing stop — all DTE, min 3-min hold:
-            // Activates at +7.5% gain. Steps in 2.5% increments, always 2.5% behind.
-            // At +25%+: 5% buffer to let big winners breathe.
-            // e.g.: +7.5%→stop+5%, +10%→+7.5%, +25%→+20%, +27.5%→+22.5%
-            // Stop only ever moves up, never down.
+            // One-shot profit lock — "free-flow" design (replaces the continuous 2.5% trail
+            // that chopped winners out on intraday noise before the move developed):
+            //   • below +15% gain: NO stop change — the trade rides on its original loss-stop
+            //     and is never knocked out by a shallow wobble (the +7% chop that cost the
+            //     +116% runner on 2026-06-24).
+            //   • at +12% gain (min 3-min hold): make EXACTLY ONE update — stop → entry+2%.
+            //     Downside is now capped at +2%; upside stays uncapped up to the strategy
+            //     target (~+25%). No further stop moves after this one ("free flow").
+            //   • checkpoints_evaluated → 3 so the hold cap extends to 240 min (room to target).
             let hold_mins = (now_ms.saturating_sub(entry_time_ms)) as f64 / 60_000.0;
             let abs_gain_pct = (current_price - entry_price) / entry_price * 100.0;
-            if abs_gain_pct >= 7.5 && hold_mins >= 3.0 {
-                let step = 2.5_f64;
-                let lookback = if abs_gain_pct >= 25.0 { step * 2.0 } else { step };
-                let lock_pct = (abs_gain_pct / step).floor() * step - lookback;
-                let new_stop = entry_price * (1.0 + lock_pct / 100.0);
+            if abs_gain_pct >= 12.0 && hold_mins >= 3.0 {
                 let pos = &mut self.positions[i];
-                if new_stop > pos.stop_price {
-                    pos.stop_price = new_stop;
-                    let new_cp = ((lock_pct - 5.0) / step).max(0.0) as u32 + 1;
-                    pos.checkpoints_evaluated = new_cp;
+                if !pos.breakeven_stop_set {
+                    let raw_lock = entry_price * 1.02;
+                    let target_guard = if pos.target_price > entry_price {
+                        (pos.target_price * 0.995).max(entry_price)
+                    } else {
+                        raw_lock
+                    };
+                    let new_stop = raw_lock.min(target_guard);
+                    if new_stop > pos.stop_price {
+                        pos.stop_price = new_stop;
+                    }
                     pos.breakeven_stop_set = true;
-                    info!("  Trail +{:.1}% (lock +{:.1}%): pos #{} {} stop → ₹{:.2} (ltp ₹{:.2})",
-                        abs_gain_pct, lock_pct, pos.id, pos.underlying, pos.stop_price, current_price);
+                    pos.checkpoints_evaluated = 3;
+                    info!("  Profit-lock +{:.1}%: pos #{} {} stop → ₹{:.2} (entry+2%), free-flow to target (ltp ₹{:.2})",
+                        abs_gain_pct, pos.id, pos.underlying, pos.stop_price, current_price);
                 }
             }
         }
@@ -4838,13 +4842,13 @@ impl OptionsEngine {
                 _ => continue,
             };
 
-            // Checkpoint-scaled hold cap: only extend time if the trade has proven itself
-            // by reaching a profit-lock checkpoint. A flat/drifting position gets the
-            // standard cap; one that already hit CP1/CP2/CP3 earns extra runway.
+            // Checkpoint-scaled hold cap: extend runway once the trade proves itself. With the
+            // one-shot profit lock, cp is only ever 0 (pre-lock) or 3 (the +15% lock fired);
+            // the 1/2 rungs remain for back-compat but are no longer set on the live path.
             //   cp == 0 (no profit locked)  → 120 min (exit a flat trade promptly)
-            //   cp >= 1 (CP1: −3% locked)   → 150 min (move confirmed, give room)
-            //   cp >= 2 (CP2: +5% locked)   → 180 min (trend running, let it extend)
-            //   cp >= 3 (CP3: +15% locked)  → 240 min (strong trend, let it run to target)
+            //   cp >= 1 (legacy)            → 150 min
+            //   cp >= 2 (legacy)            → 180 min
+            //   cp >= 3 (+12% locked)       → 240 min (let it run to target)
             let cp_now = self.positions[i].checkpoints_evaluated;
             let holding_ms = self.current_time_ms().saturating_sub(entry_time_ms);
             let max_hold_mins: u64 = match cp_now {
@@ -5161,6 +5165,86 @@ mod tests {
             exit_pending,
             checkpoints_evaluated: 0,
         }
+    }
+
+    fn test_engine_with_store(store: TickStore) -> OptionsEngine {
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_options_engine_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+        OptionsEngine::new(
+            Vec::new(),
+            store,
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        )
+    }
+
+    #[test]
+    fn one_shot_profit_lock_arms_once_and_does_not_choke_runner() {
+        let store = TickStore::new();
+        let mut engine = test_engine_with_store(store.clone());
+        let mut pos = test_position(false);
+        pos.target_price = 140.0;
+        engine.positions.push(pos);
+
+        store.update(Tick {
+            token: 101,
+            ltp: 116.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
+        engine.set_clock_override_ms(2 * 60_000);
+        engine.check_open_positions();
+        assert!((engine.positions[0].stop_price - 85.0).abs() < 1e-9, "no lock before 3 minutes");
+        assert!(!engine.positions[0].breakeven_stop_set);
+
+        engine.set_clock_override_ms(4 * 60_000);
+        engine.check_open_positions();
+        assert!((engine.positions[0].stop_price - 102.0).abs() < 1e-9, "+15% arms entry+2% lock");
+        assert!(engine.positions[0].breakeven_stop_set);
+        assert_eq!(engine.positions[0].checkpoints_evaluated, 3);
+        assert!(engine.positions[0].is_open, "profit lock should not close a runner by itself");
+
+        store.update(Tick {
+            token: 101,
+            ltp: 126.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
+        engine.set_clock_override_ms(5 * 60_000);
+        engine.check_open_positions();
+        assert!((engine.positions[0].stop_price - 102.0).abs() < 1e-9, "one-shot lock must not keep trailing");
+        assert!(engine.positions[0].is_open);
+    }
+
+    #[test]
+    fn profit_lock_stays_below_tight_target() {
+        let store = TickStore::new();
+        let mut engine = test_engine_with_store(store.clone());
+        let mut pos = test_position(false);
+        pos.target_price = 101.0;
+        engine.positions.push(pos);
+
+        store.update(Tick {
+            token: 101,
+            ltp: 116.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
+        engine.set_clock_override_ms(4 * 60_000);
+        engine.check_open_positions();
+
+        assert!(
+            engine.positions[0].stop_price < engine.positions[0].target_price,
+            "profit lock should not be placed on/above an unusually tight target"
+        );
+        assert!(!engine.positions[0].is_open, "tight target should still close as target hit");
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod ledger;
 pub mod microbook;
 pub mod models;
 pub mod multileg;
+pub mod multileg_replay;
 pub mod oms;
 pub mod portfolio;
 pub mod options_engine;

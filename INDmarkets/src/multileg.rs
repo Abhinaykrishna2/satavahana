@@ -21,8 +21,8 @@ use crate::store::TickStore;
 use crate::websocket::TickEvent;
 use chrono::{Datelike, FixedOffset, NaiveDate, TimeZone, Timelike, Utc, Weekday};
 use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
-use tokio::sync::{broadcast, mpsc};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, warn};
 
 /// Wing width in points (NIFTY strikes are 50 apart; 100 = 2 strikes — the only width the
@@ -34,18 +34,40 @@ pub const ENTRY_SLIP: f64 = 0.50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SellStructure {
+    /// OTM strangle + 100pt wings (~0.25Δ shorts) — widest zone, low credit, high win-prob.
     Condor,
+    /// Shorts nearer ATM (~0.33Δ) + 100pt wings — narrower zone, more credit (aggressive condor).
+    Tight,
+    /// ATM straddle + 100pt wings — narrow zone, big credit, high gamma.
     Fly,
+    /// ATM straddle + 200pt wings — keeps more credit, larger max-loss (wider defined risk).
+    WideFly,
 }
 
 impl SellStructure {
-    /// (short |delta| target — None = ATM ; wing width in points).
+    /// (short |delta| target — None = ATM ; wing width in points). Mirrors satakarni `STRUCTURES`.
     fn params(self) -> (Option<f64>, f64) {
         match self {
             SellStructure::Condor => (Some(0.25), WING),
+            SellStructure::Tight => (Some(0.33), WING),
             SellStructure::Fly => (None, WING),
+            SellStructure::WideFly => (None, 2.0 * WING),
         }
     }
+
+    /// Wing width (points) for this structure's defined-risk geometry. `max loss = wing − credit`.
+    pub fn wing(self) -> f64 {
+        self.params().1
+    }
+
+    /// The live structure ladder, safest/widest first: Condor → Tight → Fly → WideFly. The engine
+    /// opens the first that both clears its latents AND funds ≥1 lot (mirrors satakarni's set).
+    pub const LADDER: [SellStructure; 4] = [
+        SellStructure::Condor,
+        SellStructure::Tight,
+        SellStructure::Fly,
+        SellStructure::WideFly,
+    ];
 }
 
 /// Per-strike quote the selector needs: greeks + top of book for both sides.
@@ -176,6 +198,8 @@ pub fn marketable_limit(side: OrderSide, bid: f64, ask: f64) -> f64 {
 pub enum ExitReason {
     TakeProfit,
     Stop,
+    /// Half-gain profit trail: gave back to 50% of the peak gain (a protective win-keeper, not a loss).
+    Trail,
     Time,
 }
 
@@ -225,8 +249,8 @@ pub fn combo_close_cost(legs: &[PlannedLeg], quotes: &[StrikeQuote]) -> Option<f
     Some(cost)
 }
 
-/// Exit rule: 15:15 hard close, else take-profit at 50% of credit, else stop at 50%
-/// of defined max loss. `ist_mins` = minutes since IST midnight (15:15 = 915).
+/// Exit rule: 15:15 hard close, else take-profit at 50% of credit, else stop at
+/// `STOP_FRAC_ML` of defined max loss. `ist_mins` = minutes since IST midnight (15:15 = 915).
 pub fn exit_reason(credit: f64, close_cost: f64, max_loss_unit: f64, ist_mins: u32) -> Option<ExitReason> {
     if ist_mins >= 915 {
         return Some(ExitReason::Time);
@@ -237,16 +261,17 @@ pub fn exit_reason(credit: f64, close_cost: f64, max_loss_unit: f64, ist_mins: u
     let gain = credit - close_cost;
     if gain >= 0.5 * credit {
         Some(ExitReason::TakeProfit)
-    } else if gain <= -0.5 * max_loss_unit {
+    } else if gain <= -STOP_FRAC_ML * max_loss_unit {
         Some(ExitReason::Stop)
     } else {
         None
     }
 }
 
-/// Defined max loss for one lot = (wing width − credit) × lot_size.
-pub fn max_loss_per_lot(credit: f64, lot_size: u32) -> f64 {
-    (WING - credit) * lot_size as f64
+/// Defined max loss for one lot = (wing width − credit) × lot_size. `wing` is per-structure
+/// (100pt for condor/tight/fly, 200pt for widefly).
+pub fn max_loss_per_lot(credit: f64, wing: f64, lot_size: u32) -> f64 {
+    (wing - credit) * lot_size as f64
 }
 
 /// Lots sized so the defined max loss stays within `risk_frac` of capital, capped at
@@ -312,14 +337,52 @@ pub fn basket_margin_ok(final_margin: f64, available_funds: f64, buffer_frac: f6
 // So gate ENTRY on how much of that zone the morning range already ate, and TRIM in-trade on
 // a fast move measured against the zone — both relative to the structure's OWN geometry.
 
-/// Skip the entry if the opening range has eaten more than this fraction of the profit zone.
-pub const ENTRY_DRIFT_ZONE_CAP: f64 = 0.50;
-/// In-trade trim when a MOVE_WINDOW_MIN move consumes more than this fraction of the zone.
-pub const MOVE_ZONE_CAP: f64 = 0.35;
+/// Wider/lower-gamma structures tolerate more opening-range consumption (mirrors satakarni
+/// `ENTRY_DRIFT_ZONE_CAP`).
+pub fn entry_drift_zone_cap(structure: SellStructure) -> f64 {
+    match structure {
+        SellStructure::Condor => 0.50,
+        SellStructure::Tight => 0.45,
+        SellStructure::Fly => 0.45,
+        SellStructure::WideFly => 0.42,
+    }
+}
+
+/// At entry, spot should not sit too close to one edge of the opening range. Edge opens are
+/// directional pressure, not chop. Narrow structures need a cleaner center (mirrors satakarni
+/// `ENTRY_BALANCE_EDGE_CAP`).
+pub fn entry_balance_edge_cap(structure: SellStructure) -> f64 {
+    match structure {
+        SellStructure::Condor => 0.70,
+        SellStructure::Tight => 0.40,
+        SellStructure::Fly => 0.35,
+        SellStructure::WideFly => 0.40,
+    }
+}
+
+/// In-trade trim when a MOVE_WINDOW_MIN move consumes more than this fraction of the zone (mirrors
+/// satakarni `MOVE_ZONE_CAP`).
+pub fn move_zone_cap(structure: SellStructure) -> f64 {
+    match structure {
+        SellStructure::Condor => 0.35,
+        SellStructure::Tight => 0.30,
+        SellStructure::Fly => 0.25,
+        SellStructure::WideFly => 0.28,
+    }
+}
 /// In-trade trim when the MOVE_WINDOW_MIN move exceeds this fraction of spot (short gamma can't
 /// take a fast realized move).
 pub const MOVE_PCT: f64 = 0.0025;
-pub const MOVE_WINDOW_MIN: u32 = 5;
+pub const MOVE_WINDOW_MIN: u32 = 2;
+pub const TREND_ER: f64 = 0.50;
+/// In-trade trend-exit threshold. DISABLED (99) — the A/B showed a rolling-ER trend-exit false-fires
+/// on calm days and chops winners; the half-gain trail below is the validated profit protection.
+pub const TREND_EXIT_ER: f64 = 99.0;
+pub const TREND_ROLL_MIN: u32 = 20;
+/// Half-gain profit trail: arms once the running gain peaks past +15% of credit, then the stop locks
+/// at 50% of the PEAK gain (ratchets up, never down) — a winner gives back at most half its best.
+pub const TRAIL_TRIGGER: f64 = 0.15;
+pub const TRAIL_FRAC: f64 = 0.50;
 
 /// Credit-adjusted expiry profit zone for the short strikes: `[min_short − credit, max_short +
 /// credit]`. Condor → put/call shorts; fly → ATM ± credit. Returns `(lower, upper, width)`, or
@@ -337,16 +400,160 @@ pub fn profit_zone(legs: &[PlannedLeg], credit: f64) -> Option<(f64, f64, f64)> 
 
 /// Entry drift gate: admit only if the opening range is at most `ENTRY_DRIFT_ZONE_CAP` of the
 /// profit-zone width (the day hasn't already consumed the cushion).
-pub fn entry_drift_admits(opening_range_pts: f64, zone_width: f64) -> bool {
-    zone_width > 0.0 && opening_range_pts / zone_width <= ENTRY_DRIFT_ZONE_CAP
+pub fn entry_drift_admits(opening_range_pts: f64, zone_width: f64, structure: SellStructure) -> bool {
+    zone_width > 0.0 && opening_range_pts / zone_width <= entry_drift_zone_cap(structure)
+}
+
+pub fn entry_balance_admits(edge_frac: f64, structure: SellStructure) -> bool {
+    edge_frac <= entry_balance_edge_cap(structure)
 }
 
 /// In-trade move trim: exit if the `MOVE_WINDOW_MIN`-minute move (`move_pts = |spot(t) −
 /// spot(t−window)|`) exceeds `MOVE_PCT` of spot OR `MOVE_ZONE_CAP` of the profit zone.
-pub fn move_trims(move_pts: f64, spot: f64, zone_width: f64) -> bool {
+pub fn move_trims(move_pts: f64, spot: f64, zone_width: f64, structure: SellStructure) -> bool {
     let by_spot = spot > 0.0 && move_pts / spot > MOVE_PCT;
-    let by_zone = zone_width > 0.0 && move_pts / zone_width > MOVE_ZONE_CAP;
+    let by_zone = zone_width > 0.0 && move_pts / zone_width > move_zone_cap(structure);
     by_spot || by_zone
+}
+
+// ── Elite seller's regime gate (ported from satakarni; a-priori thresholds, NOT tuned) ──────
+// The live runtime must match the sandbox: the open gate only rejects a clearly trending open.
+// Range/straddle is logged as context, but no longer blocks entry; protection sits in the
+// structure-specific drift/balance gates and the in-trade move/trend exits.
+// NOTE: ER is sampling-frequency sensitive, so callers MUST feed 1-min closes (parity with the
+// backtest's resample) — otherwise the same threshold would behave differently.
+
+/// Kaufman Efficiency Ratio over the opening window's 1-min closes: `|net| / Σ|step|`. ~0 = chop
+/// (oscillated, went nowhere → sell), ~1 = trend (marched one way → stand aside). None if too few
+/// bars. Distinguishes "swung 50pt, ended flat" from "trended 50pt straight" — a range cannot.
+pub fn efficiency_ratio(closes: &[f64]) -> Option<f64> {
+    if closes.len() < 5 {
+        return None;
+    }
+    let net = (closes[closes.len() - 1] - closes[0]).abs();
+    let path: f64 = closes.windows(2).map(|w| (w[1] - w[0]).abs()).sum();
+    Some(if path > 0.0 { net / path } else { 0.0 })
+}
+
+/// ATM straddle premium (CE mid + PE mid at the strike nearest spot) — the options' own priced
+/// move, used as the vol-adaptive yardstick for "how big a range is too big".
+pub fn atm_straddle(quotes: &[StrikeQuote], spot: f64) -> Option<f64> {
+    let q = quotes.iter().min_by(|a, b| {
+        (a.strike - spot)
+            .abs()
+            .partial_cmp(&(b.strike - spot).abs())
+            .unwrap_or(Ordering::Equal)
+    })?;
+    let ce_mid = (q.ce_bid + q.ce_ask) / 2.0;
+    let pe_mid = (q.pe_bid + q.pe_ask) / 2.0;
+    (ce_mid > 0.0 && pe_mid > 0.0).then_some(ce_mid + pe_mid)
+}
+
+/// Regime decision: `Some(reason)` to stand aside, `None` to admit.
+pub fn sell_regime_skip(er: f64, range_pts: f64, straddle: f64) -> Option<&'static str> {
+    let _ = (range_pts, straddle);
+    if er > TREND_ER {
+        return Some("TRENDING (efficiency ratio)");
+    }
+    None
+}
+
+/// Opening-session indicators from the 09:15–09:45 window — the only past data available at the
+/// 09:45 entry (no look-ahead). Used to pick the best multi-leg structure for *this* day.
+#[derive(Debug, Clone, Copy)]
+pub struct OpeningRegime {
+    pub er: f64,
+    pub range_pts: f64,
+    pub straddle: f64,
+    /// Where 09:45 spot sits in the opening range: 0 = low, 1 = high, 0.5 = centered.
+    pub edge_frac: f64,
+}
+
+impl OpeningRegime {
+    /// Morning range as a fraction of the ATM straddle — realized vs implied ("is vol running hot?").
+    pub fn range_straddle(&self) -> f64 {
+        if self.straddle > 0.0 {
+            self.range_pts / self.straddle
+        } else {
+            f64::INFINITY
+        }
+    }
+
+    /// Chop strength: 1 = pure oscillation, 0 = at the trend threshold.
+    pub fn chop(&self) -> f64 {
+        ((TREND_ER - self.er) / TREND_ER).clamp(0.0, 1.0)
+    }
+
+    /// How centered the open is: 1 = middle of range, 0 = at an edge.
+    pub fn centered(&self) -> f64 {
+        (1.0 - (self.edge_frac - 0.5).abs() * 2.0).clamp(0.0, 1.0)
+    }
+}
+
+/// Score how well `structure` fits today's opening regime among structures that already cleared
+/// their hard gates (drift, balance, margin). Higher = better match. Pure — unit-tested.
+///
+/// Weights are a-priori (textbook seller logic), not tuned to captured days:
+///   • drift/balance *headroom* — how much cushion remains in the profit zone / range center;
+///   • structure-specific regime affinity — narrow/high-credit (Fly/Tight) on calm+centered chop,
+///     wide/low-gamma (Condor/WideFly) when realized is hot or spot sits off-center.
+pub fn structure_regime_score(
+    structure: SellStructure,
+    regime: OpeningRegime,
+    drift_frac: f64,
+) -> f64 {
+    let drift_cap = entry_drift_zone_cap(structure);
+    let edge_cap = entry_balance_edge_cap(structure);
+    let drift_headroom = ((drift_cap - drift_frac) / drift_cap).clamp(0.0, 1.0);
+    let edge_headroom = ((edge_cap - regime.edge_frac) / edge_cap).clamp(0.0, 1.0);
+
+    let chop = regime.chop();
+    let centered = regime.centered();
+    let rvs = regime.range_straddle();
+    let calm = (1.0 - (rvs / 0.80).min(1.0)).clamp(0.0, 1.0);
+    let hot = (rvs / 0.50).min(1.0);
+
+    let affinity = match structure {
+        // Calm, centered chop → ATM/near-ATM premium harvest.
+        SellStructure::Fly => chop * 0.35 + centered * 0.35 + calm * 0.30,
+        SellStructure::Tight => chop * 0.30 + centered * 0.30 + calm * 0.20 + drift_headroom * 0.20,
+        // Wide, forgiving geometry → off-center opens and moderate drift consumption.
+        SellStructure::Condor => {
+            chop * 0.25 + drift_headroom * 0.30 + (1.0 - centered) * 0.20 + edge_headroom * 0.25
+        }
+        // Realized running hot vs implied → need the 200pt wings.
+        SellStructure::WideFly => chop * 0.20 + hot * 0.35 + drift_headroom * 0.25 + edge_headroom * 0.20,
+    };
+
+    0.20 * drift_headroom + 0.15 * edge_headroom + 0.65 * affinity
+}
+
+/// Pick the structure with the highest regime score. Ties → safer structure wins (earlier in
+/// `SellStructure::LADDER`: Condor first).
+pub fn pick_best_structure(candidates: &[(SellStructure, f64)]) -> Option<SellStructure> {
+    if candidates.is_empty() {
+        return None;
+    }
+    let ladder_rank = |s: SellStructure| {
+        SellStructure::LADDER
+            .iter()
+            .position(|&x| x == s)
+            .unwrap_or(SellStructure::LADDER.len())
+    };
+    candidates
+        .iter()
+        .max_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| ladder_rank(b.0).cmp(&ladder_rank(a.0)))
+        })
+        .map(|(s, _)| *s)
+}
+
+/// Half-gain profit trail: once the peak running gain cleared `TRAIL_TRIGGER` of credit, exit when
+/// the current gain has given back to `TRAIL_FRAC` of that peak (a winner keeps at least half its best).
+pub fn trail_exits(gain: f64, peak_gain: f64, credit: f64) -> bool {
+    credit > 0.0 && peak_gain >= TRAIL_TRIGGER * credit && gain <= TRAIL_FRAC * peak_gain
 }
 
 // ── Slice 3b: live/paper runtime harness ─────────────────────────────────────────────
@@ -357,9 +564,17 @@ const CUTOFF_MIN: u32 = 14 * 60 + 30;
 const EXIT_MIN: u32 = 15 * 60 + 15;
 const OPEN_RANGE_START_SEC: u32 = 9 * 3600 + 15 * 60 + 5;
 const OPEN_RANGE_END_SEC: u32 = ENTRY_MIN * 60;
-const RISK_FRAC: f64 = 0.10;
+/// Position sizing uses FULL margin affordability — the old 10% risk-fraction SIZE cap is dropped.
+/// Downside is bounded by the active `STOP_FRAC_CAP` rupee stop instead of by refusing/shrinking the
+/// trade. Mirrors the satakarni sandbox.
+const MARGIN_SIZING_FRAC: f64 = 1.0;
+/// Hard per-cycle rupee stop = 10% of CURRENT account capital, enforced regardless of lots. The
+/// active-stop alternative to limiting risk via position size (mirrors satakarni `STOP_FRAC_CAP`).
+const STOP_FRAC_CAP: f64 = 0.10;
+/// Defined-risk stop: cut once running loss reaches this fraction of one-unit max loss.
+pub const STOP_FRAC_ML: f64 = 0.15;
 const MAX_LOTS: u32 = 5;
-const SCAN_INTERVAL_SECS: u64 = 45;
+const SCAN_INTERVAL_SECS: u64 = 5;
 const MARGIN_BUFFER_FRAC: f64 = 0.15;
 const LIVE_ORDER_TIMEOUT_SECS: u64 = 25;
 const CANCEL_RECONCILE_TIMEOUT_SECS: u64 = 20;
@@ -414,6 +629,12 @@ struct ChainSnapshot {
     lot_size: u32,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct OpeningLatent {
+    range_pts: f64,
+    edge_frac: f64,
+}
+
 #[derive(Debug, Clone)]
 struct ActiveCombo {
     underlying: String,
@@ -424,6 +645,8 @@ struct ActiveCombo {
     credit: f64,
     max_loss_unit: f64,
     zone_width: f64,
+    /// Best per-unit running gain seen so far — the ratchet for the half-gain trail.
+    peak_gain: f64,
 }
 
 #[derive(Default)]
@@ -509,20 +732,68 @@ impl MultiLegEngine {
         self.updates_rx = updates_rx;
     }
 
-    pub fn spawn(mut self, mut rx: broadcast::Receiver<TickEvent>) -> tokio::task::JoinHandle<()> {
+    pub fn spawn(self, rx: broadcast::Receiver<TickEvent>) -> tokio::task::JoinHandle<()> {
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        self.spawn_with_shutdown(rx, shutdown_rx)
+    }
+
+    pub fn spawn_with_shutdown(
+        mut self,
+        mut rx: broadcast::Receiver<TickEvent>,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!(
                 "Multi-leg engine started | structure=CONDOR | holder={} | {} mode",
                 HOLDER,
                 if self.live.is_some() { "LIVE" } else { "paper" }
             );
+            let mut flatten_clock = tokio::time::interval(std::time::Duration::from_secs(2));
+            let mut shutdown_requested = false;
+            let mut shutdown_deadline_ms = 0_u64;
             loop {
-                match rx.recv().await {
-                    Ok(event) => self.on_event(&event).await,
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        warn!("Multi-leg engine lagged by {} messages", n);
+                tokio::select! {
+                    event = rx.recv() => match event {
+                        Ok(event) => self.on_event(&event).await,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Multi-leg engine lagged by {} messages", n);
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            if self.has_active_positions() {
+                                warn!("Multi-leg tick stream closed with active position; attempting final flatten");
+                                self.close_all_active(ExitReason::Time).await;
+                            }
+                            break;
+                        }
+                    },
+                    _ = flatten_clock.tick() => {
+                        let now = now_ms();
+                        let (_day, _wd, mins, _secs) = ist_parts(now);
+                        if mins >= EXIT_MIN && self.has_active_positions() {
+                            self.close_all_active(ExitReason::Time).await;
+                        }
+                        if shutdown_requested {
+                            if !self.has_active_positions() {
+                                break;
+                            }
+                            if shutdown_deadline_ms > 0 && now >= shutdown_deadline_ms {
+                                warn!("Multi-leg shutdown flatten window elapsed; active position still tracked");
+                                break;
+                            }
+                            self.close_all_active(ExitReason::Time).await;
+                        }
+                    },
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() {
+                            shutdown_requested = true;
+                            shutdown_deadline_ms = now_ms().saturating_add(30_000);
+                            warn!("Multi-leg shutdown requested; flattening active combos before exit");
+                            self.close_all_active(ExitReason::Time).await;
+                            if !self.has_active_positions() {
+                                break;
+                            }
+                        }
                     }
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         })
@@ -588,15 +859,49 @@ impl MultiLegEngine {
         let Some(snapshot) = self.build_snapshot(underlying, now_ms) else {
             return;
         };
-        let Some((active, drift_frac)) = self.plan_entry(underlying, now_ms, day, &snapshot) else {
+        // Elite seller's regime gate (ported from satakarni): block only a clearly trending open.
+        // Range/straddle is logged for context, not used as an entry blocker in the current sandbox.
+        // Insufficient opening data → stand aside (can't confirm a calm open, so don't sell into it).
+        let closes = self.morning_minute_closes(underlying, day);
+        let regime = match (
+            efficiency_ratio(&closes),
+            atm_straddle(&snapshot.quotes, snapshot.spot),
+        ) {
+            (Some(er), Some(straddle)) => {
+                let max = closes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                let min = closes.iter().cloned().fold(f64::INFINITY, f64::min);
+                let range_pts = max - min;
+                if let Some(why) = sell_regime_skip(er, range_pts, straddle) {
+                    self.log_skip(
+                        underlying,
+                        now_ms,
+                        format!(
+                            "multi-leg stand aside: {} (ER {:.2}, range {:.0}pt = {:.0}% of straddle {:.0})",
+                            why,
+                            er,
+                            range_pts,
+                            range_pts / straddle * 100.0,
+                            straddle
+                        ),
+                    );
+                    return;
+                }
+                let edge_frac = self
+                    .opening_latent(underlying, day, None)
+                    .map(|l| l.edge_frac)
+                    .unwrap_or(0.5);
+                OpeningRegime {
+                    er,
+                    range_pts,
+                    straddle,
+                    edge_frac,
+                }
+            }
+            _ => return,
+        };
+        let Some((active, _drift_frac)) = self.plan_entry(underlying, now_ms, day, &snapshot, regime) else {
             return;
         };
-        if !entry_drift_admits(
-            drift_frac * active.zone_width,
-            active.zone_width,
-        ) {
-            return;
-        }
         self.open_combo(active, snapshot).await;
     }
 
@@ -715,66 +1020,146 @@ impl MultiLegEngine {
         })
     }
 
+    /// Indicator-driven structure pick: evaluate every structure against the opening regime,
+    /// keep those that clear hard gates (drift, balance, margin), then open the highest
+    /// `structure_regime_score`. One multi-leg trade/day is enforced by `traded_today` +
+    /// the per-holder cap on `shared_circuit`.
     fn plan_entry(
         &mut self,
         underlying: &str,
         now_ms: u64,
         day: NaiveDate,
         snapshot: &ChainSnapshot,
+        regime: OpeningRegime,
     ) -> Option<(ActiveCombo, f64)> {
-        let legs = select_legs(&snapshot.quotes, snapshot.spot, SellStructure::Condor)?;
-        let credit = combo_credit(&legs, &snapshot.quotes)?;
-        let (_zone_lo, _zone_hi, zone_width) = profit_zone(&legs, credit)?;
-        let max_loss_unit = WING - credit;
-        if credit <= 0.0 || max_loss_unit <= 0.0 {
-            return None;
+        let opening_latent = self.opening_latent(underlying, day, None)?;
+        let mut last_err = String::new();
+        let mut scored: Vec<(SellStructure, f64, ActiveCombo)> = Vec::new();
+        let mut scoreboard: Vec<(SellStructure, f64)> = Vec::new();
+
+        for structure in SellStructure::LADDER {
+            match self.plan_structure(structure, underlying, snapshot, opening_latent) {
+                Ok((combo, drift_frac)) => {
+                    let score = structure_regime_score(structure, regime, drift_frac);
+                    scoreboard.push((structure, score));
+                    scored.push((structure, drift_frac, combo));
+                }
+                Err(e) => last_err = format!("{:?} {}", structure, e),
+            }
         }
-        let opening_range = self.opening_range(underlying, day)?;
-        let drift_frac = opening_range / zone_width;
-        if drift_frac > ENTRY_DRIFT_ZONE_CAP {
+
+        if scoreboard.is_empty() {
             self.log_skip(
                 underlying,
                 now_ms,
-                format!(
-                    "multi-leg skipped: DRIFT-ZONE {:.0}% > {:.0}% (range {:.0} / zone {:.0})",
-                    drift_frac * 100.0,
-                    ENTRY_DRIFT_ZONE_CAP * 100.0,
-                    opening_range,
-                    zone_width
-                ),
+                format!("multi-leg skipped: no structure passed gates ({})", last_err),
             );
             return None;
         }
+
+        let best = pick_best_structure(&scoreboard)?;
+        let (drift_frac, active) = scored
+            .into_iter()
+            .find(|(s, _, _)| *s == best)
+            .map(|(_, d, c)| (d, c))?;
+
+        let fmt = |s: SellStructure| -> String {
+            scoreboard
+                .iter()
+                .find(|(st, _)| *st == s)
+                .map(|(_, sc)| format!("{:.2}", sc))
+                .unwrap_or_else(|| "-".to_string())
+        };
+        info!(
+            "MULTILEG regime pick {:?} score {:.2} | ER {:.2} RVS {:.0}% centered {:.0}% | \
+             Condor={} Tight={} Fly={} WideFly={}",
+            best,
+            scoreboard.iter().find(|(s, _)| *s == best).map(|(_, sc)| *sc).unwrap_or(0.0),
+            regime.er,
+            regime.range_straddle() * 100.0,
+            regime.centered() * 100.0,
+            fmt(SellStructure::Condor),
+            fmt(SellStructure::Tight),
+            fmt(SellStructure::Fly),
+            fmt(SellStructure::WideFly),
+        );
+
+        Some((active, drift_frac))
+    }
+
+    /// Plan one structure (no logging, no mutation): `Ok` if it clears the drift gate and funds a
+    /// lot, else `Err(reason)`.
+    fn plan_structure(
+        &self,
+        structure: SellStructure,
+        underlying: &str,
+        snapshot: &ChainSnapshot,
+        opening_latent: OpeningLatent,
+    ) -> Result<(ActiveCombo, f64), String> {
+        let legs = select_legs(&snapshot.quotes, snapshot.spot, structure)
+            .ok_or("legs not seatable")?;
+        let credit = combo_credit(&legs, &snapshot.quotes).ok_or("no credit")?;
+        let (_zone_lo, _zone_hi, zone_width) = profit_zone(&legs, credit).ok_or("no zone")?;
+        let max_loss_unit = structure.wing() - credit;
+        if credit <= 0.0 || max_loss_unit <= 0.0 {
+            return Err("non-positive credit/max-loss".to_string());
+        }
+        let drift_frac = opening_latent.range_pts / zone_width;
+        let drift_cap = entry_drift_zone_cap(structure);
+        if !entry_drift_admits(opening_latent.range_pts, zone_width, structure) {
+            return Err(format!(
+                "DRIFT-ZONE {:.0}% > {:.0}%",
+                drift_frac * 100.0,
+                drift_cap * 100.0
+            ));
+        }
+        let edge_cap = entry_balance_edge_cap(structure);
+        if !entry_balance_admits(opening_latent.edge_frac, structure) {
+            return Err(format!(
+                "RANGE-BALANCE edge {:.0}% > {:.0}%",
+                opening_latent.edge_frac * 100.0,
+                edge_cap * 100.0
+            ));
+        }
         let max_loss_lot = max_loss_unit * snapshot.lot_size as f64;
-        let lots = size_lots(self.capital, max_loss_lot, RISK_FRAC, MAX_LOTS);
+        let lots = size_lots(self.capital, max_loss_lot, MARGIN_SIZING_FRAC, MAX_LOTS);
         if lots == 0 {
-            self.log_skip(underlying, now_ms, "multi-leg skipped: risk budget cannot fund one lot".to_string());
-            return None;
+            return Err("margin cannot fund one lot".to_string());
         }
 
         let mut live_legs = Vec::with_capacity(legs.len());
         for leg in legs {
-            let market = snapshot.markets.get(&(strike_key(leg.strike), leg.opt))?.clone();
-            let entry_px = entry_fill(&leg, quote_at(&snapshot.quotes, leg.strike)?);
+            let market = snapshot
+                .markets
+                .get(&(strike_key(leg.strike), leg.opt))
+                .ok_or("missing leg market")?
+                .clone();
+            let entry_px = entry_fill(&leg, quote_at(&snapshot.quotes, leg.strike).ok_or("missing quote")?);
             live_legs.push(LiveLeg { plan: leg, market, entry_px });
         }
 
-        Some((
+        Ok((
             ActiveCombo {
                 underlying: underlying.to_string(),
-                structure: SellStructure::Condor,
+                structure,
                 legs: live_legs,
                 lots,
                 lot_size: snapshot.lot_size,
                 credit,
                 max_loss_unit,
                 zone_width,
+                peak_gain: 0.0,
             },
             drift_frac,
         ))
     }
 
+    #[cfg(test)]
     fn opening_range(&self, underlying: &str, day: NaiveDate) -> Option<f64> {
+        self.opening_latent(underlying, day, None).map(|l| l.range_pts)
+    }
+
+    fn opening_latent(&self, underlying: &str, day: NaiveDate, end_ms: Option<u64>) -> Option<OpeningLatent> {
         let st = self.state.get(underlying)?;
         if st.day != Some(day) {
             return None;
@@ -789,8 +1174,9 @@ impl MultiLegEngine {
                 let (sample_day, _wd, _mins, secs) = ist_parts(*t);
                 (sample_day == day
                     && secs >= OPEN_RANGE_START_SEC
-                    && secs <= OPEN_RANGE_END_SEC)
-                    .then_some(*s)
+                    && secs <= OPEN_RANGE_END_SEC
+                    && end_ms.map(|end| *t <= end).unwrap_or(true))
+                .then_some(*s)
             })
             .collect();
         if vals.len() < 2 {
@@ -798,14 +1184,49 @@ impl MultiLegEngine {
         }
         let min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
         let max = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        Some(max - min)
+        let range_pts = max - min;
+        let last = *vals.last()?;
+        let range_pos = if range_pts <= 0.0 {
+            0.5
+        } else {
+            (last - min) / range_pts
+        };
+        let edge_frac = (range_pos - 0.5).abs() * 2.0;
+        Some(OpeningLatent {
+            range_pts,
+            edge_frac,
+        })
+    }
+
+    /// 1-min spot closes over the opening window [09:15:05, 09:45], chronological. Buckets the
+    /// per-tick spot history by minute (last sample wins) to match the backtest's `resample(1min)`
+    /// — required so the Efficiency Ratio is comparable to the calibrated `ER_CAP`.
+    fn morning_minute_closes(&self, underlying: &str, day: NaiveDate) -> Vec<f64> {
+        let Some(st) = self.state.get(underlying) else {
+            return Vec::new();
+        };
+        if st.day != Some(day) {
+            return Vec::new();
+        }
+        let mut by_min: BTreeMap<u64, f64> = BTreeMap::new();
+        for (t, s) in &st.spot_history {
+            if !s.is_finite() || *s <= 0.0 {
+                continue;
+            }
+            let (sample_day, _wd, _mins, secs) = ist_parts(*t);
+            if sample_day == day && secs >= OPEN_RANGE_START_SEC && secs <= OPEN_RANGE_END_SEC {
+                by_min.insert(*t / 60_000, *s); // chronological history → last sample per minute wins
+            }
+        }
+        by_min.into_values().collect()
     }
 
     async fn open_combo(&mut self, mut active: ActiveCombo, snapshot: ChainSnapshot) {
-        if self.live.is_some() && !self.preflight_live_margin(&active, &snapshot).await {
+        if !crate::portfolio::try_claim(&self.shared_circuit, HOLDER) {
             return;
         }
-        if !crate::portfolio::try_claim(&self.shared_circuit, HOLDER) {
+        if self.live.is_some() && !self.preflight_live_margin(&mut active, &snapshot).await {
+            crate::portfolio::release(&self.shared_circuit, HOLDER);
             return;
         }
 
@@ -841,23 +1262,8 @@ impl MultiLegEngine {
         }
     }
 
-    async fn preflight_live_margin(&self, active: &ActiveCombo, snapshot: &ChainSnapshot) -> bool {
+    async fn preflight_live_margin(&self, active: &mut ActiveCombo, snapshot: &ChainSnapshot) -> bool {
         let Some(live) = &self.live else { return true; };
-        let qty = active.lots.saturating_mul(active.lot_size);
-        let orders: Vec<BasketMarginOrder> = active
-            .legs
-            .iter()
-            .map(|l| BasketMarginOrder {
-                exchange: live.exchange.clone(),
-                tradingsymbol: l.market.tradingsymbol.clone(),
-                transaction_type: side_word(l.plan.side).to_string(),
-                variety: live.variety.clone(),
-                product: live.product.clone(),
-                order_type: "LIMIT".to_string(),
-                quantity: qty,
-                price: marketable_limit(l.plan.side, l.market.bid, l.market.ask),
-            })
-            .collect();
         let funds = match fetch_live_available_funds(&live.api_key, &live.access_token).await {
             Ok(v) => v,
             Err(e) => {
@@ -865,27 +1271,56 @@ impl MultiLegEngine {
                 return false;
             }
         };
-        let final_margin = match fetch_basket_final_margin(&live.api_key, &live.access_token, &orders).await {
-            Ok(v) => v,
-            Err(e) => {
-                warn!("MULTILEG margin preflight skipped entry: basket margin unavailable: {}", e);
-                return false;
+
+        let planned_lots = active.lots.max(1);
+        for lots in (1..=planned_lots).rev() {
+            let qty = lots.saturating_mul(active.lot_size);
+            let orders: Vec<BasketMarginOrder> = active
+                .legs
+                .iter()
+                .map(|l| BasketMarginOrder {
+                    exchange: live.exchange.clone(),
+                    tradingsymbol: l.market.tradingsymbol.clone(),
+                    transaction_type: side_word(l.plan.side).to_string(),
+                    variety: live.variety.clone(),
+                    product: live.product.clone(),
+                    order_type: "LIMIT".to_string(),
+                    quantity: qty,
+                    price: marketable_limit(l.plan.side, l.market.bid, l.market.ask),
+                })
+                .collect();
+            let final_margin = match fetch_basket_final_margin(&live.api_key, &live.access_token, &orders).await {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!("MULTILEG margin preflight skipped entry: basket margin unavailable: {}", e);
+                    return false;
+                }
+            };
+            if basket_margin_ok(final_margin, funds, MARGIN_BUFFER_FRAC) {
+                if lots != active.lots {
+                    warn!(
+                        "MULTILEG margin preflight resized {} {:?}: {}lot -> {}lot to fit funds ₹{:.0}",
+                        active.underlying, active.structure, active.lots, lots, funds
+                    );
+                    active.lots = lots;
+                }
+                info!(
+                    "MULTILEG margin preflight OK {} {:?}: final ₹{:.0}, funds ₹{:.0}, spot {:.0}, lots {}",
+                    active.underlying, active.structure, final_margin, funds, snapshot.spot, active.lots
+                );
+                return true;
             }
-        };
-        if !basket_margin_ok(final_margin, funds, MARGIN_BUFFER_FRAC) {
             warn!(
-                "MULTILEG margin preflight rejected: final margin ₹{:.0} + {:.0}% buffer > funds ₹{:.0}",
+                "MULTILEG margin preflight rejected {} {:?} x{}lot: final margin ₹{:.0} + {:.0}% buffer > funds ₹{:.0}",
+                active.underlying,
+                active.structure,
+                lots,
                 final_margin,
                 MARGIN_BUFFER_FRAC * 100.0,
                 funds
             );
-            return false;
         }
-        info!(
-            "MULTILEG margin preflight OK {} {:?}: final ₹{:.0}, funds ₹{:.0}, spot {:.0}",
-            active.underlying, active.structure, final_margin, funds, snapshot.spot
-        );
-        true
+        false
     }
 
     async fn place_live_entry(&mut self, active: &mut ActiveCombo) -> Result<(), LiveEntryFailure> {
@@ -973,18 +1408,64 @@ impl MultiLegEngine {
         let close_cost = combo_close_cost(&plans, &snapshot.quotes).unwrap_or(active.credit);
         let mut reason = None;
         if let Some(move_pts) = self.recent_move_pts(underlying, now_ms) {
-            if move_trims(move_pts, snapshot.spot, active.zone_width) {
+            if move_trims(move_pts, snapshot.spot, active.zone_width, active.structure) {
                 reason = Some(ExitReason::Stop);
             }
         }
         if reason.is_none() {
-            reason = exit_reason(active.credit, close_cost, active.max_loss_unit, mins);
+            let gain = active.credit - close_cost;
+            // Ratchet the peak gain and persist it on the active position (the trail floor rises,
+            // never falls) so the half-gain trail survives across manage cycles.
+            let peak_gain = active.peak_gain.max(gain);
+            if let Some(st) = self.state.get_mut(underlying) {
+                if let Some(a) = st.active.as_mut() {
+                    a.peak_gain = peak_gain;
+                }
+            }
+            if mins >= EXIT_MIN {
+                reason = Some(ExitReason::Time);
+            } else if active.credit > 0.0 && gain >= 0.5 * active.credit {
+                reason = Some(ExitReason::TakeProfit);
+            } else if trail_exits(gain, peak_gain, active.credit) {
+                // Half-gain profit trail: a winner that peaked past +15% gives back at most half.
+                reason = Some(ExitReason::Trail);
+            } else if gain * active.lots.saturating_mul(active.lot_size) as f64
+                <= -STOP_FRAC_CAP * self.capital
+            {
+                // Hard rupee stop: cut once the realized loss hits 10% of account capital, regardless
+                // of lots — the active-stop alternative to limiting risk via position size.
+                reason = Some(ExitReason::Stop);
+            } else if active.max_loss_unit > 0.0 && gain <= -STOP_FRAC_ML * active.max_loss_unit {
+                reason = Some(ExitReason::Stop);
+            }
         }
         if mins >= EXIT_MIN {
             reason = Some(ExitReason::Time);
         }
         if let Some(exit) = reason {
             self.close_active(active, snapshot, exit).await;
+        }
+    }
+
+    fn has_active_positions(&self) -> bool {
+        self.state.values().any(|st| st.active.is_some())
+    }
+
+    async fn close_all_active(&mut self, reason: ExitReason) {
+        let active: Vec<ActiveCombo> = self
+            .state
+            .values()
+            .filter_map(|st| st.active.clone())
+            .collect();
+        for combo in active {
+            let Some(snapshot) = self.build_snapshot(&combo.underlying, now_ms()) else {
+                warn!(
+                    "MULTILEG {:?} CLOSE skipped for {} {:?}: no current chain snapshot",
+                    reason, combo.underlying, combo.structure
+                );
+                continue;
+            };
+            self.close_active(combo, snapshot, reason).await;
         }
     }
 
@@ -1076,17 +1557,10 @@ impl MultiLegEngine {
     }
 
     async fn flatten_live_fills(&mut self, fills: &[FilledLiveLeg], label: &str) -> Result<(), String> {
-        let mut seq: Vec<FilledLiveLeg> = fills
-            .iter()
-            .filter(|f| f.qty > 0 && f.leg.plan.side == OrderSide::Sell)
-            .cloned()
-            .collect();
-        seq.extend(
-            fills
-                .iter()
-                .filter(|f| f.qty > 0 && f.leg.plan.side == OrderSide::Buy)
-                .cloned(),
-        );
+        // Close order is the mirror of entry: buy back every SHORT first, THEN sell the wings, so a
+        // short is never momentarily left naked. Stable sort preserves intra-group order.
+        let mut seq: Vec<FilledLiveLeg> = fills.iter().filter(|f| f.qty > 0).cloned().collect();
+        seq.sort_by_key(|f| close_order_rank(f.leg.plan.side));
         for fill in seq {
             let side = close_side(fill.leg.plan.side);
             let tag = self.next_tag(if label == "exit" { "MLX" } else { "MLF" });
@@ -1341,6 +1815,17 @@ fn close_side(entry_side: OrderSide) -> OrderSide {
     }
 }
 
+/// Close-ordering rank: a SHORT (entry SELL) is bought back FIRST (rank 0); a LONG wing (entry BUY)
+/// is sold AFTER (rank 1). Selling a wing before its short is closed would momentarily un-hedge the
+/// short into naked, full-margin/unlimited risk — the exact mirror of `placement_sequence` (wings
+/// bought first on entry). A *stable* sort on this rank preserves intra-group order.
+fn close_order_rank(entry_side: OrderSide) -> u8 {
+    match entry_side {
+        OrderSide::Sell => 0,
+        OrderSide::Buy => 1,
+    }
+}
+
 /// Pick which already-filled legs to flatten when an entry leg fails mid-sequence.
 ///
 /// Normally everything filled so far is flattened. But if the leg that failed is a SHORT
@@ -1419,7 +1904,7 @@ fn realized_pnl(
     gross_unit * qty_f - costs
 }
 
-fn option_order_cost(price: f64, qty: u32, side: OrderSide, ts_ms: u64) -> f64 {
+pub(crate) fn option_order_cost(price: f64, qty: u32, side: OrderSide, ts_ms: u64) -> f64 {
     let prem = price.max(0.0) * qty as f64;
     let brokerage = 20.0;
     let exch = 0.000311 * prem;
@@ -1507,6 +1992,24 @@ mod tests {
     }
 
     #[test]
+    fn shorts_bought_back_before_wings_sold_on_exit() {
+        // Exit must mirror entry: close the SHORTS (buy-to-close) before selling the protective
+        // wings, so a short is never momentarily un-hedged into naked risk.
+        let mut legs = select_legs(&chain(), 24109.0, SellStructure::Condor).unwrap();
+        legs.sort_by_key(|l| close_order_rank(l.side));
+        let first_buy = legs.iter().position(|l| l.side == OrderSide::Buy).unwrap();
+        let last_sell = legs.iter().rposition(|l| l.side == OrderSide::Sell).unwrap();
+        assert!(
+            last_sell < first_buy,
+            "every short (SELL, bought back) must close before any wing (BUY, sold)"
+        );
+        assert!(
+            legs[first_buy..].iter().all(|l| l.wing),
+            "the legs closed last are the protective wings"
+        );
+    }
+
+    #[test]
     fn marketable_limit_crosses_so_no_leg_is_missed() {
         // BUY pays up over the ask; SELL gives up under the bid → both immediately marketable.
         assert!((marketable_limit(OrderSide::Buy, 12.0, 12.1) - 12.6).abs() < 1e-9);
@@ -1537,22 +2040,76 @@ mod tests {
     }
 
     #[test]
+    fn tight_picks_third_delta_shorts_with_100pt_wings() {
+        // TIGHT shorts sit nearer ATM than the condor (~0.33Δ), wings still 100pt.
+        let legs = select_legs(&chain(), 24109.0, SellStructure::Tight).expect("tight must seat");
+        let ce_s = legs.iter().find(|l| l.opt == OptionType::CE && l.side == OrderSide::Sell).unwrap();
+        let pe_s = legs.iter().find(|l| l.opt == OptionType::PE && l.side == OrderSide::Sell).unwrap();
+        let ce_w = legs.iter().find(|l| l.opt == OptionType::CE && l.side == OrderSide::Buy).unwrap();
+        let pe_w = legs.iter().find(|l| l.opt == OptionType::PE && l.side == OrderSide::Buy).unwrap();
+        assert_eq!(ce_s.strike, 24200.0, "CE short at ~0.33Δ");
+        assert_eq!(pe_s.strike, 24000.0, "PE short at ~0.33Δ");
+        assert_eq!(ce_w.strike, 24300.0, "CE wing 100pt out");
+        assert_eq!(pe_w.strike, 23900.0, "PE wing 100pt out");
+        assert_eq!(SellStructure::Tight.wing(), 100.0);
+    }
+
+    #[test]
+    fn widefly_is_atm_with_200pt_wings_and_larger_maxloss() {
+        let legs = select_legs(&chain(), 24109.0, SellStructure::WideFly).expect("widefly must seat");
+        let ce_s = legs.iter().find(|l| l.opt == OptionType::CE && l.side == OrderSide::Sell).unwrap();
+        let pe_s = legs.iter().find(|l| l.opt == OptionType::PE && l.side == OrderSide::Sell).unwrap();
+        let ce_w = legs.iter().find(|l| l.opt == OptionType::CE && l.side == OrderSide::Buy).unwrap();
+        let pe_w = legs.iter().find(|l| l.opt == OptionType::PE && l.side == OrderSide::Buy).unwrap();
+        assert_eq!(ce_s.strike, 24100.0, "ATM short");
+        assert_eq!(pe_s.strike, 24100.0, "ATM short (same strike)");
+        assert_eq!(ce_w.strike, 24300.0, "CE wing 200pt out");
+        assert_eq!(pe_w.strike, 23900.0, "PE wing 200pt out");
+        assert_eq!(SellStructure::WideFly.wing(), 200.0);
+        // Wider wing ⇒ larger defined max loss per lot than the 100pt fly at the same credit.
+        let credit = 125.0;
+        assert!(
+            max_loss_per_lot(credit, SellStructure::WideFly.wing(), 65)
+                > max_loss_per_lot(credit, SellStructure::Fly.wing(), 65)
+        );
+    }
+
+    #[test]
+    fn per_structure_caps_match_satakarni() {
+        for (s, drift, edge, mv) in [
+            (SellStructure::Condor, 0.50, 0.70, 0.35),
+            (SellStructure::Tight, 0.45, 0.40, 0.30),
+            (SellStructure::Fly, 0.45, 0.35, 0.25),
+            (SellStructure::WideFly, 0.42, 0.40, 0.28),
+        ] {
+            assert_eq!(entry_drift_zone_cap(s), drift, "drift cap {:?}", s);
+            assert_eq!(entry_balance_edge_cap(s), edge, "balance cap {:?}", s);
+            assert_eq!(move_zone_cap(s), mv, "move cap {:?}", s);
+        }
+    }
+
+    #[test]
     fn exit_rule_fires_on_tp_stop_and_time() {
         let credit = 31.2;
         let maxloss = WING - credit;
         assert_eq!(exit_reason(credit, 31.55, maxloss, 600), None);            // just opened, mid-session
         assert_eq!(exit_reason(credit, 15.0, maxloss, 600), Some(ExitReason::TakeProfit)); // gain 16.2 ≥ 15.6
-        assert_eq!(exit_reason(credit, 66.0, maxloss, 600), Some(ExitReason::Stop));       // loss exceeds 50% ML
+        assert_eq!(exit_reason(credit, 41.0, maxloss, 600), None);             // loss still below 15% ML
+        assert_eq!(exit_reason(credit, 41.6, maxloss, 600), Some(ExitReason::Stop));        // loss exceeds 15% ML
         assert_eq!(exit_reason(credit, 5.0, maxloss, 915), Some(ExitReason::Time));        // 15:15 overrides
     }
 
     #[test]
     fn sizing_respects_risk_budget_and_skips_when_unaffordable() {
-        let mll = max_loss_per_lot(31.2, 65); // (100−31.2)×65 ≈ 4472
-        assert!((mll - 4472.0).abs() < 1.0);
-        assert_eq!(size_lots(150_000.0, mll, 0.10, 5), 3); // ₹15k budget / ₹4472 → 3 lots
-        assert_eq!(size_lots(15_000.0, mll, 0.10, 5), 0);  // ₹1.5k budget < one lot → SKIP
-        assert_eq!(size_lots(500_000.0, mll, 0.10, 5), 5); // capped at MAX_LOTS
+        let condor_mll = max_loss_per_lot(31.2, WING, 65); // (100−31.2)×65 ≈ 4472 — wide, expensive
+        let fly_mll = max_loss_per_lot(80.0, WING, 65); //    (100−80)×65 = 1300 — cheap, ATM
+        assert!((condor_mll - 4472.0).abs() < 1.0);
+        // On the real ₹15k account: the cheap fly funds a lot, the expensive condor does not
+        // (which is exactly why the ladder falls condor→fly at 15k).
+        assert_eq!(size_lots(15_000.0, fly_mll, 0.10, 5), 1); // ₹1.5k budget / ₹1300 → 1 fly lot
+        assert_eq!(size_lots(15_000.0, condor_mll, 0.10, 5), 0); // ₹1.5k < one condor lot → SKIP
+        // Only once the account compounds up does the condor become fundable.
+        assert_eq!(size_lots(50_000.0, condor_mll, 0.10, 5), 1); // ₹5k budget / ₹4472 → 1 condor lot
     }
 
     #[test]
@@ -1593,16 +2150,20 @@ mod tests {
     #[test]
     fn entry_drift_gate_rejects_when_open_range_eats_the_zone() {
         let zone = 362.0;
-        assert!(entry_drift_admits(90.0, zone));   // 25% of zone → ok
-        assert!(!entry_drift_admits(200.0, zone)); // 55% of zone → rejected (>50%)
-        assert!(!entry_drift_admits(50.0, 0.0));   // no zone → reject
+        assert!(entry_drift_admits(90.0, zone, SellStructure::Condor));   // 25% of zone → ok
+        assert!(!entry_drift_admits(200.0, zone, SellStructure::Condor)); // 55% → rejected (>50%)
+        assert!(!entry_drift_admits(165.0, zone, SellStructure::Fly));    // 46% → rejected for fly (>45%)
+        assert!(!entry_drift_admits(50.0, 0.0, SellStructure::Condor));   // no zone → reject
+        assert!(entry_balance_admits(0.60, SellStructure::Condor));
+        assert!(!entry_balance_admits(0.60, SellStructure::Fly));
     }
 
     #[test]
     fn move_trim_fires_on_spot_pct_or_zone_fraction() {
-        assert!(!move_trims(55.0, 24100.0, 362.0));   // 0.23% spot, 15% zone → hold
-        assert!(move_trims(130.0, 24100.0, 362.0));   // 0.54% of spot → trim
-        assert!(move_trims(130.0, 100_000.0, 300.0)); // 0.13% spot but 43% of zone → trim
+        assert!(!move_trims(55.0, 24100.0, 362.0, SellStructure::Condor));   // 0.23% spot, 15% zone → hold
+        assert!(move_trims(130.0, 24100.0, 362.0, SellStructure::Condor));   // 0.54% of spot → trim
+        assert!(move_trims(130.0, 100_000.0, 300.0, SellStructure::Condor)); // 0.13% spot but 43% zone
+        assert!(move_trims(80.0, 100_000.0, 300.0, SellStructure::Fly));     // fly cap is tighter: 27% zone
     }
 
     #[test]
@@ -1737,6 +2298,87 @@ mod tests {
                 avg_price: 12.35
             })
         );
+    }
+
+    #[test]
+    fn efficiency_ratio_separates_chop_from_trend() {
+        // Pure trend (monotone) → ER = 1.0; pure chop (round trip) → ER = 0.
+        assert!((efficiency_ratio(&[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap() - 1.0).abs() < 1e-9);
+        assert!(efficiency_ratio(&[1.0, 2.0, 1.0, 2.0, 1.0]).unwrap().abs() < 1e-9);
+        // Half-efficient: net 2 over path 4 → 0.5.
+        assert!((efficiency_ratio(&[0.0, 1.0, 0.0, 1.0, 2.0]).unwrap() - 0.5).abs() < 1e-9);
+        // Too few bars → None (can't judge).
+        assert!(efficiency_ratio(&[1.0, 2.0]).is_none());
+    }
+
+    #[test]
+    fn sell_regime_skips_trend_only_and_logs_realized_hot() {
+        let straddle = 200.0;
+        assert!(sell_regime_skip(0.10, 40.0, straddle).is_none());
+        assert!(sell_regime_skip(0.45, 40.0, straddle).is_none());
+        assert!(sell_regime_skip(0.51, 40.0, straddle).is_some());
+        // Range/straddle is no longer an entry blocker in the sandbox, so live must admit it too.
+        assert!(sell_regime_skip(0.10, 180.0, straddle).is_none());
+    }
+
+    #[test]
+    fn regime_score_prefers_fly_on_calm_centered_chop() {
+        let regime = OpeningRegime {
+            er: 0.07,
+            range_pts: 42.0,
+            straddle: 162.0,
+            edge_frac: 0.30,
+        };
+        let s_fly = structure_regime_score(SellStructure::Fly, regime, 0.20);
+        let s_condor = structure_regime_score(SellStructure::Condor, regime, 0.35);
+        assert!(
+            s_fly > s_condor,
+            "calm centered chop should favour the ATM fly (fly={s_fly:.3} condor={s_condor:.3})"
+        );
+    }
+
+    #[test]
+    fn regime_score_prefers_widefly_when_realized_is_hot() {
+        let regime = OpeningRegime {
+            er: 0.15,
+            range_pts: 100.0,
+            straddle: 140.0,
+            edge_frac: 0.30,
+        };
+        assert!(regime.range_straddle() > 0.5);
+        let s_wide = structure_regime_score(SellStructure::WideFly, regime, 0.35);
+        let s_fly = structure_regime_score(SellStructure::Fly, regime, 0.40);
+        assert!(s_wide > s_fly, "hot realized day should favour widefly");
+    }
+
+    #[test]
+    fn pick_best_structure_breaks_ties_to_safer_ladder_rank() {
+        let chosen = pick_best_structure(&[(SellStructure::Fly, 0.75), (SellStructure::Condor, 0.75)]).unwrap();
+        assert_eq!(chosen, SellStructure::Condor);
+    }
+
+    #[test]
+    fn half_gain_trail_keeps_half_of_peak() {
+        let credit = 80.0;
+        // Peak below the +15% arm (12) -> trail not active, never exits.
+        assert!(!trail_exits(5.0, 10.0, credit));
+        // Armed (peak +30% = 24) but gain still at peak -> hold.
+        assert!(!trail_exits(24.0, 24.0, credit));
+        // Armed, gain gave back to 50% of peak (12) -> exit.
+        assert!(trail_exits(12.0, 24.0, credit));
+        // Armed exactly at the +15% peak (12), back to half (6) -> exit.
+        assert!(trail_exits(6.0, 12.0, credit));
+    }
+
+    #[test]
+    fn atm_straddle_picks_nearest_strike_mid_sum() {
+        let quotes = vec![
+            sq(23900.0, 0.6, 0.4, 120.0, 122.0, 60.0, 62.0),
+            sq(24000.0, 0.5, 0.5, 95.0, 97.0, 90.0, 92.0), // nearest to spot 24010
+            sq(24100.0, 0.4, 0.6, 60.0, 62.0, 130.0, 132.0),
+        ];
+        // ATM mids: CE (95+97)/2=96, PE (90+92)/2=91 → 187.
+        assert!((atm_straddle(&quotes, 24010.0).unwrap() - 187.0).abs() < 1e-9);
     }
 
     fn filled_leg(opt: OptionType, side: OrderSide, wing: bool) -> FilledLiveLeg {
@@ -1894,14 +2536,23 @@ mod tests {
             underlyings,
             0.065,
             0.0,
-            150_000.0,
-            crate::portfolio::new_shared(150_000.0, 15.0, 25.0, 1),
+            // ₹50k = a compounded-up account that can fund the wide condor lot. At the real ₹15k the
+            // ladder correctly falls to the fly instead — see runtime_falls_to_fly_when_capital...
+            50_000.0,
+            crate::portfolio::new_shared(50_000.0, 15.0, 25.0, 1),
         );
 
+        // Calm chop open: low Efficiency Ratio (oscillates, ends flat) and a ~16pt range that is
+        // small vs the ~162pt ATM straddle — so the elite regime gate admits and the condor opens.
         for (h, m, s, spot) in [
-            (9, 15, 5, 24_090.0),
-            (9, 30, 0, 24_125.0),
-            (9, 45, 0, 24_109.0),
+            (9, 15, 5, 24_100.0),
+            (9, 20, 0, 24_112.0),
+            (9, 25, 0, 24_096.0),
+            (9, 30, 0, 24_108.0),
+            (9, 35, 0, 24_099.0),
+            (9, 40, 0, 24_106.0),
+            // End near the center of the opening range so the fly's stricter balance latent admits.
+            (9, 45, 0, 24_104.0),
         ] {
             store.update(crate::models::Tick {
                 token: 1,
@@ -1919,6 +2570,51 @@ mod tests {
             .expect("paper runtime should open the multi-leg condor");
         assert_eq!(active.structure, SellStructure::Condor);
         assert_eq!(active.legs.len(), 4);
+        assert!(crate::portfolio::is_locked(&engine.shared_circuit));
+    }
+
+    #[tokio::test]
+    async fn runtime_opens_condor_on_15k_via_margin_sizing() {
+        let day = NaiveDate::from_ymd_opt(2026, 6, 23).unwrap();
+        let (contracts, store, underlyings) = runtime_contracts_and_store();
+        // 15k: the 10% risk-fraction SIZE cap is dropped — the condor is now sized by margin
+        // affordability, so a calm open opens the wide condor even on the real account. Downside is
+        // bounded by the 10%-of-capital active stop, not by refusing the trade.
+        let mut engine = MultiLegEngine::new(
+            contracts,
+            store.clone(),
+            underlyings,
+            0.065,
+            0.0,
+            15_000.0,
+            crate::portfolio::new_shared(15_000.0, 15.0, 25.0, 1),
+        );
+        for (h, m, s, spot) in [
+            (9, 15, 5, 24_100.0),
+            (9, 20, 0, 24_112.0),
+            (9, 25, 0, 24_096.0),
+            (9, 30, 0, 24_108.0),
+            (9, 35, 0, 24_099.0),
+            (9, 40, 0, 24_106.0),
+            // Center of the opening range so even the fly's stricter balance latent would admit;
+            // the condor (tried first) opens here purely because margin sizing now funds it.
+            (9, 45, 0, 24_104.0),
+        ] {
+            store.update(crate::models::Tick {
+                token: 1,
+                ltp: spot,
+                mode: crate::models::TickMode::Ltp,
+                ..crate::models::Tick::default()
+            });
+            engine.on_event_at(ist_ms(day, h, m, s)).await;
+        }
+        let active = engine
+            .state
+            .get("NIFTY")
+            .and_then(|s| s.active.as_ref())
+            .expect("margin-affordability sizing should open a condor on the 15k account");
+        assert_eq!(active.structure, SellStructure::Condor);
+        assert!(active.lots >= 1);
         assert!(crate::portfolio::is_locked(&engine.shared_circuit));
     }
 }

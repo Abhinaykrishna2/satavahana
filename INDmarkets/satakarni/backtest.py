@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""satakarni — INTRADAY option-SELLING sandbox (₹150k), theta harvest with compounding.
+"""satakarni — INTRADAY option-SELLING sandbox (₹15k account), theta harvest with compounding.
 
 Intraday only: every position opens AND closes the same session (overnight holds carry
 news/gap risk that breaks the Markov assumption — we never carry). Selling-only here;
@@ -30,26 +30,59 @@ import numpy as np
 import pandas as pd
 
 DATA = Path(__file__).resolve().parent.parent / "data"   # INDmarkets/data
-CAPITAL = 150_000.0
+CAPITAL = 15_000.0     # the real, live account size
 LOT = 65
 WING = 100             # wing width (pts) — the only width that fits the recorded ±5-strike chain
-SIDEWAYS_PCT = 0.0040  # morning 09:16-09:45 range <= 0.40% of spot => sideways => sell premium
+SIDEWAYS_PCT = 0.0040  # (legacy, unused) morning range fraction gate — replaced by ER + range/straddle
+# ── Elite regime gate for a SELLER (a-priori textbook thresholds, NOT tuned to captured days) ──
+# A premium seller's two questions are "is it a genuine range, not a trend?" and "am I paid enough
+# vs what's realizing?" — neither is answered by a directional indicator (RSI/EMA) or a fixed % range.
+ER_CAP = 0.35          # Kaufman efficiency ratio |net|/Σ|step| over the open: > this = trending => skip
+RANGE_STRADDLE_CAP = 0.30  # morning range > 30% of the ATM straddle = realized running hot vs implied => skip
 RISK_FRAC = 0.10       # size each cycle to risk <= 10% of *current* capital as expiry-max-loss
 MAX_LOTS = 5           # hard cap — bounds intraday gamma (expiry-max-loss understates intraday risk)
+OPEN_START = "09:15:05" # skip the noisy open print, but include the real post-open range
 ENTRY = "09:45"        # first entry, after the open warmup
 CUTOFF = "14:30"       # no NEW cycles after this; existing managed to EXIT
 EXIT = "15:15"         # square off — never carry overnight
 REENTRY_GAP_MIN = 2
 MAX_CYCLES_PER_DAY = 1  # one trade/day — on both days re-entry only ever gave back gains (over-trading)
 # Management chosen A-PRIORI from option-selling convention, NOT optimized to the 2 days we have:
+TREND_ER = 0.50        # a-priori trend threshold (Kaufman) for the ENTRY filter (open already trending)
+TREND_EXIT_ER = 99.0   # in-trade trend-exit DISABLED (A/B showed it false-fires on calm days and
+                       # chops winners; the half-gain trail is the validated protection). Matches Rust.
+TREND_ROLL_MIN = 20    # in-trade rolling window (min) for the trend-exit detector
+TRAIL_TRIGGER = 0.15   # half-gain profit trail arms once running gain peaks past +15% of credit
+TRAIL_FRAC = 0.50      # then the stop locks at 50% of the PEAK gain (ratchets up, never down)
 TARGET_FRAC = 0.50     # book at 50% of credit — the industry-standard "manage at 50%" rule
 STOP_FRAC_ML = 0.50    # cut at 50% of DEFINED MAX LOSS — a principled tail cap that actually binds
+STOP_FRAC_CAP = 0.10   # hard rupee stop per cycle = 10% of CURRENT account capital (compounds with it).
+                       # Caps realized loss regardless of lots — the active-stop alternative to limiting
+                       # risk via position size.
                        # (a 2× credit stop never fires when 2×credit > max loss, so trades rode to near-max).
 MOVE_PCT = 0.0025      # SUDDEN-MOVE trim: short premium is short gamma, so a fast realized move in the
 MOVE_WINDOW = 5        # underlying IS the risk — exit when |spot move| over MOVE_WINDOW min exceeds this.
-ENTRY_DRIFT_ZONE_CAP = 0.50  # no entry if the opening range has already consumed >50% of the
-                             # structure's credit-adjusted profit zone.
-MOVE_ZONE_CAP = 0.35         # in-trade trim when a 5m move consumes >35% of that same zone.
+# Structure-specific latent caps. Narrow/high-gamma structures need a cleaner open than a wide
+# condor: less profit-zone consumption, and 09:45 spot should sit near the middle of the opening
+# range rather than at an edge (directional pressure).
+ENTRY_DRIFT_ZONE_CAP = {
+    "condor":  0.50,
+    "tight":   0.45,
+    "fly":     0.45,
+    "widefly": 0.42,
+}
+ENTRY_BALANCE_EDGE_CAP = {
+    "condor":  0.70,
+    "tight":   0.40,
+    "fly":     0.35,
+    "widefly": 0.40,
+}
+MOVE_ZONE_CAP = {
+    "condor":  0.35,
+    "tight":   0.30,
+    "fly":     0.25,
+    "widefly": 0.28,
+}
 # (A dynamic no-arm trailing was tried and REMOVED: with no minimum it fired on micro-noise and
 #  churned the bid/ask spread 20-30×/day — a net loss. Demonstrates why exit-tuning on N=2 backfires.)
 SLIP = 0.003           # adverse slippage if ever priced off a basic (no-book) file
@@ -90,7 +123,7 @@ def load(path):
     return df
 
 def ts(day, hhmm):
-    return pd.Timestamp(f"{day} {hhmm}:00")
+    return pd.Timestamp(f"{day} {hhmm}")
 
 def snapshot(df, t):
     """As-of snapshot: last tick per (strike,option_type) at-or-before t. No look-ahead."""
@@ -111,14 +144,44 @@ def spot_of(df, snap):
     return best
 
 def morning_range_pct(df, day):
-    """Realized spot range over [09:16, ENTRY] / spot. Small => sideways."""
-    t_open, t0 = ts(day, "09:16"), ts(day, ENTRY)
+    """Realized spot range over [OPEN_START, ENTRY] / spot. Small => sideways."""
+    t_open, t0 = ts(day, OPEN_START), ts(day, ENTRY)
     if df.attrs["rich"]:
         sp = df[(df.recv_ts >= t_open) & (df.recv_ts <= t0)]["spot"].replace(0, np.nan).dropna()
         return (sp.max() - sp.min()) / sp.median() if len(sp) >= 2 else None
     spots = [spot_of(df, snapshot(df, ts(day, f"09:{m:02d}"))) for m in range(20, 46, 5)]
     spots = np.array([s for s in spots if s])
     return (spots.max() - spots.min()) / np.median(spots) if len(spots) >= 2 else None
+
+def morning_spot_path(df, day):
+    """1-min spot closes over [OPEN_START, ENTRY] — the only data a 09:45 entry may use (no look-ahead)."""
+    t_open, t0 = ts(day, OPEN_START), ts(day, ENTRY)
+    w = df[(df.recv_ts >= t_open) & (df.recv_ts <= t0)][["recv_ts", "spot"]].copy()
+    w["spot"] = w["spot"].replace(0, np.nan)
+    sp = w.dropna().set_index("recv_ts")["spot"].resample("1min").last().dropna()
+    return sp if len(sp) >= 5 else None
+
+def efficiency_ratio(sp):
+    """Kaufman ER = |net move| / Σ|bar-to-bar move|. ~0 = chop (oscillated, went nowhere => SELL),
+    ~1 = trend (marched one way => stand aside). Distinguishes 'swung 50pt, ended flat' from
+    'trended 50pt straight' — which an absolute range cannot. No warmup; works on ~30 1-min bars."""
+    net = abs(sp.iloc[-1] - sp.iloc[0])
+    path = sp.diff().abs().sum()
+    return (net / path) if path > 0 else 0.0
+
+def atm_straddle(df, day):
+    """ATM straddle premium (pts) at 09:45 = the options' own priced move — a vol-ADAPTIVE yardstick
+    for 'how big is too big', so the gate tightens in calm vol and loosens when a move is already priced."""
+    snap = snapshot(df, ts(day, ENTRY))
+    spot = spot_of(df, snap)
+    if spot is None:
+        return None
+    ks = snap.index.get_level_values(0).unique()
+    K = min(ks, key=lambda k: abs(k - spot))
+    if (K, "CE") not in snap.index or (K, "PE") not in snap.index:
+        return None
+    ce, pe = float(snap.loc[(K, "CE"), "px"]), float(snap.loc[(K, "PE"), "px"])
+    return (ce + pe) if ce > 0 and pe > 0 else None
 
 def fill(rich, row, side):
     if rich:
@@ -185,22 +248,29 @@ def profit_zone(legs, credit):
     return (lower, upper, width) if width > 0 else None
 
 def opening_drift_latent(df, day, t_entry, legs, credit):
-    """Opening-range pressure as a fraction of the structure's own profit zone."""
+    """Opening-range pressure and balance for the structure's own profit zone."""
     zone = profit_zone(legs, credit)
     if zone is None:
         return None
     _lower, _upper, width = zone
-    sp = df[(df.recv_ts >= ts(day, "09:16")) & (df.recv_ts <= t_entry)]["spot"].replace(0, np.nan).dropna()
+    sp = df[(df.recv_ts >= ts(day, OPEN_START)) & (df.recv_ts <= t_entry)]["spot"].replace(0, np.nan).dropna()
     if len(sp) < 2:
         return None
     range_pts = float(sp.max() - sp.min())
+    if range_pts <= 0:
+        range_pos = 0.5
+    else:
+        range_pos = (float(sp.iloc[-1]) - float(sp.min())) / range_pts
+    edge_frac = abs(range_pos - 0.5) * 2.0
     return {
         "range_pts": range_pts,
         "zone_width": width,
         "zone_frac": range_pts / width,
+        "range_pos": range_pos,
+        "edge_frac": edge_frac,
     }
 
-def manage(df, t0, tN, legs, credit, maxloss_u, zone_width):
+def manage(df, t0, tN, legs, credit, maxloss_u, zone_width, kind, lots=1, stop_rupees=float("inf")):
     """Mark-to-mid early-exit management (a-priori, not data-fit). First to fire:
       TARGET : book at TARGET_FRAC of credit.
       STOP   : cut at STOP_FRAC_ML of the DEFINED MAX LOSS (binds, unlike a 2× credit stop).
@@ -221,16 +291,33 @@ def manage(df, t0, tN, legs, credit, maxloss_u, zone_width):
     move_pts = (spot_s - spot_s.shift(MOVE_WINDOW)).abs()
     move_spot = move_pts / spot_s
     move_zone = move_pts / zone_width if zone_width > 0 else move_pts * 0.0
+    peak_gain = 0.0
     for t, g in gain.items():
         if t <= t0:
             continue
-        if move_spot.get(t, 0.0) > MOVE_PCT or move_zone.get(t, 0.0) > MOVE_ZONE_CAP:
+        if move_spot.get(t, 0.0) > MOVE_PCT or move_zone.get(t, 0.0) > MOVE_ZONE_CAP[kind]:
             return t, (
                 f"MOVE {move_spot.get(t, 0.0)*100:.2f}%/{MOVE_WINDOW}m "
                 f"zone {move_zone.get(t, 0.0)*100:.0f}%"
             )
         if g >= TARGET_FRAC * credit:
             return t, f"TARGET {int(TARGET_FRAC*100)}%"
+        # Half-gain profit trail: once the running gain has PEAKED past +TRAIL_TRIGGER of credit,
+        # lock the stop at TRAIL_FRAC of that peak (ratchets up, never down). A winner can give back
+        # at most half its best gain instead of sliding to the -50% disaster stop.
+        peak_gain = max(peak_gain, g)
+        if peak_gain >= TRAIL_TRIGGER * credit and g <= TRAIL_FRAC * peak_gain:
+            return t, f"TRAIL +{TRAIL_FRAC*peak_gain/credit*100:.0f}% (½ of peak +{peak_gain/credit*100:.0f}%)"
+        # In-trade TREND-EXIT: a rolling Efficiency Ratio over the last TREND_ROLL_MIN minutes
+        # (bars <= t only — no look-ahead). Catches a SLOW directional grind the 5-min move-trim
+        # misses. Placed after TARGET so a profitable position banks first; its job is to bound the
+        # loss on a day that drifts into a trend after a calm open (e.g. 06-24), not to make money.
+        if (t - t0) >= pd.Timedelta(minutes=TREND_ROLL_MIN):
+            win = spot_s.loc[t - pd.Timedelta(minutes=TREND_ROLL_MIN):t]
+            if len(win) >= 5 and efficiency_ratio(win) >= TREND_EXIT_ER:
+                return t, f"TREND ER {efficiency_ratio(win):.2f}/{TREND_ROLL_MIN}m"
+        if g * LOT * lots <= -stop_rupees:
+            return t, f"STOP ₹{stop_rupees:.0f} (10% cap)"
         if g <= -STOP_FRAC_ML * maxloss_u:
             return t, f"STOP {int(STOP_FRAC_ML*100)}%ML"
     return tN, "15:15"
@@ -252,16 +339,24 @@ def run_cycle(df, day, t_entry, kind, cap):
     latent = opening_drift_latent(df, day, t_entry, legs, credit)
     if latent is None:
         return None, "insufficient drift-latent data"
-    if latent["zone_frac"] > ENTRY_DRIFT_ZONE_CAP:
+    zone_cap = ENTRY_DRIFT_ZONE_CAP[kind]
+    if latent["zone_frac"] > zone_cap:
         return None, (
-            f"DRIFT-ZONE {latent['zone_frac']*100:.0f}% > {ENTRY_DRIFT_ZONE_CAP*100:.0f}% "
+            f"DRIFT-ZONE {latent['zone_frac']*100:.0f}% > {zone_cap*100:.0f}% "
             f"(range {latent['range_pts']:.0f} / zone {latent['zone_width']:.0f})"
         )
-    lots = min(MAX_LOTS, int((cap * RISK_FRAC) // (maxloss_u * LOT)))
+    edge_cap = ENTRY_BALANCE_EDGE_CAP[kind]
+    if latent["edge_frac"] > edge_cap:
+        return None, (
+            f"RANGE-BALANCE edge {latent['edge_frac']*100:.0f}% > {edge_cap*100:.0f}% "
+            f"(09:45 pos {latent['range_pos']*100:.0f}% of opening range)"
+        )
+    lots = min(MAX_LOTS, int(cap // (maxloss_u * LOT)))  # EXPERIMENT: 10% RISK_FRAC dropped — size by margin affordability
     if lots == 0:
-        return None, "risk budget can't fund one lot"  # never force a lot; matches Rust size_lots
+        return None, "margin can't fund one lot"
     margin = maxloss_u * LOT * lots
-    t_exit, why = manage(df, t_entry, ts(day, EXIT), legs, credit, maxloss_u, latent["zone_width"])
+    t_exit, why = manage(df, t_entry, ts(day, EXIT), legs, credit, maxloss_u, latent["zone_width"], kind,
+                         lots, cap * STOP_FRAC_CAP)
     res = pnl(df, snapshot(df, t_entry), snapshot(df, t_exit), legs, lots)
     if res is None:
         return None, "missing entry/exit marks"
@@ -271,12 +366,24 @@ def run_cycle(df, day, t_entry, kind, cap):
 
 def sell_intraday(df, day, kind, start_cap):
     """One day of intraday-compounded selling, sized off `start_cap`. Returns a result dict."""
-    rng = morning_range_pct(df, day)
-    base = dict(day=day, kind=kind, start_cap=start_cap, end_cap=start_cap, day_pnl=0.0, traded=False, rng=rng)
-    if rng is None:
+    base = dict(day=day, kind=kind, start_cap=start_cap, end_cap=start_cap, day_pnl=0.0,
+                traded=False, rng=None, er=None, rvs=None)
+    sp = morning_spot_path(df, day)
+    straddle = atm_straddle(df, day)
+    if sp is None or straddle is None or straddle <= 0:
         return {**base, "reason": "insufficient morning data"}
-    if rng > SIDEWAYS_PCT:
-        return {**base, "reason": f"TRENDING {rng*100:.2f}% > {SIDEWAYS_PCT*100:.2f}% — stand aside"}
+    er = efficiency_ratio(sp)
+    range_pts = float(sp.max() - sp.min())
+    rng = range_pts / float(sp.median())
+    rvs = range_pts / straddle
+    base.update(rng=rng, er=er, rvs=rvs)
+    # LIGHT entry filter only — protection now lives in the IN-TRADE trend-exit, not the gate. Block
+    # only an open that is ALREADY clearly trending; everything else enters and is managed out by the
+    # rolling-ER trend-detector (so a day like 06-23 enters and banks via TARGET, instead of being
+    # skipped). The range/straddle gate is intentionally dropped — it was the entry filter that
+    # blocked 06-23.
+    if er > TREND_ER:
+        return {**base, "reason": f"OPEN already trending: ER {er:.2f} > {TREND_ER:.2f} — stand aside"}
     cap, t, cyc, last_reason = start_cap, ts(day, ENTRY), [], None
     while t < ts(day, CUTOFF):
         c, reason = run_cycle(df, day, t, kind, cap)
@@ -299,8 +406,8 @@ def sell_intraday(df, day, kind, start_cap):
 def format_day(r):
     if not r["traded"]:
         return f"  {r['day']}: {r.get('reason', '-')}"
-    head = (f"  {r['day']}  SIDEWAYS {r['rng']*100:.2f}%  spot≈{r['spot']:.0f}  {r['n_cycles']} cyc  "
-            f"day ₹{r['day_pnl']:+,.0f}  cap ₹{r['end_cap']:,.0f}")
+    head = (f"  {r['day']}  CHOP ER {r['er']:.2f} | rng {r['rvs']:.0%} of straddle  spot≈{r['spot']:.0f}  "
+            f"{r['n_cycles']} cyc  day ₹{r['day_pnl']:+,.0f}  cap ₹{r['end_cap']:,.0f}")
     rows = [f"     {i}. {c['t0'].strftime('%H:%M')}->{c['t1'].strftime('%H:%M')} x{c['lots']}lot "
             f"cr{c['credit']:.0f}/u maxloss ₹{c['margin']:,.0f} "
             f"driftZ {c['drift_zone']*100:.0f}% [{c['why']}] net ₹{c['net']:+,.0f}"
