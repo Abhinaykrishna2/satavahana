@@ -4778,9 +4778,10 @@ impl OptionsEngine {
         // Hard close-all at 15:20 IST regardless of confidence.
         let hard_close_all = close_ist_mins >= 920;
 
-        // One-shot profit lock-in: once the option is +15% and has held at least 3 minutes,
-        // move the stop once to roughly entry+2%, then stop trailing. This avoids chopping a
-        // live trend while still preventing a winner from becoming a loser.
+        // Two-stage profit protection (same code path for live + backtest):
+        //   • +12% gain (≥3-min hold): one-shot lock — stop → entry+2%, governs the +12–15% zone.
+        //   • +15%+ : half-of-peak trail — stop ratchets to (entry+peak)/2, i.e. give back at most
+        //     50% of the peak gain before closing (mirrors the multi-leg trail).
         let now_ms = self.current_time_ms();
         for i in 0..self.positions.len() {
             let (is_open, option_token, entry_price, entry_time_ms) = {
@@ -4822,6 +4823,34 @@ impl OptionsEngine {
                     pos.breakeven_stop_set = true;
                     pos.checkpoints_evaluated = 3;
                     info!("  Profit-lock +{:.1}%: pos #{} {} stop → ₹{:.2} (entry+2%), free-flow to target (ltp ₹{:.2})",
+                        abs_gain_pct, pos.id, pos.underlying, pos.stop_price, current_price);
+                }
+            }
+
+            // +15% half-of-peak trail (mirrors the multi-leg trail exactly: arm at 0.15, give
+            // back 0.50 of peak). Once the option reaches +15%, ratchet the stop to halfway
+            // between entry and the current price = give back at most 50% of the PEAK gain before
+            // closing. The `> stop_price` guard makes it a one-way ratchet: it locks the running
+            // peak (when current == peak the midpoint is highest and is stored) and never lowers,
+            // so a pullback can only hit it, not reset it. Sits ABOVE the +2% lock; the strategy
+            // target still caps the upside.
+            // No time gate (matches multileg::trail_exits, which arms purely on the peak
+            // threshold) — a sub-3-min spike-then-crash is still protected. The +15% trigger is
+            // itself the noise filter.
+            if abs_gain_pct >= 15.0 {
+                let pos = &mut self.positions[i];
+                let raw_trail = (entry_price + current_price) / 2.0;
+                // Never park the trail on/above a tight target (the target fires first anyway) —
+                // same guard the +2% lock uses.
+                let trail_stop = if pos.target_price > entry_price {
+                    raw_trail.min((pos.target_price * 0.995).max(entry_price))
+                } else {
+                    raw_trail
+                };
+                if trail_stop > pos.stop_price {
+                    pos.stop_price = trail_stop;
+                    pos.checkpoints_evaluated = pos.checkpoints_evaluated.max(3);
+                    info!("  Trail +{:.1}% (50%-of-peak): pos #{} {} stop → ₹{:.2} (ltp ₹{:.2})",
                         abs_gain_pct, pos.id, pos.underlying, pos.stop_price, current_price);
                 }
             }
@@ -5186,40 +5215,53 @@ mod tests {
     }
 
     #[test]
-    fn one_shot_profit_lock_arms_once_and_does_not_choke_runner() {
+    fn trail_arms_without_time_gate_and_keeps_half_of_peak() {
         let store = TickStore::new();
         let mut engine = test_engine_with_store(store.clone());
-        let mut pos = test_position(false);
+        let mut pos = test_position(false);   // entry 100, initial stop 85 (-15%)
+        pos.target_price = 140.0;             // far target so the trail (not target) governs
+        engine.positions.push(pos);
+
+        // +16% at only 1 min held: the trail arms immediately — NO time gate (uniform with
+        // multileg::trail_exits). stop = (100+116)/2 = 108 = give back 50% of the +16% peak.
+        // The +12% lock stays 3-min-gated, so breakeven_stop_set is still false here.
+        store.update(Tick { token: 101, ltp: 116.0, mode: TickMode::Ltp, ..Tick::default() });
+        engine.set_clock_override_ms(60_000);
+        engine.check_open_positions();
+        assert!((engine.positions[0].stop_price - 108.0).abs() < 1e-9, "trail arms with no time gate");
+        assert_eq!(engine.positions[0].checkpoints_evaluated, 3);
+        assert!(!engine.positions[0].breakeven_stop_set, "lock is still time-gated; only the trail fired");
+        assert!(engine.positions[0].is_open, "trail must not close a live runner");
+
+        // +26%: trail ratchets up → (100+126)/2 = 113.
+        store.update(Tick { token: 101, ltp: 126.0, mode: TickMode::Ltp, ..Tick::default() });
+        engine.set_clock_override_ms(4 * 60_000);
+        engine.check_open_positions();
+        assert!((engine.positions[0].stop_price - 113.0).abs() < 1e-9, "trail ratchets up with the peak");
+        assert!(engine.positions[0].is_open);
+
+        // pullback to +18%: one-way ratchet holds the stop at 113; still open (118 > 113).
+        store.update(Tick { token: 101, ltp: 118.0, mode: TickMode::Ltp, ..Tick::default() });
+        engine.set_clock_override_ms(5 * 60_000);
+        engine.check_open_positions();
+        assert!((engine.positions[0].stop_price - 113.0).abs() < 1e-9, "trail never lowers");
+        assert!(engine.positions[0].is_open);
+    }
+
+    #[test]
+    fn lock_arms_in_12_to_15_zone() {
+        let store = TickStore::new();
+        let mut engine = test_engine_with_store(store.clone());
+        let mut pos = test_position(false);   // entry 100, initial stop 85
         pos.target_price = 140.0;
         engine.positions.push(pos);
 
-        store.update(Tick {
-            token: 101,
-            ltp: 116.0,
-            mode: TickMode::Ltp,
-            ..Tick::default()
-        });
-        engine.set_clock_override_ms(2 * 60_000);
-        engine.check_open_positions();
-        assert!((engine.positions[0].stop_price - 85.0).abs() < 1e-9, "no lock before 3 minutes");
-        assert!(!engine.positions[0].breakeven_stop_set);
-
+        // +13% (≥3 min), never reached +15%: one-shot lock to entry+2% (102); trail NOT armed.
+        store.update(Tick { token: 101, ltp: 113.0, mode: TickMode::Ltp, ..Tick::default() });
         engine.set_clock_override_ms(4 * 60_000);
         engine.check_open_positions();
-        assert!((engine.positions[0].stop_price - 102.0).abs() < 1e-9, "+15% arms entry+2% lock");
+        assert!((engine.positions[0].stop_price - 102.0).abs() < 1e-9, "+13% arms the entry+2% lock");
         assert!(engine.positions[0].breakeven_stop_set);
-        assert_eq!(engine.positions[0].checkpoints_evaluated, 3);
-        assert!(engine.positions[0].is_open, "profit lock should not close a runner by itself");
-
-        store.update(Tick {
-            token: 101,
-            ltp: 126.0,
-            mode: TickMode::Ltp,
-            ..Tick::default()
-        });
-        engine.set_clock_override_ms(5 * 60_000);
-        engine.check_open_positions();
-        assert!((engine.positions[0].stop_price - 102.0).abs() < 1e-9, "one-shot lock must not keep trailing");
         assert!(engine.positions[0].is_open);
     }
 

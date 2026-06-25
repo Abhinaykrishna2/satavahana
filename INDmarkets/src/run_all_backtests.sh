@@ -3,9 +3,10 @@ set -e
 cd "$(dirname "$0")"
 
 echo "=== Single-Leg Options Backtests (Rust) ==="
-for file in ../data/*_options_ticks.csv; do
+for file in ../data/*_options_ticks.csv ../data/*_options_ticks.csv.gz; do
+    [ -e "$file" ] || continue          # glob may not match if all files are (un)compressed
     base=$(basename "$file")
-    if [[ "$base" == *"_trim.csv" ]]; then
+    if [[ "$base" == *"_trim."* ]]; then
         continue
     fi
     echo "--- $base ---"

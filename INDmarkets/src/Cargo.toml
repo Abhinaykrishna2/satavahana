@@ -45,6 +45,9 @@ toml = "0.8"
 # CSV parsing
 csv = "1"
 
+# Gzip (read .csv.gz tick archives directly in backtests)
+flate2 = "1"
+
 # Lock-free concurrent map
 dashmap = "6"
 

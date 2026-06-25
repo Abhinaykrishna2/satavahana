@@ -83,45 +83,6 @@ fn exit_px(leg: &PlannedLeg, q: &StrikeQuote) -> f64 {
     }
 }
 
-fn last_underlying_spot(rows: &[TickRow], t: NaiveDateTime) -> Option<f64> {
-    rows.iter()
-        .rev()
-        .find(|r| r.ts <= t && r.spot.is_finite() && r.spot > 0.0)
-        .map(|r| r.spot)
-}
-
-fn minute_spot_series(rows: &[TickRow], t0: NaiveDateTime, t1: NaiveDateTime) -> Vec<(NaiveDateTime, f64)> {
-    let mut out = Vec::new();
-    let mut h = t0.hour();
-    let mut m = t0.minute();
-    let mut last = last_underlying_spot(rows, t0).unwrap_or(0.0);
-    loop {
-        let t = t0
-            .date()
-            .and_time(NaiveTime::from_hms_opt(h, m, 0).unwrap());
-        if t > t1 {
-            break;
-        }
-        if t >= t0 {
-            if let Some(s) = last_underlying_spot(rows, t) {
-                last = s;
-            }
-            if last > 0.0 {
-                out.push((t, last));
-            }
-        }
-        if h == t1.hour() && m == t1.minute() {
-            break;
-        }
-        m += 1;
-        if m >= 60 {
-            m = 0;
-            h += 1;
-        }
-    }
-    out
-}
-
 fn snapshot_at(rows: &[TickRow], t: NaiveDateTime) -> Option<(f64, Vec<StrikeQuote>)> {
     let mut by_strike: BTreeMap<i64, (Option<&TickRow>, Option<&TickRow>)> = BTreeMap::new();
     let mut last_spot = 0.0_f64;
@@ -297,61 +258,107 @@ fn manage(
     t_entry: NaiveDateTime,
     plan: &Plan,
     capital: f64,
+    entry_quotes: &[StrikeQuote],
 ) -> (NaiveDateTime, String) {
     let t_exit = ts(day, "15:15");
     let mut peak_gain = 0.0_f64;
     let stop_rupees = STOP_FRAC_CAP * capital;
-    let minute_spots = minute_spot_series(rows, t_entry, t_exit);
 
-    for (i, (t, spot_now)) in minute_spots.iter().enumerate() {
-        if *t <= t_entry {
+    // Single O(n) forward pass: evaluate stop/target/trail/move on EVERY recorded tick (one eval
+    // per distinct timestamp) — exact parity with live `manage_active`, which runs on every market
+    // event with no throttle. (The old minute-sampled loop booked a fast stop up to a minute late,
+    // overstating the realized loss; rebuilding the chain per tick via snapshot_at was O(n²).)
+    let plan_keys: std::collections::HashSet<i64> = plan
+        .legs
+        .iter()
+        .map(|l| (l.strike * 1000.0).round() as i64)
+        .collect();
+    let mut by_strike: std::collections::BTreeMap<i64, (Option<(f64, f64, f64)>, Option<(f64, f64, f64)>)> =
+        std::collections::BTreeMap::new();
+    let mut spot = 0.0_f64;
+    let mut spot_hist: Vec<(NaiveDateTime, f64)> = Vec::new();
+    let mut mv = 0usize; // pointer to the latest spot_hist entry ≤ t − MOVE_WINDOW_MIN
+
+    let mut idx = 0usize;
+    while idx < rows.len() {
+        let t = rows[idx].ts;
+        if t > t_exit {
+            break;
+        }
+        // Fold every row stamped at this tick into the running leg-quote state.
+        while idx < rows.len() && rows[idx].ts == t {
+            let r = &rows[idx];
+            if r.spot.is_finite() && r.spot > 0.0 {
+                spot = r.spot;
+            }
+            let key = (r.strike * 1000.0).round() as i64;
+            if plan_keys.contains(&key) {
+                let e = by_strike.entry(key).or_insert((None, None));
+                let q = (r.bid, r.ask, r.delta);
+                match r.opt {
+                    OptionType::CE => e.0 = Some(q),
+                    OptionType::PE => e.1 = Some(q),
+                }
+            }
+            idx += 1;
+        }
+        if t <= t_entry || spot <= 0.0 {
             continue;
         }
-        let Some((_spot, quotes)) = snapshot_at(rows, *t) else {
-            continue;
-        };
+
+        let quotes: Vec<StrikeQuote> = by_strike
+            .iter()
+            .filter_map(|(k, (ce, pe))| {
+                let (cb, ca, cd) = (*ce)?;
+                let (pb, pa, pd) = (*pe)?;
+                Some(StrikeQuote {
+                    strike: *k as f64 / 1000.0,
+                    ce_delta: cd,
+                    pe_delta: pd,
+                    ce_bid: cb,
+                    ce_ask: ca,
+                    pe_bid: pb,
+                    pe_ask: pa,
+                })
+            })
+            .collect();
         let close_cost = combo_close_cost(&plan.legs, &quotes).unwrap_or(plan.credit);
         let gain = plan.credit - close_cost;
 
-        // Rolling calendar-minute move on underlying spot (matches live `MOVE_WINDOW_MIN`).
-        if let Some((t_prev, spot_prev)) = minute_spots
-            .iter()
-            .rev()
-            .find(|(ts, _)| *ts <= *t - chrono::Duration::minutes(MOVE_WINDOW_MIN as i64))
-        {
-            let move_pts = (spot_now - spot_prev).abs();
-            if move_trims(move_pts, *spot_now, plan.zone_width, plan.structure) {
-                return (
-                    *t,
-                    format!(
-                        "MOVE {:.2}%/{MOVE_WINDOW_MIN}m",
-                        move_pts / spot_now * 100.0
-                    ),
-                );
+        // Rolling MOVE_WINDOW_MIN move on underlying spot (matches live), via a monotonic pointer.
+        spot_hist.push((t, spot));
+        let cutoff = t - chrono::Duration::minutes(MOVE_WINDOW_MIN as i64);
+        while mv + 1 < spot_hist.len() && spot_hist[mv + 1].0 <= cutoff {
+            mv += 1;
+        }
+        if spot_hist[mv].0 <= cutoff {
+            let move_pts = (spot - spot_hist[mv].1).abs();
+            if move_trims(move_pts, spot, plan.zone_width, plan.structure) {
+                return (t, format!("MOVE {:.2}%/{MOVE_WINDOW_MIN}m", move_pts / spot * 100.0));
             }
-            let _ = (i, t_prev);
         }
 
         if gain >= TARGET_FRAC * plan.credit {
-            return (*t, format!("TARGET {:.0}%", TARGET_FRAC * 100.0));
+            return (t, format!("TARGET {:.0}%", TARGET_FRAC * 100.0));
         }
-
         peak_gain = peak_gain.max(gain);
         if trail_exits(gain, peak_gain, plan.credit) {
             return (
-                *t,
-                format!(
-                    "TRAIL +{:.0}%",
-                    crate::multileg::TRAIL_FRAC * peak_gain / plan.credit * 100.0
-                ),
+                t,
+                format!("TRAIL +{:.0}%", crate::multileg::TRAIL_FRAC * peak_gain / plan.credit * 100.0),
             );
         }
-
-        if gain * LOT_SIZE as f64 * plan.lots as f64 <= -stop_rupees {
-            return (*t, format!("STOP ₹{stop_rupees:.0} (10% cap)"));
+        // Hard rupee stop on the NET (post-cost) P&L the exit would actually realize — so the
+        // booked loss lands at 10% of capital, not 10%+costs+slippage. Same realized formula
+        // (pnl) used at the real exit; live mirrors this via realized_pnl in manage_active.
+        let t_ms = t.and_utc().timestamp_millis() as u64;
+        if let Some((net, _g, _c)) = pnl(&plan.legs, entry_quotes, &quotes, plan.lots, t_ms) {
+            if net <= -stop_rupees {
+                return (t, format!("STOP ₹{stop_rupees:.0} (10% cap, net)"));
+            }
         }
         if gain <= -STOP_FRAC_ML * plan.max_loss_unit {
-            return (*t, format!("STOP {:.0}%ML", STOP_FRAC_ML * 100.0));
+            return (t, format!("STOP {:.0}%ML", STOP_FRAC_ML * 100.0));
         }
     }
 
@@ -359,7 +366,7 @@ fn manage(
 }
 
 pub(crate) fn load_selling_ticks(path: &Path) -> Result<(NaiveDate, Vec<TickRow>), String> {
-    let mut rdr = csv::Reader::from_path(path).map_err(|e| e.to_string())?;
+    let mut rdr = crate::open_csv(path).map_err(|e| e.to_string())?;
     let headers = rdr.headers().map_err(|e| e.to_string())?.clone();
     let idx = |name: &str| headers.iter().position(|h| h == name).ok_or_else(|| format!("missing col {name}"));
     let i_ts = idx("recv_ts")?;
@@ -393,6 +400,9 @@ pub(crate) fn load_selling_ticks(path: &Path) -> Result<(NaiveDate, Vec<TickRow>
             delta: rec.get(i_delta).unwrap_or("0").parse().unwrap_or(0.0),
         });
     }
+    // manage()'s single-pass per-tick walk (and snapshot_at's early break) assume time order.
+    // The recorder writes ascending recv_ts, but make the invariant explicit and cheap to hold.
+    rows.sort_by(|a, b| a.ts.cmp(&b.ts));
     Ok((day.ok_or("empty file")?, rows))
 }
 
@@ -410,7 +420,9 @@ pub(crate) fn replay_day(rows: &[TickRow], day: NaiveDate, mut capital: f64) -> 
         skip_reason: None,
     };
 
-    if !weekday_allows(day.weekday()) {
+    // ponytail: env bypass for "what-if any weekday" backtests; live/default stays Mon/Tue.
+    let any_weekday = std::env::var("SATA_ML_ANY_WEEKDAY").is_ok();
+    if !any_weekday && !weekday_allows(day.weekday()) {
         return (
             MultilegDayResult {
                 skip_reason: Some(format!("weekday {:?} not Mon/Tue", day.weekday())),
@@ -539,7 +551,6 @@ pub(crate) fn replay_day(rows: &[TickRow], day: NaiveDate, mut capital: f64) -> 
     };
     let plan = candidates.into_iter().find(|p| p.structure == best_s).unwrap();
 
-    let (t_out, why) = manage(rows, day, t_entry, &plan, capital);
     let Some((_s, q_e)) = snapshot_at(rows, t_entry) else {
         return (
             MultilegDayResult {
@@ -550,6 +561,7 @@ pub(crate) fn replay_day(rows: &[TickRow], day: NaiveDate, mut capital: f64) -> 
             capital,
         );
     };
+    let (t_out, why) = manage(rows, day, t_entry, &plan, capital, &q_e);
     let Some((_s, q_x)) = snapshot_at(rows, t_out) else {
         return (
             MultilegDayResult {
@@ -630,5 +642,121 @@ mod tests {
         assert!(!r.traded);
         assert!(r.skip_reason.as_ref().unwrap().contains("Wed"));
         assert_eq!(cap, 15_000.0);
+    }
+
+    // Exercises the per-tick manage() loop's MOVE-exit path (untested by the 3 sample days, none of
+    // which trip MOVE): the monotonic spot pointer + plan-key quote accumulation must detect a
+    // >MOVE_PCT underlying move across the 2-min window and exit on the right tick.
+    #[test]
+    fn manage_move_exit_fires_on_per_tick_pass() {
+        let day = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
+        let t_entry = ts(day, "09:45");
+
+        // Condor legs; quotes fixed at bid 10 / ask 30 both sides so close_cost = credit (gain 0)
+        // every tick — only MOVE can fire (target/stop stay dormant).
+        let legs = vec![
+            PlannedLeg { strike: 23900.0, opt: OptionType::PE, side: OrderSide::Sell, wing: false },
+            PlannedLeg { strike: 23800.0, opt: OptionType::PE, side: OrderSide::Buy, wing: true },
+            PlannedLeg { strike: 24100.0, opt: OptionType::CE, side: OrderSide::Sell, wing: false },
+            PlannedLeg { strike: 24200.0, opt: OptionType::CE, side: OrderSide::Buy, wing: true },
+        ];
+        let plan = Plan {
+            structure: SellStructure::Condor,
+            legs,
+            credit: 40.0, // shorts 30 each − wings 10 each = +40 collected (matches the quotes below)
+            max_loss_unit: 60.0,
+            zone_width: 200.0,
+            lots: 3,
+            score: 1.0,
+        };
+
+        // Zero-spread quotes priced so credit/gain AND net all stay flat (only MOVE can fire): shorts
+        // 30, wings 10 → combo credit = 40 = plan.credit, gain 0, net ≈ −costs (well above −1500 stop).
+        let price = |k: f64| if k == 23900.0 || k == 24100.0 { 30.0 } else { 10.0 };
+        let strikes = [23900.0, 23800.0, 24100.0, 24200.0];
+        let entry_quotes: Vec<StrikeQuote> = strikes
+            .iter()
+            .map(|&k| StrikeQuote {
+                strike: k,
+                ce_delta: 0.2,
+                pe_delta: -0.2,
+                ce_bid: price(k),
+                ce_ask: price(k),
+                pe_bid: price(k),
+                pe_ask: price(k),
+            })
+            .collect();
+
+        // Spot flat at 24000 through 09:46:30, then a +100pt (0.42% > MOVE_PCT 0.25%) thrust by
+        // 09:47:30 — the 2-min window (cutoff 09:45:30) sees 24000 → 24100.
+        let bar = |secs: i64, spot: f64| -> Vec<TickRow> {
+            let t = t_entry + chrono::Duration::seconds(secs);
+            let mut out = Vec::new();
+            for &k in &strikes {
+                for opt in [OptionType::CE, OptionType::PE] {
+                    out.push(TickRow { ts: t, strike: k, opt, spot, bid: price(k), ask: price(k), delta: 0.2 });
+                }
+            }
+            out
+        };
+        let mut rows = Vec::new();
+        for (secs, spot) in [(0i64, 24000.0), (30, 24000.0), (60, 24000.0), (90, 24030.0), (120, 24060.0), (150, 24100.0)] {
+            rows.extend(bar(secs, spot));
+        }
+
+        let (t_out, why) = manage(&rows, day, t_entry, &plan, 15_000.0, &entry_quotes);
+        assert!(why.starts_with("MOVE"), "expected MOVE exit, got {why:?}");
+        assert_eq!(t_out, t_entry + chrono::Duration::seconds(150), "MOVE must fire on the +100pt tick");
+    }
+
+    // The hard stop must trigger on NET (post-cost) P&L, not gross, so the booked loss lands at the
+    // 10%-of-capital cap. Shorts blow out 30→60 (wings flat); net loss clears −1500 → "10% cap, net".
+    #[test]
+    fn rupee_stop_triggers_on_net_pnl() {
+        let day = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
+        let t_entry = ts(day, "09:45");
+        let legs = vec![
+            PlannedLeg { strike: 23900.0, opt: OptionType::PE, side: OrderSide::Sell, wing: false },
+            PlannedLeg { strike: 23800.0, opt: OptionType::PE, side: OrderSide::Buy, wing: true },
+            PlannedLeg { strike: 24100.0, opt: OptionType::CE, side: OrderSide::Sell, wing: false },
+            PlannedLeg { strike: 24200.0, opt: OptionType::CE, side: OrderSide::Buy, wing: true },
+        ];
+        let plan = Plan {
+            structure: SellStructure::Condor,
+            legs,
+            credit: 40.0,
+            max_loss_unit: 60.0,
+            zone_width: 200.0,
+            lots: 3,
+            score: 1.0,
+        };
+        let strikes = [23900.0, 23800.0, 24100.0, 24200.0];
+        let mk = |k: f64, short_px: f64| StrikeQuote {
+            strike: k,
+            ce_delta: 0.2,
+            pe_delta: -0.2,
+            ce_bid: if k == 24100.0 { short_px } else { 10.0 },
+            ce_ask: if k == 24100.0 { short_px } else { 10.0 },
+            pe_bid: if k == 23900.0 { short_px } else { 10.0 },
+            pe_ask: if k == 23900.0 { short_px } else { 10.0 },
+        };
+        let entry_quotes: Vec<StrikeQuote> = strikes.iter().map(|&k| mk(k, 30.0)).collect();
+
+        // spot flat (no MOVE); shorts marked at 60 → per-unit gain −40, net far past −1500.
+        let mut rows = Vec::new();
+        for secs in [0i64, 30] {
+            let t = t_entry + chrono::Duration::seconds(secs);
+            let short_px = if secs == 0 { 30.0 } else { 60.0 };
+            for &k in &strikes {
+                let p_ce = if k == 24100.0 { short_px } else { 10.0 };
+                let p_pe = if k == 23900.0 { short_px } else { 10.0 };
+                rows.push(TickRow { ts: t, strike: k, opt: OptionType::CE, spot: 24000.0, bid: p_ce, ask: p_ce, delta: 0.2 });
+                rows.push(TickRow { ts: t, strike: k, opt: OptionType::PE, spot: 24000.0, bid: p_pe, ask: p_pe, delta: 0.2 });
+            }
+        }
+
+        let (t_out, why) = manage(&rows, day, t_entry, &plan, 15_000.0, &entry_quotes);
+        assert!(why.contains("net"), "stop must be the net-based 10% cap, got {why:?}");
+        assert_eq!(t_out, t_entry + chrono::Duration::seconds(30));
     }
 }

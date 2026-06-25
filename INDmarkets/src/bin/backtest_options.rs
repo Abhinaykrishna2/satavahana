@@ -265,7 +265,7 @@ fn infer_lot_sizes_from_csv(
     i_last_qty: usize,
 ) -> Result<HashMap<u32, u32>, Box<dyn Error>> {
     let mut qty_gcd: HashMap<u32, u32> = HashMap::new();
-    let mut rdr = csv::Reader::from_path(options_csv)?;
+    let mut rdr = satavahana::open_csv(options_csv)?;
     for rec in rdr.records() {
         let rec = rec?;
         let token = parse_u32(&rec, i_token);
@@ -378,7 +378,7 @@ fn summarize_trades(trades_csv: &Path) -> Result<(TradeSummary, Vec<TradeDetail>
 fn build_contracts(options_csv: &Path) -> Result<Vec<OptionContract>, Box<dyn Error>> {
     // Resolve column indices from CSV headers (needed for both passes).
     let headers = {
-        let mut rdr = csv::Reader::from_path(options_csv)?;
+        let mut rdr = satavahana::open_csv(options_csv)?;
         rdr.headers()?.clone()
     };
 
@@ -396,7 +396,7 @@ fn build_contracts(options_csv: &Path) -> Result<Vec<OptionContract>, Box<dyn Er
 
     // Pass 2: build one OptionContract per token.
     let mut contracts: HashMap<u32, OptionContract> = HashMap::new();
-    let mut rdr = csv::Reader::from_path(options_csv)?;
+    let mut rdr = satavahana::open_csv(options_csv)?;
     // skip re-reading headers (already cloned above)
     let _ = rdr.headers()?;
 
@@ -562,7 +562,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let replay_day = replay_date.as_deref()
             .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
             .or_else(|| {
-                let mut peek = csv::Reader::from_path(&options_file).ok()?;
+                let mut peek = satavahana::open_csv(&options_file).ok()?;
                 let hdrs = peek.headers().ok()?.clone();
                 let i = col_idx(&hdrs, "recv_ts").ok()?;
                 let rec = peek.records().next()?.ok()?;
@@ -592,7 +592,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     engine.set_execution_fill_offsets(cli.fill_offset_inr, cli.fill_offset_inr);
 
-    let mut rdr = csv::Reader::from_path(&options_file)?;
+    let mut rdr = satavahana::open_csv(&options_file)?;
     let headers = rdr.headers()?.clone();
 
     let i_ts = col_idx(&headers, "recv_ts")?;
