@@ -13,7 +13,7 @@ fn print_usage(bin: &str) {
          \n\
          Replays *_option_selling_ticks.csv (bid/ask + greeks required).\n\
          Picks the best structure per day via opening-regime indicators (matches live).\n\
-         One multi-leg trade/day; Mon/Tue weekday gate matches live.\n\
+         One multi-leg trade/day; 0/1-DTE open, far-DTE confirmed-sideways gate matches live.\n\
          \n\
          Examples:\n\
            {bin} ../data/2026-06-23_option_selling_ticks.csv\n\
@@ -134,7 +134,7 @@ fn main() {
     println!("Starting capital    : ₹{start_cap:.2}");
     println!("Days replayed       : {}", summary.days.len());
     println!("Regime picker       : Condor | Tight | Fly | WideFly (best score)");
-    println!("Trades/day cap      : 1 (Mon/Tue only, matches live)\n");
+    println!("Trades/day cap      : 1 (0/1-DTE open; far-DTE confirmed-sideways gate)\n");
 
     for d in &summary.days {
         println!("{}", format_day(d));

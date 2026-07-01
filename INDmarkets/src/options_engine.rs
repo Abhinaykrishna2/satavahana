@@ -837,6 +837,10 @@ pub struct OptionsEngine {
     order_tag_prefix: String,
     pending_entry_orders: Vec<PendingEntryOrder>,
     pending_exit_orders: Vec<PendingExitOrder>,
+    /// Per-position consecutive zero-fill exit-order failures. Bounds resubmission so a
+    /// persistently-rejected exit (e.g. a funds/margin reject, which on a CLOSE proves the
+    /// broker holds no inventory) can never spray the broker forever.
+    exit_failures: HashMap<u64, u32>,
     pending_capital_reserved: f64,
     max_concurrent_positions: usize,
     entry_order_timeout_ms: u64,
@@ -944,6 +948,7 @@ impl OptionsEngine {
             order_tag_prefix: "SATA".to_string(),
             pending_entry_orders: Vec::new(),
             pending_exit_orders: Vec::new(),
+            exit_failures: HashMap::new(),
             pending_capital_reserved: 0.0,
             max_concurrent_positions: 4,
             entry_order_timeout_ms: 4 * 60 * 1_000,
@@ -1286,6 +1291,38 @@ impl OptionsEngine {
             self.handle_exit_order_update(idx, update);
             return;
         }
+        // No pending order matched this tag. A COMPLETE on an EXIT tag here means the pending
+        // record was already removed (e.g. a duplicate CANCELLED for the same per-position tag)
+        // before the fallback order's fill arrived — the position is flat at the broker. Close
+        // it by pos_id so the engine never resubmits a phantom (naked) exit.
+        self.reconcile_orphaned_exit_fill(&update);
+    }
+
+    /// Parse the position id out of an EXIT order tag (`{prefix}EXIT{pos_id}`).
+    fn pos_id_from_exit_tag(&self, tag: &str) -> Option<u64> {
+        let prefix = format!("{}EXIT", self.order_tag_prefix);
+        tag.strip_prefix(&prefix)?.parse().ok()
+    }
+
+    /// Close a position whose exit order filled but whose pending record was already gone.
+    fn reconcile_orphaned_exit_fill(&mut self, update: &OrderUpdate) {
+        let status = update.status.as_deref().unwrap_or_default().to_ascii_uppercase();
+        if status != "COMPLETE" || update.filled_quantity.unwrap_or(0) == 0 {
+            return;
+        }
+        let Some(pos_id) = self.pos_id_from_exit_tag(&update.tag) else { return; };
+        let Some(pos_idx) = self.positions.iter().position(|p| p.id == pos_id && p.is_open) else {
+            return;
+        };
+        let avg_price = update
+            .average_price
+            .filter(|&p| p > 0.0)
+            .unwrap_or_else(|| self.positions[pos_idx].entry_price);
+        warn!(
+            "Reconciled orphaned exit fill tag={} pos_id={} avg=₹{:.2} — closing position (pending record was gone)",
+            update.tag, pos_id, avg_price
+        );
+        self.finalize_position_close(pos_idx, avg_price, "EXIT (reconciled orphan fill)".to_string());
     }
 
     fn handle_entry_order_update(&mut self, idx: usize, update: OrderUpdate) {
@@ -1425,27 +1462,13 @@ impl OptionsEngine {
                 "place_error" => {
                     let pending = self.pending_exit_orders.remove(idx);
                     let is_untracked = Self::is_untracked_exit_reason(&pending.reason);
-                    if pending.total_filled_quantity > 0 {
-                        error!(
-                            "Exit order {} failed to place after partial fill {}/{}: {} — manual intervention required",
-                            pending.tag,
-                            pending.total_filled_quantity,
-                            pending.total_quantity,
-                            msg
-                        );
-                    } else if is_untracked {
+                    if is_untracked {
                         error!(
                             "[{}] SELL failed to place tag={} err={} — broker position may still be OPEN. MANUAL INTERVENTION REQUIRED.",
                             pending.reason, pending.tag, msg
                         );
                     } else {
-                        warn!("Exit order {} failed to place: {}", pending.tag, msg);
-                    }
-
-                    if !is_untracked {
-                        if let Some(pos) = self.positions.iter_mut().find(|p| p.id == pending.pos_id) {
-                            pos.exit_pending = pending.total_filled_quantity > 0;
-                        }
+                        self.handle_failed_exit(pending, "PLACE_ERROR", Some(msg));
                     }
                     return;
                 }
@@ -1482,6 +1505,25 @@ impl OptionsEngine {
             let pending = self.pending_exit_orders.remove(idx);
             self.finish_completed_exit(pending, avg_price);
         } else if is_terminal_reject {
+            let stale_cancel_after_market_fallback = self
+                .pending_exit_orders
+                .get(idx)
+                .map(|p| {
+                    p.market_fallback_sent
+                        && (status_upper == "CANCELLED" || status_upper == "CANCELED")
+                })
+                .unwrap_or(false);
+            if stale_cancel_after_market_fallback {
+                if let Some(pending) = self.pending_exit_orders.get_mut(idx) {
+                    pending.last_status_poll_ms = 0;
+                    warn!(
+                        "Exit order {} got {} after MARKET fallback was already sent — treating as stale pre-fallback cancel and keeping exit pending",
+                        pending.tag, status_upper
+                    );
+                }
+                return;
+            }
+
             let needs_market_fallback = self
                 .pending_exit_orders
                 .get(idx)
@@ -1493,7 +1535,7 @@ impl OptionsEngine {
             }
 
             let pending = self.pending_exit_orders.remove(idx);
-            self.handle_failed_exit(pending, &status_upper);
+            self.handle_failed_exit(pending, &status_upper, update.message.as_deref());
         }
     }
 
@@ -1684,7 +1726,7 @@ impl OptionsEngine {
         }
     }
 
-    fn handle_failed_exit(&mut self, pending: PendingExitOrder, status_upper: &str) {
+    fn handle_failed_exit(&mut self, pending: PendingExitOrder, status_upper: &str, reject_msg: Option<&str>) {
         let is_untracked = Self::is_untracked_exit_reason(&pending.reason);
 
         if pending.total_filled_quantity >= pending.total_quantity && pending.total_quantity > 0 {
@@ -1705,14 +1747,9 @@ impl OptionsEngine {
             return;
         }
 
-        if let Some(pos) = self.positions.iter_mut().find(|p| p.id == pending.pos_id) {
-            if pending.total_filled_quantity == 0 {
-                warn!(
-                    "Exit order {} terminal status {}. Will re-attempt exit later.",
-                    pending.tag, status_upper
-                );
-                pos.exit_pending = false;
-            } else {
+        if pending.total_filled_quantity > 0 {
+            // Partial fill then terminal: leave exit_pending so we never oversell; needs a human.
+            if let Some(pos) = self.positions.iter_mut().find(|p| p.id == pending.pos_id) {
                 error!(
                     "Exit order {} terminal status {} after partial fill {}/{} — manual intervention required; engine position left exit_pending to avoid oversell.",
                     pending.tag,
@@ -1721,6 +1758,43 @@ impl OptionsEngine {
                     pending.total_quantity
                 );
                 pos.exit_pending = true;
+            }
+            return;
+        }
+
+        // Zero-fill terminal reject. A funds/margin reject on a CLOSE is definitional proof the
+        // broker holds no inventory, so a retry can only ever fire a naked short — never retry it.
+        // Any other reject is bounded by MAX_EXIT_ATTEMPTS so a persistent failure can't run away
+        // (this is what turned one orphaned fill into 498 rejected resubmits on 2026-06-30).
+        const MAX_EXIT_ATTEMPTS: u32 = 3;
+        let funds_reject = reject_msg
+            .map(|m| {
+                let m = m.to_ascii_lowercase();
+                m.contains("insufficient funds") || m.contains("margin") || m.contains("rms:")
+            })
+            .unwrap_or(false);
+        let attempts = {
+            let c = self.exit_failures.entry(pending.pos_id).or_insert(0);
+            *c += 1;
+            *c
+        };
+        if let Some(pos) = self.positions.iter_mut().find(|p| p.id == pending.pos_id) {
+            if funds_reject || attempts >= MAX_EXIT_ATTEMPTS {
+                error!(
+                    "Exit order {} {} — {} on a CLOSE: broker shows no open inventory. Halting exit resubmit after {} attempt(s); position {} left exit_pending. MANUAL INTERVENTION REQUIRED (reconcile on the broker).",
+                    pending.tag,
+                    status_upper,
+                    if funds_reject { "funds/margin reject" } else { "retry cap reached" },
+                    attempts,
+                    pending.pos_id
+                );
+                pos.exit_pending = true; // blocks close_position_at (guard: !is_open || exit_pending)
+            } else {
+                warn!(
+                    "Exit order {} terminal status {} (attempt {}/{}). Will re-attempt exit later.",
+                    pending.tag, status_upper, attempts, MAX_EXIT_ATTEMPTS
+                );
+                pos.exit_pending = false;
             }
         }
     }
@@ -3115,8 +3189,9 @@ impl OptionsEngine {
                 SignalAction::BuyPE => crate::technicals::Direction::Bear,
                 _ => crate::technicals::Direction::Neutral,
             };
-            let scalp = series
-                .scalp_assessment(desired_direction)
+            let scalp_assessment = series.scalp_assessment(desired_direction);
+            let scalp = scalp_assessment
+                .as_ref()
                 .map(|s| {
                     format!(
                         " | scalp {:?} alignment {}/{}: {}",
@@ -3146,6 +3221,22 @@ impl OptionsEngine {
                     summary
                 );
                 return signals;
+            } else if veto
+                && !scalp_assessment
+                    .as_ref()
+                    .map(|s| s.aligned >= 2 && s.aligned * 2 >= s.observed)
+                    .unwrap_or(false)
+            {
+                warn!(
+                    "  {} gen_signals: {:?} VETOED — spot-reversal is fighting slower bias {:?} (strength {:.2}) without scalp majority; {}{}",
+                    snap.underlying,
+                    dominant_action,
+                    b.direction,
+                    b.strength,
+                    summary,
+                    scalp
+                );
+                return signals;
             } else if veto {
                 warn!(
                     "  {} gen_signals: {:?} allowed by spot-reversal break despite slower bias {:?} (strength {:.2}); {}",
@@ -3156,6 +3247,24 @@ impl OptionsEngine {
                     summary
                 );
             }
+        }
+
+        // 2026-06-30 fingerprint: expiry-morning compression with very low PCR created a false
+        // bearish read from call-writing/strike pinning. In that setup, the first PE cluster
+        // repeatedly stopped out before the tape developed real downside breadth. Keep later
+        // expiry-day PE continuation available once PCR normalizes, and keep multi-day trades out
+        // of this gate entirely.
+        if dominant_action == SignalAction::BuyPE
+            && snap.days_to_expiry < 0.5
+            && matches!(self.current_session(), SessionPhase::Morning)
+            && compressive
+            && snap.pcr_oi < 0.70
+        {
+            warn!(
+                "  {} gen_signals: PE blocked — 0-DTE morning compression with very low PCR {:.2} (<0.70) is likely strike-pinning/call-writing skew",
+                snap.underlying, snap.pcr_oi
+            );
+            return signals;
         }
 
         // Symmetric PCR conviction floors.
@@ -5519,6 +5628,244 @@ mod tests {
         assert!(!engine.positions[0].is_open);
         assert!(!engine.positions[0].exit_pending);
         assert!((engine.positions[0].exit_price - 102.25).abs() < 0.01);
+    }
+
+    #[test]
+    fn margin_rejected_exit_does_not_resubmit() {
+        // 2026-06-30 incident: an exit was rejected for "Insufficient funds / Margin exceeds".
+        // On a CLOSE that proves the broker holds no inventory, so the engine must NOT keep
+        // resubmitting (each resubmit would be a naked short) — it must halt for manual reconcile.
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_margin_reject_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+        let mut engine = OptionsEngine::new(
+            Vec::new(),
+            TickStore::new(),
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+        let (order_tx, _order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+        engine.positions.push(test_position(true));
+        engine.pending_exit_orders.push(PendingExitOrder {
+            pos_id: 1,
+            tag: "SATAEXIT1".to_string(),
+            tradingsymbol: "NIFTY26APR22000CE".to_string(),
+            total_quantity: 50,
+            placed_ms: 0,
+            last_status_poll_ms: 0,
+            reason: "STOP HIT".to_string(),
+            cancel_requested: false,
+            last_cancel_attempt_ms: 0,
+            market_fallback_sent: false,
+            fallback_book_price: 85.0,
+            total_filled_quantity: 0,
+            total_filled_notional: 0.0,
+            current_order_filled_quantity: 0,
+            current_order_filled_notional: 0.0,
+        });
+
+        engine.handle_order_update(OrderUpdate {
+            tag: "SATAEXIT1".to_string(),
+            order_id: Some("111".to_string()),
+            status: Some("REJECTED".to_string()),
+            average_price: None,
+            filled_quantity: Some(0),
+            pending_quantity: Some(0),
+            source: "status_poll".to_string(),
+            message: Some(
+                "Insufficient funds. Margin required: 204193.50. Margin available: 15386.60.".to_string(),
+            ),
+        });
+
+        assert!(engine.pending_exit_orders.is_empty());
+        assert!(engine.positions[0].is_open, "a reject must not falsely close the position");
+        assert!(
+            engine.positions[0].exit_pending,
+            "exit_pending must stay true so close_position_at's guard blocks resubmit"
+        );
+    }
+
+    #[test]
+    fn margin_place_error_exit_does_not_resubmit() {
+        // Same safety rule as a broker REJECTED status, but for brokers/API layers that return
+        // the margin failure directly from placement instead of creating an order_id first.
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_margin_place_error_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+        let mut engine = OptionsEngine::new(
+            Vec::new(),
+            TickStore::new(),
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+        let (order_tx, _order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+        engine.positions.push(test_position(true));
+        engine.pending_exit_orders.push(PendingExitOrder {
+            pos_id: 1,
+            tag: "SATAEXIT1".to_string(),
+            tradingsymbol: "NIFTY26APR22000CE".to_string(),
+            total_quantity: 50,
+            placed_ms: 0,
+            last_status_poll_ms: 0,
+            reason: "STOP HIT".to_string(),
+            cancel_requested: false,
+            last_cancel_attempt_ms: 0,
+            market_fallback_sent: false,
+            fallback_book_price: 85.0,
+            total_filled_quantity: 0,
+            total_filled_notional: 0.0,
+            current_order_filled_quantity: 0,
+            current_order_filled_notional: 0.0,
+        });
+
+        engine.handle_order_update(OrderUpdate {
+            tag: "SATAEXIT1".to_string(),
+            order_id: None,
+            status: None,
+            average_price: None,
+            filled_quantity: None,
+            pending_quantity: None,
+            source: "place_error".to_string(),
+            message: Some("RMS: Margin Exceeds, required: 204193, available: 15386".to_string()),
+        });
+
+        assert!(engine.pending_exit_orders.is_empty());
+        assert!(engine.positions[0].is_open, "a place error must not falsely close the position");
+        assert!(
+            engine.positions[0].exit_pending,
+            "margin place_error must halt resubmits just like a REJECTED status"
+        );
+    }
+
+    #[test]
+    fn orphaned_exit_fill_closes_position() {
+        // 2026-06-30 root cause: a duplicate CANCELLED removed the pending exit before the
+        // market-fallback's COMPLETE arrived, so the fill was dropped at tag dispatch and the
+        // position stayed "open". The reconcile path must close it by pos_id from the tag.
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_orphan_fill_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+        let mut engine = OptionsEngine::new(
+            Vec::new(),
+            TickStore::new(),
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+        let (order_tx, _order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+        engine.positions.push(test_position(true));
+        // No pending_exit_orders: the record was already removed (duplicate CANCELLED).
+
+        engine.handle_order_update(OrderUpdate {
+            tag: "SATAEXIT1".to_string(),
+            order_id: Some("222".to_string()),
+            status: Some("COMPLETE".to_string()),
+            average_price: Some(55.10),
+            filled_quantity: Some(50),
+            pending_quantity: Some(0),
+            source: "postback".to_string(),
+            message: None,
+        });
+
+        assert!(!engine.positions[0].is_open, "orphaned exit fill must close the position");
+        assert!(!engine.positions[0].exit_pending);
+        assert!((engine.positions[0].exit_price - 55.10).abs() < 0.01);
+    }
+
+    #[test]
+    fn duplicate_cancel_after_market_fallback_keeps_exit_pending() {
+        // The cancel request and the queued status poll can both report the original limit order
+        // as CANCELLED. Once the market fallback has been sent, that stale terminal status must not
+        // remove the pending exit or clear exit_pending before the fallback fill arrives.
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_duplicate_cancel_after_fallback_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+        let mut engine = OptionsEngine::new(
+            Vec::new(),
+            TickStore::new(),
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+        let (order_tx, _order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+        engine.positions.push(test_position(true));
+        engine.pending_exit_orders.push(PendingExitOrder {
+            pos_id: 1,
+            tag: "SATAEXIT1".to_string(),
+            tradingsymbol: "NIFTY26APR22000CE".to_string(),
+            total_quantity: 50,
+            placed_ms: 20_000,
+            last_status_poll_ms: 0,
+            reason: "STOP HIT".to_string(),
+            cancel_requested: false,
+            last_cancel_attempt_ms: 0,
+            market_fallback_sent: true,
+            fallback_book_price: 57.50,
+            total_filled_quantity: 0,
+            total_filled_notional: 0.0,
+            current_order_filled_quantity: 0,
+            current_order_filled_notional: 0.0,
+        });
+
+        engine.handle_order_update(OrderUpdate {
+            tag: "SATAEXIT1".to_string(),
+            order_id: Some("old-limit".to_string()),
+            status: Some("CANCELLED".to_string()),
+            average_price: Some(0.0),
+            filled_quantity: Some(0),
+            pending_quantity: Some(50),
+            source: "status_poll".to_string(),
+            message: None,
+        });
+
+        assert_eq!(engine.pending_exit_orders.len(), 1);
+        assert!(engine.positions[0].is_open);
+        assert!(
+            engine.positions[0].exit_pending,
+            "duplicate stale cancel must not unblock another close_position_at call"
+        );
+
+        engine.handle_order_update(OrderUpdate {
+            tag: "SATAEXIT1".to_string(),
+            order_id: Some("market-fallback".to_string()),
+            status: Some("COMPLETE".to_string()),
+            average_price: Some(55.10),
+            filled_quantity: Some(50),
+            pending_quantity: Some(0),
+            source: "status_poll".to_string(),
+            message: None,
+        });
+
+        assert!(engine.pending_exit_orders.is_empty());
+        assert!(!engine.positions[0].is_open);
+        assert!(!engine.positions[0].exit_pending);
+        assert!((engine.positions[0].exit_price - 55.10).abs() < 0.01);
     }
 
     #[test]

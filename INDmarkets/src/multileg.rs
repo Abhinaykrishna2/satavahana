@@ -1,6 +1,6 @@
 //! Multi-leg defined-risk option SELLING — slice 1: pure entry logic (no I/O, no live orders).
 //!
-//! Ports the satakarni sandbox's entry path into the Rust engine: a Mon/Tue day-gate,
+//! Ports the satakarni sandbox's entry path into the Rust engine: near-expiry and far-DTE sideways gates,
 //! defined-risk leg selection (iron condor / iron fly), and **wings-first, marketable-limit**
 //! placement sequencing. Kept pure and heavily unit-tested. The live order-routing, combo
 //! management (TP/stop/15:15), and paper-fill simulation are later slices. Paper-first.
@@ -92,10 +92,82 @@ pub struct PlannedLeg {
     pub wing: bool,
 }
 
-/// Mon/Tue only — weekly NIFTY theta-selling is for 1-DTE (Mon) and expiry day (Tue),
-/// the only days intraday decay is fast enough to be worth the gamma.
+/// Legacy weekday guard for the standard Tue-expiry NIFTY cycle.
 pub fn weekday_allows(wd: Weekday) -> bool {
     matches!(wd, Weekday::Mon | Weekday::Tue)
+}
+
+/// Near-expiry selling can use the normal 09:45 open because intraday theta is fast enough to
+/// justify the gamma. Farther-DTE selling is allowed only after a stronger sideways confirmation.
+pub const MAX_SELL_DTE_DAYS: i64 = 1;
+pub const FAR_DTE_ENTRY_MIN: u32 = 12 * 60;
+pub const FAR_DTE_RECENT_MIN: u32 = 30;
+pub const FAR_DTE_MAX_RECENT_ER: f64 = 0.45;
+pub const FAR_DTE_MAX_SESSION_NET_PCT: f64 = 0.0035;
+pub const FAR_DTE_MAX_SESSION_RANGE_PCT: f64 = 0.0060;
+pub const FAR_DTE_MAX_EDGE_FRAC: f64 = 0.65;
+
+pub fn dte_allows(days_to_expiry: i64) -> bool {
+    (0..=MAX_SELL_DTE_DAYS).contains(&days_to_expiry)
+}
+
+pub fn expiry_dte_days(day: NaiveDate, expiry: &str) -> Option<i64> {
+    let expiry = NaiveDate::parse_from_str(expiry, "%Y-%m-%d").ok()?;
+    Some(expiry.signed_duration_since(day).num_days())
+}
+
+pub fn expiry_proximity_allows(day: NaiveDate, expiry: &str) -> bool {
+    expiry_dte_days(day, expiry).is_some_and(dte_allows)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FarDteSideways {
+    pub session_er: f64,
+    pub recent_er: f64,
+    pub session_net_pct: f64,
+    pub session_range_pct: f64,
+    pub edge_frac: f64,
+}
+
+pub fn far_dte_sideways_metrics(
+    session_closes: &[f64],
+    recent_closes: &[f64],
+    spot: f64,
+) -> Option<FarDteSideways> {
+    if spot <= 0.0 || !spot.is_finite() || session_closes.len() < 5 {
+        return None;
+    }
+    let session_er = efficiency_ratio(session_closes)?;
+    let recent_er = efficiency_ratio(recent_closes)?;
+    let first = *session_closes.first()?;
+    let last = *session_closes.last()?;
+    let min = session_closes.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = session_closes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let range = max - min;
+    let range_pos = if range <= 0.0 { 0.5 } else { (last - min) / range };
+    Some(FarDteSideways {
+        session_er,
+        recent_er,
+        session_net_pct: (last - first).abs() / spot,
+        session_range_pct: range / spot,
+        edge_frac: (range_pos - 0.5).abs() * 2.0,
+    })
+}
+
+pub fn far_dte_sideways_reject(m: FarDteSideways) -> Option<&'static str> {
+    if m.recent_er > FAR_DTE_MAX_RECENT_ER {
+        return Some("RECENT-TREND");
+    }
+    if m.session_net_pct > FAR_DTE_MAX_SESSION_NET_PCT {
+        return Some("SESSION-DRIFT");
+    }
+    if m.session_range_pct > FAR_DTE_MAX_SESSION_RANGE_PCT {
+        return Some("SESSION-RANGE");
+    }
+    if m.edge_frac > FAR_DTE_MAX_EDGE_FRAC {
+        return Some("RANGE-EDGE");
+    }
+    None
 }
 
 fn has_strike(q: &[StrikeQuote], k: f64) -> bool {
@@ -249,10 +321,10 @@ pub fn combo_close_cost(legs: &[PlannedLeg], quotes: &[StrikeQuote]) -> Option<f
     Some(cost)
 }
 
-/// Exit rule: 15:15 hard close, else take-profit at 50% of credit, else stop at
-/// `STOP_FRAC_ML` of defined max loss. `ist_mins` = minutes since IST midnight (15:15 = 915).
+/// Exit rule: `EXIT_MIN` hard close (14:55), else take-profit at 50% of credit, else stop at
+/// `STOP_FRAC_ML` of defined max loss. `ist_mins` = minutes since IST midnight (14:55 = 895).
 pub fn exit_reason(credit: f64, close_cost: f64, max_loss_unit: f64, ist_mins: u32) -> Option<ExitReason> {
-    if ist_mins >= 915 {
+    if ist_mins >= EXIT_MIN {
         return Some(ExitReason::Time);
     }
     if credit <= 0.0 || max_loss_unit <= 0.0 {
@@ -561,7 +633,7 @@ pub fn trail_exits(gain: f64, peak_gain: f64, credit: f64) -> bool {
 const HOLDER: &str = "multileg";
 const ENTRY_MIN: u32 = 9 * 60 + 45;
 const CUTOFF_MIN: u32 = 14 * 60 + 30;
-const EXIT_MIN: u32 = 15 * 60 + 15;
+const EXIT_MIN: u32 = 14 * 60 + 55;
 const OPEN_RANGE_START_SEC: u32 = 9 * 3600 + 15 * 60 + 5;
 const OPEN_RANGE_END_SEC: u32 = ENTRY_MIN * 60;
 /// Position sizing uses FULL margin affordability — the old 10% risk-fraction SIZE cap is dropped.
@@ -834,7 +906,7 @@ impl MultiLegEngine {
         underlying: &str,
         now_ms: u64,
         day: NaiveDate,
-        wd: Weekday,
+        _wd: Weekday,
         mins: u32,
     ) {
         if self.state.get(underlying).and_then(|s| s.active.as_ref()).is_some() {
@@ -842,7 +914,7 @@ impl MultiLegEngine {
             return;
         }
 
-        if !weekday_allows(wd) || mins < ENTRY_MIN || mins > CUTOFF_MIN {
+        if mins < ENTRY_MIN || mins > CUTOFF_MIN {
             return;
         }
         if self
@@ -859,10 +931,56 @@ impl MultiLegEngine {
         let Some(snapshot) = self.build_snapshot(underlying, now_ms) else {
             return;
         };
+        let dte = match expiry_dte_days(day, &snapshot.expiry) {
+            Some(dte) if dte >= 0 => dte,
+            Some(dte) => {
+                self.log_skip(
+                    underlying,
+                    now_ms,
+                    format!("multi-leg stand aside: expiry {} is expired ({}DTE)", snapshot.expiry, dte),
+                );
+                return;
+            }
+            None => {
+                self.log_skip(
+                    underlying,
+                    now_ms,
+                    format!("multi-leg stand aside: invalid expiry {}", snapshot.expiry),
+                );
+                return;
+            }
+        };
+        let near_expiry = dte_allows(dte);
+        if !near_expiry && mins < FAR_DTE_ENTRY_MIN {
+            return;
+        }
+        let latent_end_ms = if near_expiry { None } else { Some(now_ms) };
         // Elite seller's regime gate (ported from satakarni): block only a clearly trending open.
         // Range/straddle is logged for context, not used as an entry blocker in the current sandbox.
         // Insufficient opening data → stand aside (can't confirm a calm open, so don't sell into it).
-        let closes = self.morning_minute_closes(underlying, day);
+        let closes = self.entry_minute_closes(underlying, day, latent_end_ms);
+        if !near_expiry {
+            let recent = self.recent_minute_closes(underlying, day, now_ms, FAR_DTE_RECENT_MIN);
+            let Some(metrics) = far_dte_sideways_metrics(&closes, &recent, snapshot.spot) else {
+                return;
+            };
+            if let Some(why) = far_dte_sideways_reject(metrics) {
+                self.log_skip(
+                    underlying,
+                    now_ms,
+                    format!(
+                        "multi-leg far-DTE stand aside: {} (session ER {:.2}, recent ER {:.2}, drift {:.2}%, range {:.2}%, edge {:.0}%)",
+                        why,
+                        metrics.session_er,
+                        metrics.recent_er,
+                        metrics.session_net_pct * 100.0,
+                        metrics.session_range_pct * 100.0,
+                        metrics.edge_frac * 100.0
+                    ),
+                );
+                return;
+            }
+        }
         let regime = match (
             efficiency_ratio(&closes),
             atm_straddle(&snapshot.quotes, snapshot.spot),
@@ -887,7 +1005,7 @@ impl MultiLegEngine {
                     return;
                 }
                 let edge_frac = self
-                    .opening_latent(underlying, day, None)
+                    .opening_latent(underlying, day, latent_end_ms)
                     .map(|l| l.edge_frac)
                     .unwrap_or(0.5);
                 OpeningRegime {
@@ -899,7 +1017,9 @@ impl MultiLegEngine {
             }
             _ => return,
         };
-        let Some((active, _drift_frac)) = self.plan_entry(underlying, now_ms, day, &snapshot, regime) else {
+        let Some((active, _drift_frac)) =
+            self.plan_entry(underlying, now_ms, day, &snapshot, regime, latent_end_ms)
+        else {
             return;
         };
         self.open_combo(active, snapshot).await;
@@ -1031,8 +1151,9 @@ impl MultiLegEngine {
         day: NaiveDate,
         snapshot: &ChainSnapshot,
         regime: OpeningRegime,
+        latent_end_ms: Option<u64>,
     ) -> Option<(ActiveCombo, f64)> {
-        let opening_latent = self.opening_latent(underlying, day, None)?;
+        let opening_latent = self.opening_latent(underlying, day, latent_end_ms)?;
         let mut last_err = String::new();
         let mut scored: Vec<(SellStructure, f64, ActiveCombo)> = Vec::new();
         let mut scoreboard: Vec<(SellStructure, f64)> = Vec::new();
@@ -1164,6 +1285,9 @@ impl MultiLegEngine {
         if st.day != Some(day) {
             return None;
         }
+        let end_secs = end_ms
+            .map(|end| ist_parts(end).3)
+            .unwrap_or(OPEN_RANGE_END_SEC);
         let vals: Vec<f64> = st
             .spot_history
             .iter()
@@ -1174,7 +1298,7 @@ impl MultiLegEngine {
                 let (sample_day, _wd, _mins, secs) = ist_parts(*t);
                 (sample_day == day
                     && secs >= OPEN_RANGE_START_SEC
-                    && secs <= OPEN_RANGE_END_SEC
+                    && secs <= end_secs
                     && end_ms.map(|end| *t <= end).unwrap_or(true))
                 .then_some(*s)
             })
@@ -1198,24 +1322,51 @@ impl MultiLegEngine {
         })
     }
 
-    /// 1-min spot closes over the opening window [09:15:05, 09:45], chronological. Buckets the
-    /// per-tick spot history by minute (last sample wins) to match the backtest's `resample(1min)`
-    /// — required so the Efficiency Ratio is comparable to the calibrated `ER_CAP`.
-    fn morning_minute_closes(&self, underlying: &str, day: NaiveDate) -> Vec<f64> {
+    /// 1-min spot closes over the entry window [09:15:05, end], chronological. Buckets the
+    /// per-tick spot history by minute (last sample wins) to match the backtest's resample.
+    fn entry_minute_closes(&self, underlying: &str, day: NaiveDate, end_ms: Option<u64>) -> Vec<f64> {
         let Some(st) = self.state.get(underlying) else {
             return Vec::new();
         };
         if st.day != Some(day) {
             return Vec::new();
         }
+        let end_secs = end_ms
+            .map(|end| ist_parts(end).3)
+            .unwrap_or(OPEN_RANGE_END_SEC);
         let mut by_min: BTreeMap<u64, f64> = BTreeMap::new();
         for (t, s) in &st.spot_history {
             if !s.is_finite() || *s <= 0.0 {
                 continue;
             }
             let (sample_day, _wd, _mins, secs) = ist_parts(*t);
-            if sample_day == day && secs >= OPEN_RANGE_START_SEC && secs <= OPEN_RANGE_END_SEC {
-                by_min.insert(*t / 60_000, *s); // chronological history → last sample per minute wins
+            if sample_day == day
+                && secs >= OPEN_RANGE_START_SEC
+                && secs <= end_secs
+                && end_ms.map(|end| *t <= end).unwrap_or(true)
+            {
+                by_min.insert(*t / 60_000, *s);
+            }
+        }
+        by_min.into_values().collect()
+    }
+
+    fn recent_minute_closes(&self, underlying: &str, day: NaiveDate, now_ms: u64, minutes: u32) -> Vec<f64> {
+        let Some(st) = self.state.get(underlying) else {
+            return Vec::new();
+        };
+        if st.day != Some(day) {
+            return Vec::new();
+        }
+        let start_ms = now_ms.saturating_sub(minutes as u64 * 60_000);
+        let mut by_min: BTreeMap<u64, f64> = BTreeMap::new();
+        for (t, s) in &st.spot_history {
+            if !s.is_finite() || *s <= 0.0 {
+                continue;
+            }
+            let (sample_day, _wd, _mins, secs) = ist_parts(*t);
+            if sample_day == day && secs >= OPEN_RANGE_START_SEC && *t >= start_ms && *t <= now_ms {
+                by_min.insert(*t / 60_000, *s);
             }
         }
         by_min.into_values().collect()
@@ -1965,6 +2116,30 @@ mod tests {
     }
 
     #[test]
+    fn expiry_proximity_gate_allows_only_zero_or_one_dte() {
+        let mon = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
+        let tue = NaiveDate::from_ymd_opt(2026, 6, 23).unwrap();
+
+        assert_eq!(expiry_dte_days(mon, "2026-06-23"), Some(1));
+        assert!(expiry_proximity_allows(mon, "2026-06-23"));
+        assert!(expiry_proximity_allows(tue, "2026-06-23"));
+        assert!(!expiry_proximity_allows(mon, "2026-06-30"));
+        assert!(!expiry_proximity_allows(mon, "not-a-date"));
+    }
+
+    #[test]
+    fn far_dte_sideways_gate_admits_clean_range_and_rejects_recent_trend() {
+        let sideways = [24000.0, 24020.0, 24005.0, 24025.0, 24010.0, 24030.0, 24015.0, 24020.0];
+        let recent_chop = [24015.0, 24025.0, 24018.0, 24028.0, 24020.0];
+        let m = far_dte_sideways_metrics(&sideways, &recent_chop, 24020.0).unwrap();
+        assert!(far_dte_sideways_reject(m).is_none(), "clean far-DTE range should admit: {m:?}");
+
+        let recent_trend = [24020.0, 24030.0, 24040.0, 24050.0, 24060.0];
+        let m = far_dte_sideways_metrics(&sideways, &recent_trend, 24060.0).unwrap();
+        assert_eq!(far_dte_sideways_reject(m), Some("RECENT-TREND"));
+    }
+
+    #[test]
     fn condor_picks_quarter_delta_shorts_with_wings() {
         let legs = select_legs(&chain(), 24109.0, SellStructure::Condor).unwrap();
         assert_eq!(legs.len(), 4);
@@ -2100,7 +2275,8 @@ mod tests {
         assert_eq!(exit_reason(credit, 15.0, maxloss, 600), Some(ExitReason::TakeProfit)); // gain 16.2 ≥ 15.6
         assert_eq!(exit_reason(credit, 41.0, maxloss, 600), None);             // loss still below 15% ML
         assert_eq!(exit_reason(credit, 41.6, maxloss, 600), Some(ExitReason::Stop));        // loss exceeds 15% ML
-        assert_eq!(exit_reason(credit, 5.0, maxloss, 915), Some(ExitReason::Time));        // 15:15 overrides
+        assert_eq!(exit_reason(credit, 5.0, maxloss, 895), Some(ExitReason::Time));        // 14:55 overrides
+        assert_eq!(exit_reason(credit, 31.55, maxloss, 894), None);                        // 14:54 not yet forced
     }
 
     #[test]

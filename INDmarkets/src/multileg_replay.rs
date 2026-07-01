@@ -4,14 +4,15 @@
 use crate::execution::OrderSide;
 use crate::models::OptionType;
 use crate::multileg::{
-    atm_straddle, combo_close_cost, combo_credit, efficiency_ratio, entry_balance_admits,
-    entry_drift_admits, entry_drift_zone_cap, entry_balance_edge_cap, max_loss_per_lot,
-    move_trims, option_order_cost, pick_best_structure, profit_zone, select_legs, sell_regime_skip,
-    size_lots, structure_regime_score, trail_exits, OpeningRegime, PlannedLeg, SellStructure,
-    StrikeQuote, MOVE_WINDOW_MIN, STOP_FRAC_ML, weekday_allows,
+    atm_straddle, combo_close_cost, combo_credit, dte_allows, efficiency_ratio, entry_balance_admits,
+    entry_balance_edge_cap, entry_drift_admits, entry_drift_zone_cap, far_dte_sideways_metrics,
+    far_dte_sideways_reject, max_loss_per_lot, move_trims, option_order_cost, pick_best_structure,
+    profit_zone, select_legs, sell_regime_skip, size_lots, structure_regime_score, trail_exits,
+    OpeningRegime, PlannedLeg, SellStructure, StrikeQuote, FAR_DTE_RECENT_MIN, MOVE_WINDOW_MIN,
+    STOP_FRAC_ML,
 };
 
-use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -260,7 +261,7 @@ fn manage(
     capital: f64,
     entry_quotes: &[StrikeQuote],
 ) -> (NaiveDateTime, String) {
-    let t_exit = ts(day, "15:15");
+    let t_exit = ts(day, "14:55");
     let mut peak_gain = 0.0_f64;
     let stop_rupees = STOP_FRAC_CAP * capital;
 
@@ -362,14 +363,15 @@ fn manage(
         }
     }
 
-    (t_exit, "15:15".to_string())
+    (t_exit, "14:55".to_string())
 }
 
-pub(crate) fn load_selling_ticks(path: &Path) -> Result<(NaiveDate, Vec<TickRow>), String> {
+pub(crate) fn load_selling_ticks(path: &Path) -> Result<(NaiveDate, NaiveDate, Vec<TickRow>), String> {
     let mut rdr = crate::open_csv(path).map_err(|e| e.to_string())?;
     let headers = rdr.headers().map_err(|e| e.to_string())?.clone();
     let idx = |name: &str| headers.iter().position(|h| h == name).ok_or_else(|| format!("missing col {name}"));
     let i_ts = idx("recv_ts")?;
+    let i_expiry = idx("expiry")?;
     let i_strike = idx("strike")?;
     let i_ot = idx("option_type")?;
     let i_spot = idx("spot")?;
@@ -379,6 +381,7 @@ pub(crate) fn load_selling_ticks(path: &Path) -> Result<(NaiveDate, Vec<TickRow>
 
     let mut rows = Vec::new();
     let mut day = None;
+    let mut expiry = None;
     for rec in rdr.records() {
         let rec = rec.map_err(|e| e.to_string())?;
         let ts = NaiveDateTime::parse_from_str(rec.get(i_ts).unwrap_or(""), "%Y-%m-%dT%H:%M:%S%.f")
@@ -390,6 +393,9 @@ pub(crate) fn load_selling_ticks(path: &Path) -> Result<(NaiveDate, Vec<TickRow>
         if bid <= 0.0 && ask <= 0.0 {
             continue;
         }
+        let row_expiry = NaiveDate::parse_from_str(rec.get(i_expiry).unwrap_or(""), "%Y-%m-%d")
+            .map_err(|e| format!("expiry parse: {e}"))?;
+        expiry.get_or_insert(row_expiry);
         rows.push(TickRow {
             ts,
             strike: rec.get(i_strike).unwrap_or("0").parse().unwrap_or(0.0),
@@ -403,10 +409,15 @@ pub(crate) fn load_selling_ticks(path: &Path) -> Result<(NaiveDate, Vec<TickRow>
     // manage()'s single-pass per-tick walk (and snapshot_at's early break) assume time order.
     // The recorder writes ascending recv_ts, but make the invariant explicit and cheap to hold.
     rows.sort_by(|a, b| a.ts.cmp(&b.ts));
-    Ok((day.ok_or("empty file")?, rows))
+    Ok((day.ok_or("empty file")?, expiry.ok_or("empty file")?, rows))
 }
 
-pub(crate) fn replay_day(rows: &[TickRow], day: NaiveDate, mut capital: f64) -> (MultilegDayResult, f64) {
+pub(crate) fn replay_day(
+    rows: &[TickRow],
+    day: NaiveDate,
+    expiry: NaiveDate,
+    mut capital: f64,
+) -> (MultilegDayResult, f64) {
     let base = MultilegDayResult {
         day,
         traded: false,
@@ -420,19 +431,19 @@ pub(crate) fn replay_day(rows: &[TickRow], day: NaiveDate, mut capital: f64) -> 
         skip_reason: None,
     };
 
-    // ponytail: env bypass for "what-if any weekday" backtests; live/default stays Mon/Tue.
-    let any_weekday = std::env::var("SATA_ML_ANY_WEEKDAY").is_ok();
-    if !any_weekday && !weekday_allows(day.weekday()) {
+    let dte = expiry.signed_duration_since(day).num_days();
+    if dte < 0 {
         return (
             MultilegDayResult {
-                skip_reason: Some(format!("weekday {:?} not Mon/Tue", day.weekday())),
+                skip_reason: Some(format!("expiry {expiry} is expired ({dte}DTE)")),
                 ..base
             },
             capital,
         );
     }
+    let near_expiry = dte_allows(dte);
 
-    let t_entry = ts(day, "09:45");
+    let t_entry = if near_expiry { ts(day, "09:45") } else { ts(day, "12:00") };
     let t_open = ts(day, "09:15:05");
 
     let closes = minute_closes(rows, t_open, t_entry);
@@ -456,6 +467,38 @@ pub(crate) fn replay_day(rows: &[TickRow], day: NaiveDate, mut capital: f64) -> 
             capital,
         );
     };
+
+    if !near_expiry {
+        let recent_start = t_entry - chrono::Duration::minutes(FAR_DTE_RECENT_MIN as i64);
+        let recent = minute_closes(rows, recent_start, t_entry);
+        let Some(metrics) = far_dte_sideways_metrics(&closes, &recent, spot) else {
+            return (
+                MultilegDayResult {
+                    er: Some(er),
+                    skip_reason: Some("insufficient far-DTE sideways data".into()),
+                    ..base
+                },
+                capital,
+            );
+        };
+        if let Some(why) = far_dte_sideways_reject(metrics) {
+            return (
+                MultilegDayResult {
+                    er: Some(er),
+                    skip_reason: Some(format!(
+                        "FAR-DTE {why}: session ER {:.2}, recent ER {:.2}, drift {:.2}%, range {:.2}%, edge {:.0}%",
+                        metrics.session_er,
+                        metrics.recent_er,
+                        metrics.session_net_pct * 100.0,
+                        metrics.session_range_pct * 100.0,
+                        metrics.edge_frac * 100.0
+                    )),
+                    ..base
+                },
+                capital,
+            );
+        }
+    }
 
     let Some(straddle) = atm_straddle(&quotes, spot) else {
         return (
@@ -603,8 +646,8 @@ pub(crate) fn replay_day(rows: &[TickRow], day: NaiveDate, mut capital: f64) -> 
 }
 
 pub fn replay_file(path: &Path, start_capital: f64) -> Result<MultilegReplaySummary, String> {
-    let (day, rows) = load_selling_ticks(path)?;
-    let (result, end) = replay_day(&rows, day, start_capital);
+    let (day, expiry, rows) = load_selling_ticks(path)?;
+    let (result, end) = replay_day(&rows, day, expiry, start_capital);
     Ok(MultilegReplaySummary {
         start_capital,
         end_capital: end,
@@ -616,8 +659,8 @@ pub fn replay_many(paths: &[&Path], start_capital: f64) -> Result<MultilegReplay
     let mut cap = start_capital;
     let mut days = Vec::new();
     for path in paths {
-        let (day, rows) = load_selling_ticks(path)?;
-        let (r, new_cap) = replay_day(&rows, day, cap);
+        let (day, expiry, rows) = load_selling_ticks(path)?;
+        let (r, new_cap) = replay_day(&rows, day, expiry, cap);
         cap = new_cap;
         days.push(r);
     }
@@ -632,15 +675,14 @@ pub fn replay_many(paths: &[&Path], start_capital: f64) -> Result<MultilegReplay
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::Weekday;
 
     #[test]
-    fn replay_module_compiles_and_weekday_gate_blocks_wed() {
+    fn replay_module_compiles_and_expired_expiry_blocks() {
         let day = NaiveDate::from_ymd_opt(2026, 6, 24).unwrap();
-        assert_eq!(day.weekday(), Weekday::Wed);
-        let (r, cap) = replay_day(&[], day, 15_000.0);
+        let expiry = NaiveDate::from_ymd_opt(2026, 6, 23).unwrap();
+        let (r, cap) = replay_day(&[], day, expiry, 15_000.0);
         assert!(!r.traded);
-        assert!(r.skip_reason.as_ref().unwrap().contains("Wed"));
+        assert!(r.skip_reason.as_ref().unwrap().contains("expired"));
         assert_eq!(cap, 15_000.0);
     }
 
