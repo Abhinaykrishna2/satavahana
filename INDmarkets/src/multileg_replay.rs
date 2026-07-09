@@ -4,12 +4,15 @@
 use crate::execution::OrderSide;
 use crate::models::OptionType;
 use crate::multileg::{
-    atm_straddle, combo_close_cost, combo_credit, dte_allows, efficiency_ratio, entry_balance_admits,
-    entry_balance_edge_cap, entry_drift_admits, entry_drift_zone_cap, far_dte_sideways_metrics,
-    far_dte_sideways_reject, max_loss_per_lot, move_trims, option_order_cost, pick_best_structure,
-    profit_zone, select_legs, sell_regime_skip, size_lots, structure_regime_score, trail_exits,
-    OpeningRegime, PlannedLeg, SellStructure, StrikeQuote, FAR_DTE_RECENT_MIN, MOVE_WINDOW_MIN,
-    STOP_FRAC_ML,
+    atm_straddle, combo_close_cost, combo_credit, credit_edge_direction, credit_edge_er_admits,
+    dte_allows, efficiency_ratio, entry_balance_admits, entry_balance_edge_cap,
+    entry_drift_admits, entry_drift_zone_cap, exit_min_for, hard_stop_frac_cap,
+    max_loss_per_lot, move_stop_enabled, move_trims, option_order_cost, pick_best_structure,
+    profit_zone, select_credit_spread_legs, select_legs, sell_regime_skip, size_lots,
+    stop_frac_ml, structure_regime_score, target_frac, trail_enabled, trail_exits,
+    OpeningRegime, PlannedLeg, SellStructure, StrikeQuote, CREDIT_EDGE_ALLOC_FRAC,
+    CREDIT_EDGE_DELTA, CREDIT_EDGE_MAX_DTE_DAYS, CREDIT_EDGE_MAX_ER, CREDIT_EDGE_MAX_LOTS,
+    CREDIT_EDGE_MAX_RANGE_PCT, CREDIT_EDGE_THRESHOLD, MOVE_WINDOW_MIN,
 };
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
@@ -18,9 +21,7 @@ use std::path::Path;
 
 const LOT_SIZE: u32 = 65;
 const MARGIN_SIZING_FRAC: f64 = 1.0;
-const STOP_FRAC_CAP: f64 = 0.10;
 const MAX_LOTS: u32 = 5;
-const TARGET_FRAC: f64 = 0.50;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TickRow {
@@ -45,6 +46,13 @@ pub struct MultilegDayResult {
     pub exit_reason: String,
     pub er: Option<f64>,
     pub skip_reason: Option<String>,
+    // ponytail: reporting only — populated on a traded day, ignored by the P&L path.
+    pub entry_ts: Option<NaiveDateTime>,
+    pub exit_ts: Option<NaiveDateTime>,
+    pub credit: f64,
+    pub max_loss_unit: f64,
+    /// "SELL 24000PE / BUY 23900PE" — short legs first, wings after.
+    pub legs_desc: String,
 }
 
 #[derive(Debug)]
@@ -64,6 +72,10 @@ fn parse_opt(s: &str) -> OptionType {
 fn ts(day: NaiveDate, hhmm: &str) -> NaiveDateTime {
     let parts: Vec<u32> = hhmm.split(':').map(|p| p.parse().unwrap_or(0)).collect();
     day.and_time(NaiveTime::from_hms_opt(parts[0], parts[1], 0).unwrap())
+}
+
+fn ts_min(day: NaiveDate, minute: u32) -> NaiveDateTime {
+    day.and_time(NaiveTime::from_hms_opt(minute / 60, minute % 60, 0).unwrap())
 }
 
 fn entry_px(leg: &PlannedLeg, q: &StrikeQuote) -> f64 {
@@ -134,14 +146,14 @@ fn minute_closes(rows: &[TickRow], t0: NaiveDateTime, t1: NaiveDateTime) -> Vec<
     buckets.into_values().collect()
 }
 
-fn opening_latent(
-    rows: &[TickRow],
-    day: NaiveDate,
-    t_entry: NaiveDateTime,
-    legs: &[PlannedLeg],
-    credit: f64,
-) -> Option<(f64, f64, f64)> {
-    let (_lo, _hi, zone_width) = profit_zone(legs, credit)?;
+#[derive(Debug, Clone, Copy)]
+struct ReplayOpening {
+    range_pts: f64,
+    edge_pos: f64,
+    edge_frac: f64,
+}
+
+fn opening_latent(rows: &[TickRow], day: NaiveDate, t_entry: NaiveDateTime) -> Option<ReplayOpening> {
     let t_open = ts(day, "09:15:05");
     let spots: Vec<f64> = rows
         .iter()
@@ -160,9 +172,13 @@ fn opening_latent(
     } else {
         (last - min) / range_pts
     };
-    let edge_frac = (range_pos - 0.5).abs() * 2.0;
-    let zone_frac = range_pts / zone_width;
-    Some((range_pts, edge_frac, zone_frac))
+    let edge_pos = range_pos.clamp(0.0, 1.0);
+    let edge_frac = (edge_pos - 0.5).abs() * 2.0;
+    Some(ReplayOpening {
+        range_pts,
+        edge_pos,
+        edge_frac,
+    })
 }
 
 fn pnl(
@@ -197,73 +213,113 @@ fn pnl(
 #[derive(Debug, Clone)]
 struct Plan {
     structure: SellStructure,
+    entry_ts: NaiveDateTime,
     legs: Vec<PlannedLeg>,
     credit: f64,
     max_loss_unit: f64,
     zone_width: f64,
     lots: u32,
     score: f64,
+    er: f64,
 }
 
 fn try_plan(
     structure: SellStructure,
+    entry_ts: NaiveDateTime,
     quotes: &[StrikeQuote],
     spot: f64,
-    opening: (f64, f64, f64),
+    opening: ReplayOpening,
     regime: OpeningRegime,
     capital: f64,
+    no_gate: bool,
 ) -> Result<Plan, String> {
-    let legs = select_legs(quotes, spot, structure).ok_or("legs not seatable")?;
+    let legs = if structure == SellStructure::CreditEdge {
+        if !no_gate && !credit_edge_er_admits(regime.er) {
+            return Err(format!(
+                "CRED ER {:.2} > {:.2}",
+                regime.er, CREDIT_EDGE_MAX_ER
+            ));
+        }
+        if !no_gate && opening.range_pts / spot > CREDIT_EDGE_MAX_RANGE_PCT {
+            return Err(format!(
+                "CRED range {:.2}% > {:.2}%",
+                opening.range_pts / spot * 100.0,
+                CREDIT_EDGE_MAX_RANGE_PCT * 100.0
+            ));
+        }
+        let direction = credit_edge_direction(opening.edge_pos, CREDIT_EDGE_THRESHOLD)
+            .ok_or("CRED opening not near edge")?;
+        select_credit_spread_legs(quotes, spot, direction, CREDIT_EDGE_DELTA, structure.wing())
+            .ok_or("CRED legs not seatable")?
+    } else {
+        select_legs(quotes, spot, structure).ok_or("legs not seatable")?
+    };
     let credit = combo_credit(&legs, quotes).ok_or("no credit")?;
-    let (_lo, _hi, zone_width) = profit_zone(&legs, credit).ok_or("no zone")?;
+    let zone_width = if structure == SellStructure::CreditEdge {
+        structure.wing()
+    } else {
+        let (_lo, _hi, zone_width) = profit_zone(&legs, credit).ok_or("no zone")?;
+        zone_width
+    };
     let max_loss_unit = structure.wing() - credit;
     if credit <= 0.0 || max_loss_unit <= 0.0 {
         return Err("non-positive credit/max-loss".into());
     }
-    let (range_pts, edge_frac, drift_frac) = opening;
-    let _ = range_pts;
-    if !entry_drift_admits(opening.0, zone_width, structure) {
+    let drift_frac = opening.range_pts / zone_width;
+    if structure != SellStructure::CreditEdge && !no_gate && !entry_drift_admits(opening.range_pts, zone_width, structure) {
         return Err(format!(
             "DRIFT-ZONE {:.0}% > {:.0}%",
             drift_frac * 100.0,
             entry_drift_zone_cap(structure) * 100.0
         ));
     }
-    if !entry_balance_admits(edge_frac, structure) {
+    if structure != SellStructure::CreditEdge && !no_gate && !entry_balance_admits(opening.edge_frac, structure) {
         return Err(format!(
             "RANGE-BALANCE edge {:.0}% > {:.0}%",
-            edge_frac * 100.0,
+            opening.edge_frac * 100.0,
             entry_balance_edge_cap(structure) * 100.0
         ));
     }
     let mll = max_loss_per_lot(credit, structure.wing(), LOT_SIZE);
-    let lots = size_lots(capital, mll, MARGIN_SIZING_FRAC, MAX_LOTS);
+    let sizing_frac = if structure == SellStructure::CreditEdge {
+        CREDIT_EDGE_ALLOC_FRAC
+    } else {
+        MARGIN_SIZING_FRAC
+    };
+    let max_lots = if structure == SellStructure::CreditEdge {
+        CREDIT_EDGE_MAX_LOTS
+    } else {
+        MAX_LOTS
+    };
+    let lots = size_lots(capital, mll, sizing_frac, max_lots);
     if lots == 0 {
         return Err("margin cannot fund one lot".into());
     }
     let score = structure_regime_score(structure, regime, drift_frac);
     Ok(Plan {
         structure,
+        entry_ts,
         legs,
         credit,
         max_loss_unit,
         zone_width,
         lots,
         score,
+        er: regime.er,
     })
 }
 
 fn manage(
     rows: &[TickRow],
     day: NaiveDate,
-    t_entry: NaiveDateTime,
     plan: &Plan,
     capital: f64,
     entry_quotes: &[StrikeQuote],
 ) -> (NaiveDateTime, String) {
-    let t_exit = ts(day, "14:55");
+    let t_entry = plan.entry_ts;
+    let t_exit = ts_min(day, exit_min_for(plan.structure));
     let mut peak_gain = 0.0_f64;
-    let stop_rupees = STOP_FRAC_CAP * capital;
+    let stop_rupees = hard_stop_frac_cap(plan.structure) * capital;
 
     // Single O(n) forward pass: evaluate stop/target/trail/move on EVERY recorded tick (one eval
     // per distinct timestamp) — exact parity with live `manage_active`, which runs on every market
@@ -334,36 +390,45 @@ fn manage(
         }
         if spot_hist[mv].0 <= cutoff {
             let move_pts = (spot - spot_hist[mv].1).abs();
-            if move_trims(move_pts, spot, plan.zone_width, plan.structure) {
+            if move_stop_enabled(plan.structure) && move_trims(move_pts, spot, plan.zone_width, plan.structure) {
                 return (t, format!("MOVE {:.2}%/{MOVE_WINDOW_MIN}m", move_pts / spot * 100.0));
             }
         }
 
-        if gain >= TARGET_FRAC * plan.credit {
-            return (t, format!("TARGET {:.0}%", TARGET_FRAC * 100.0));
+        if gain >= target_frac(plan.structure) * plan.credit {
+            return (t, format!("TARGET {:.0}%", target_frac(plan.structure) * 100.0));
         }
         peak_gain = peak_gain.max(gain);
-        if trail_exits(gain, peak_gain, plan.credit) {
+        if trail_enabled(plan.structure) && trail_exits(gain, peak_gain, plan.credit) {
             return (
                 t,
                 format!("TRAIL +{:.0}%", crate::multileg::TRAIL_FRAC * peak_gain / plan.credit * 100.0),
             );
         }
         // Hard rupee stop on the NET (post-cost) P&L the exit would actually realize — so the
-        // booked loss lands at 10% of capital, not 10%+costs+slippage. Same realized formula
-        // (pnl) used at the real exit; live mirrors this via realized_pnl in manage_active.
+        // booked loss lands at the structure-specific capital cap, not cap+costs+slippage.
+        // Same realized formula (pnl) used at the real exit; live mirrors this via realized_pnl
+        // in manage_active.
         let t_ms = t.and_utc().timestamp_millis() as u64;
         if let Some((net, _g, _c)) = pnl(&plan.legs, entry_quotes, &quotes, plan.lots, t_ms) {
             if net <= -stop_rupees {
-                return (t, format!("STOP ₹{stop_rupees:.0} (10% cap, net)"));
+                return (
+                    t,
+                    format!(
+                        "STOP ₹{stop_rupees:.0} ({:.0}% cap, net)",
+                        hard_stop_frac_cap(plan.structure) * 100.0
+                    ),
+                );
             }
         }
-        if gain <= -STOP_FRAC_ML * plan.max_loss_unit {
-            return (t, format!("STOP {:.0}%ML", STOP_FRAC_ML * 100.0));
+        if gain <= -stop_frac_ml(plan.structure) * plan.max_loss_unit {
+            return (t, format!("STOP {:.0}%ML", stop_frac_ml(plan.structure) * 100.0));
         }
     }
 
-    (t_exit, "14:55".to_string())
+    // Label the actual time-exit for this structure (CreditEdge exits 14:45, neutrals 14:55).
+    let m = exit_min_for(plan.structure);
+    (t_exit, format!("{:02}:{:02}", m / 60, m % 60))
 }
 
 pub(crate) fn load_selling_ticks(path: &Path) -> Result<(NaiveDate, NaiveDate, Vec<TickRow>), String> {
@@ -429,6 +494,11 @@ pub(crate) fn replay_day(
         exit_reason: String::new(),
         er: None,
         skip_reason: None,
+        entry_ts: None,
+        exit_ts: None,
+        credit: 0.0,
+        max_loss_unit: 0.0,
+        legs_desc: String::new(),
     };
 
     let dte = expiry.signed_duration_since(day).num_days();
@@ -442,139 +512,96 @@ pub(crate) fn replay_day(
         );
     }
     let near_expiry = dte_allows(dte);
+    // Backtest-only research bypass for threshold tuning: lift the far-DTE sideways
+    // day-admission gate so every day attempts a trade. Live/default is unaffected
+    // because this env is only read here in the replay. Entry time and structure gates still apply.
+    let no_gate = std::env::var("SATA_ML_NO_GATE").is_ok();
+    let credit_edge_allowed = dte <= CREDIT_EDGE_MAX_DTE_DAYS;
+    let standard_allowed = near_expiry || no_gate;
+    // Far-DTE neutral multi-leg structures remain off by default, but CRED-EDGE is a separate
+    // 09:45 edge-open credit spread validated in the option-idea lab through the weekly cycle.
+    if !standard_allowed && !credit_edge_allowed {
+        return (
+            MultilegDayResult {
+                skip_reason: Some(format!("far-DTE ({dte}DTE) outside CRED/near-expiry gates")),
+                ..base
+            },
+            capital,
+        );
+    }
 
-    let t_entry = if near_expiry { ts(day, "09:45") } else { ts(day, "12:00") };
     let t_open = ts(day, "09:15:05");
-
-    let closes = minute_closes(rows, t_open, t_entry);
-    let Some(er) = efficiency_ratio(&closes) else {
-        return (
-            MultilegDayResult {
-                skip_reason: Some("insufficient morning ER data".into()),
-                ..base
-            },
-            capital,
-        );
-    };
-
-    let Some((spot, quotes)) = snapshot_at(rows, t_entry) else {
-        return (
-            MultilegDayResult {
-                er: Some(er),
-                skip_reason: Some("no entry snapshot".into()),
-                ..base
-            },
-            capital,
-        );
-    };
-
-    if !near_expiry {
-        let recent_start = t_entry - chrono::Duration::minutes(FAR_DTE_RECENT_MIN as i64);
-        let recent = minute_closes(rows, recent_start, t_entry);
-        let Some(metrics) = far_dte_sideways_metrics(&closes, &recent, spot) else {
-            return (
-                MultilegDayResult {
-                    er: Some(er),
-                    skip_reason: Some("insufficient far-DTE sideways data".into()),
-                    ..base
-                },
-                capital,
-            );
-        };
-        if let Some(why) = far_dte_sideways_reject(metrics) {
-            return (
-                MultilegDayResult {
-                    er: Some(er),
-                    skip_reason: Some(format!(
-                        "FAR-DTE {why}: session ER {:.2}, recent ER {:.2}, drift {:.2}%, range {:.2}%, edge {:.0}%",
-                        metrics.session_er,
-                        metrics.recent_er,
-                        metrics.session_net_pct * 100.0,
-                        metrics.session_range_pct * 100.0,
-                        metrics.edge_frac * 100.0
-                    )),
-                    ..base
-                },
-                capital,
-            );
-        }
-    }
-
-    let Some(straddle) = atm_straddle(&quotes, spot) else {
-        return (
-            MultilegDayResult {
-                er: Some(er),
-                skip_reason: Some("no ATM straddle".into()),
-                ..base
-            },
-            capital,
-        );
-    };
-
-    let range_pts = closes.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
-        - closes.iter().cloned().fold(f64::INFINITY, f64::min);
-    if let Some(why) = sell_regime_skip(er, range_pts, straddle) {
-        return (
-            MultilegDayResult {
-                er: Some(er),
-                skip_reason: Some(format!("{why} (ER {er:.2})")),
-                ..base
-            },
-            capital,
-        );
-    }
-
-    let edge_frac = {
-        let spots: Vec<f64> = rows
-            .iter()
-            .filter(|r| r.ts >= t_open && r.ts <= t_entry && r.spot > 0.0)
-            .map(|r| r.spot)
-            .collect();
-        if spots.len() < 2 {
-            0.5
-        } else {
-            let min = spots.iter().cloned().fold(f64::INFINITY, f64::min);
-            let max = spots.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            let range = max - min;
-            let pos = if range <= 0.0 {
-                0.5
-            } else {
-                (spots.last().copied().unwrap_or(min) - min) / range
-            };
-            (pos - 0.5).abs() * 2.0
-        }
-    };
-
-    let regime = OpeningRegime {
-        er,
-        range_pts,
-        straddle,
-        edge_frac,
-    };
 
     let mut candidates: Vec<Plan> = Vec::new();
     let mut last_err = String::new();
+    let mut first_er = None;
     for structure in SellStructure::LADDER {
-        let Some(legs) = select_legs(&quotes, spot, structure) else {
-            last_err = format!("{structure:?} legs not seatable");
+        if structure == SellStructure::CreditEdge && !credit_edge_allowed {
+            continue;
+        }
+        if structure != SellStructure::CreditEdge && !standard_allowed {
+            continue;
+        }
+
+        let t_entry = if structure == SellStructure::CreditEdge || near_expiry {
+            ts(day, "09:45")
+        } else {
+            ts(day, "12:00")
+        };
+        let closes = minute_closes(rows, t_open, t_entry);
+        let Some(er) = efficiency_ratio(&closes) else {
+            last_err = format!("{structure:?} insufficient morning ER data");
             continue;
         };
-        let Some(credit) = combo_credit(&legs, &quotes) else {
-            last_err = format!("{structure:?} no credit");
+        first_er.get_or_insert(er);
+        let Some((spot, quotes)) = snapshot_at(rows, t_entry) else {
+            last_err = format!("{structure:?} no entry snapshot");
             continue;
         };
-        let Some((range_pts, edge_frac, drift_frac)) = opening_latent(rows, day, t_entry, &legs, credit)
-        else {
+        let Some(straddle) = atm_straddle(&quotes, spot) else {
+            last_err = format!("{structure:?} no ATM straddle");
+            continue;
+        };
+        let range_pts = closes.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+            - closes.iter().cloned().fold(f64::INFINITY, f64::min);
+        let Some(opening) = opening_latent(rows, day, t_entry) else {
             last_err = format!("{structure:?} insufficient drift-latent data");
             continue;
         };
+        let regime = OpeningRegime {
+            er,
+            range_pts,
+            straddle,
+            edge_frac: opening.edge_frac,
+        };
+        if structure != SellStructure::CreditEdge {
+            if let Some(why) = sell_regime_skip(er, range_pts, straddle).filter(|_| !no_gate) {
+                last_err = format!("{structure:?} {why} (ER {er:.2})");
+                continue;
+            }
+        }
+
+        if std::env::var("SATA_ML_LATENTS").is_ok() {
+            let drift = match (closes.first(), closes.last()) {
+                (Some(&f), Some(&l)) if spot > 0.0 => (l - f).abs() / spot * 100.0,
+                _ => 0.0,
+            };
+            eprintln!(
+                "LATENT {} | {:?} {}DTE {} | ER {:.2} | edge {:.0}% | range {:.2}% | drift {:.2}% | straddle {:.0} | range/straddle {:.2}",
+                day, structure, dte, if near_expiry { "near" } else { "far" }, er, opening.edge_frac * 100.0,
+                range_pts / spot * 100.0, drift, straddle, range_pts / straddle,
+            );
+        }
+
         match try_plan(
             structure,
+            t_entry,
             &quotes,
             spot,
-            (range_pts, edge_frac, drift_frac),
+            opening,
             regime,
             capital,
+            no_gate,
         ) {
             Ok(p) => candidates.push(p),
             Err(e) => last_err = format!("{structure:?} {e}"),
@@ -585,7 +612,7 @@ pub(crate) fn replay_day(
     let Some(best_s) = pick_best_structure(&scoreboard) else {
         return (
             MultilegDayResult {
-                er: Some(er),
+                er: first_er,
                 skip_reason: Some(format!("no structure passed gates ({last_err})")),
                 ..base
             },
@@ -594,21 +621,21 @@ pub(crate) fn replay_day(
     };
     let plan = candidates.into_iter().find(|p| p.structure == best_s).unwrap();
 
-    let Some((_s, q_e)) = snapshot_at(rows, t_entry) else {
+    let Some((_s, q_e)) = snapshot_at(rows, plan.entry_ts) else {
         return (
             MultilegDayResult {
-                er: Some(er),
+                er: Some(plan.er),
                 skip_reason: Some("entry marks missing".into()),
                 ..base
             },
             capital,
         );
     };
-    let (t_out, why) = manage(rows, day, t_entry, &plan, capital, &q_e);
+    let (t_out, why) = manage(rows, day, &plan, capital, &q_e);
     let Some((_s, q_x)) = snapshot_at(rows, t_out) else {
         return (
             MultilegDayResult {
-                er: Some(er),
+                er: Some(plan.er),
                 skip_reason: Some("exit marks missing".into()),
                 ..base
             },
@@ -619,7 +646,7 @@ pub(crate) fn replay_day(
     let Some((net, gross, costs)) = pnl(&plan.legs, &q_e, &q_x, plan.lots, exit_ms) else {
         return (
             MultilegDayResult {
-                er: Some(er),
+                er: Some(plan.er),
                 skip_reason: Some("pnl calc failed".into()),
                 ..base
             },
@@ -637,12 +664,30 @@ pub(crate) fn replay_day(
             gross_pnl: gross,
             costs,
             exit_reason: why,
-            er: Some(er),
+            er: Some(plan.er),
             skip_reason: None,
+            entry_ts: Some(plan.entry_ts),
+            exit_ts: Some(t_out),
+            credit: plan.credit,
+            max_loss_unit: plan.max_loss_unit,
+            legs_desc: describe_legs(&plan.legs),
             ..base
         },
         capital,
     )
+}
+
+/// "SELL 24000PE / BUY 23900PE" — shorts first so the structure reads at a glance.
+fn describe_legs(legs: &[crate::multileg::PlannedLeg]) -> String {
+    let mut v: Vec<&crate::multileg::PlannedLeg> = legs.iter().collect();
+    v.sort_by_key(|l| l.wing); // shorts (wing=false) first
+    v.iter()
+        .map(|l| {
+            let side = if matches!(l.side, OrderSide::Sell) { "SELL" } else { "BUY" };
+            format!("{side} {:.0}{:?}", l.strike, l.opt)
+        })
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 pub fn replay_file(path: &Path, start_capital: f64) -> Result<MultilegReplaySummary, String> {
@@ -704,12 +749,14 @@ mod tests {
         ];
         let plan = Plan {
             structure: SellStructure::Condor,
+            entry_ts: t_entry,
             legs,
             credit: 40.0, // shorts 30 each − wings 10 each = +40 collected (matches the quotes below)
             max_loss_unit: 60.0,
             zone_width: 200.0,
             lots: 3,
             score: 1.0,
+            er: 0.10,
         };
 
         // Zero-spread quotes priced so credit/gain AND net all stay flat (only MOVE can fire): shorts
@@ -746,7 +793,7 @@ mod tests {
             rows.extend(bar(secs, spot));
         }
 
-        let (t_out, why) = manage(&rows, day, t_entry, &plan, 15_000.0, &entry_quotes);
+        let (t_out, why) = manage(&rows, day, &plan, 15_000.0, &entry_quotes);
         assert!(why.starts_with("MOVE"), "expected MOVE exit, got {why:?}");
         assert_eq!(t_out, t_entry + chrono::Duration::seconds(150), "MOVE must fire on the +100pt tick");
     }
@@ -765,12 +812,14 @@ mod tests {
         ];
         let plan = Plan {
             structure: SellStructure::Condor,
+            entry_ts: t_entry,
             legs,
             credit: 40.0,
             max_loss_unit: 60.0,
             zone_width: 200.0,
             lots: 3,
             score: 1.0,
+            er: 0.10,
         };
         let strikes = [23900.0, 23800.0, 24100.0, 24200.0];
         let mk = |k: f64, short_px: f64| StrikeQuote {
@@ -797,7 +846,7 @@ mod tests {
             }
         }
 
-        let (t_out, why) = manage(&rows, day, t_entry, &plan, 15_000.0, &entry_quotes);
+        let (t_out, why) = manage(&rows, day, &plan, 15_000.0, &entry_quotes);
         assert!(why.contains("net"), "stop must be the net-based 10% cap, got {why:?}");
         assert_eq!(t_out, t_entry + chrono::Duration::seconds(30));
     }

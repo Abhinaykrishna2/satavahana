@@ -98,6 +98,15 @@ pub struct SpotReversal {
     pub lookback_bars: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DirectionalExtension {
+    pub extreme: f64,
+    pub current: f64,
+    pub points: f64,
+    pub pct: f64,
+    pub lookback_bars: usize,
+}
+
 // ─── Fixed periods (textbook; never tuned to captured data) ──────────────────
 const EMA_FAST: usize = 9;
 const EMA_SLOW: usize = 21;
@@ -561,6 +570,51 @@ impl SpotSeries {
         }
     }
 
+    /// Distance already travelled from the recent closed-bar extreme to `current_price`.
+    /// The extreme is taken only from CLOSED bars; the current price is the live decision tick.
+    pub fn directional_extension_from_extreme(
+        &self,
+        direction: Direction,
+        lookback_bars: usize,
+        current_price: f64,
+    ) -> Option<DirectionalExtension> {
+        if direction == Direction::Neutral
+            || lookback_bars == 0
+            || current_price <= 0.0
+            || self.bars.is_empty()
+        {
+            return None;
+        }
+
+        let observed = self.bars.len().min(lookback_bars);
+        let bars = self.bars.iter().rev().take(observed);
+        let extreme = match direction {
+            Direction::Bear => bars.map(|b| b.high).fold(f64::NEG_INFINITY, f64::max),
+            Direction::Bull => bars.map(|b| b.low).fold(f64::INFINITY, f64::min),
+            Direction::Neutral => return None,
+        };
+        if !extreme.is_finite() || extreme <= 0.0 {
+            return None;
+        }
+
+        let points = match direction {
+            Direction::Bear => extreme - current_price,
+            Direction::Bull => current_price - extreme,
+            Direction::Neutral => return None,
+        };
+        if points <= 0.0 {
+            return None;
+        }
+
+        Some(DirectionalExtension {
+            extreme,
+            current: current_price,
+            points,
+            pct: points / extreme,
+            lookback_bars: observed,
+        })
+    }
+
     pub fn technical_summary(&self) -> Option<String> {
         if self.bars.is_empty() {
             return None;
@@ -613,6 +667,12 @@ impl SpotSeries {
         }
 
         Some(parts.join(", "))
+    }
+
+    /// Latest closed-bar RSI used by strategy gates that need the scalar value, not just the
+    /// directional vote inside `bias()`.
+    pub fn rsi14(&self) -> Option<f64> {
+        Self::rsi(&self.closes(), RSI_PERIOD)
     }
 
     pub fn scalp_assessment(&self, direction: Direction) -> Option<ScalpAssessment> {
@@ -817,6 +877,23 @@ mod tests {
     }
 
     #[test]
+    fn rsi14_accessor_matches_wilder_rsi() {
+        let closes = [
+            44.34, 44.09, 44.15, 43.61, 44.33,
+            44.83, 45.10, 45.42, 45.84, 46.08,
+            45.89, 46.03, 45.61, 46.28, 46.28,
+        ];
+        let mut s = SpotSeries::new();
+        for (idx, close) in closes.iter().enumerate() {
+            s.ingest(idx as u64 * 60_000, *close);
+        }
+        s.ingest(closes.len() as u64 * 60_000, *closes.last().unwrap());
+
+        let rsi = s.rsi14().expect("RSI should form from closed bars");
+        assert!((rsi - 70.46).abs() < 0.05, "unexpected accessor RSI {rsi}");
+    }
+
+    #[test]
     fn fibonacci_levels_and_vote_use_recent_closed_swing() {
         let mut up = SpotSeries::new();
         feed_trend(&mut up, 100.0, 1.0, 30);
@@ -932,6 +1009,31 @@ mod tests {
             s.reversal_break().unwrap().move_pct,
             before,
             "in-progress collapse must not alter the closed-bar reversal"
+        );
+    }
+
+    #[test]
+    fn directional_extension_uses_closed_extreme_and_live_price() {
+        let mut s = SpotSeries::new();
+        feed_trend(&mut s, 100.0, 1.0, 70);
+
+        let ext = s
+            .directional_extension_from_extreme(Direction::Bear, 60, 130.0)
+            .expect("drop from recent high should be measured");
+        assert_eq!(ext.lookback_bars, 60);
+        assert!(ext.extreme > 160.0, "recent closed high should come from closed bars");
+        assert!(ext.points > 30.0);
+
+        let before = ext.points;
+        for k in 0..20u64 {
+            s.ingest(70 * 60_000 + 2_000 + k * 100, 999.0);
+        }
+        let after = s
+            .directional_extension_from_extreme(Direction::Bear, 60, 130.0)
+            .unwrap();
+        assert_eq!(
+            after.points, before,
+            "same-minute in-progress spike must not change the recent extreme"
         );
     }
 }

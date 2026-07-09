@@ -14,9 +14,29 @@ use tracing::{error, info, warn};
 
 const NSE_OPTIONS_EXCHANGE_TXN_RATE: f64 = 0.000311;
 const LIVE_ENTRY_LIMIT_PAYUP_INR: f64 = 0.25;
+const ENTRY_SCAN_VALIDATION_GRACE_MS: u64 = 5_000;
 // Options below ₹30 are typically deep OTM or near-expiry junk — bid-ask spread
 // alone can be ₹2-5 (7-16% of price), making fills far worse than the mid-price.
 const MIN_TRADEABLE_OPTION_PRICE: f64 = 30.0;
+const LATE_0DTE_REVERSAL_LOOKBACK_BARS: usize = 60;
+const LATE_0DTE_REVERSAL_MIN_POINTS: f64 = 55.0;
+const LATE_0DTE_REVERSAL_MIN_PCT: f64 = 0.0020;
+const STANDALONE_SPOT_REVERSAL_CE_RSI_MAX: f64 = 70.0;
+const STANDALONE_SPOT_REVERSAL_PE_RSI_MIN: f64 = 35.0;
+const COMPOSITE_SPOT_REVERSAL_MIN_MOVE_PCT: f64 = 0.0018;
+const FAR_DTE_COMPOSITE_MIN_DTE: f64 = 3.5;
+const FAR_DTE_COMPOSITE_CE_RSI_MAX: f64 = 70.0;
+const FAR_DTE_COMPOSITE_PE_RSI_MIN: f64 = 30.0;
+const MAX_CE_OTM_STEPS: usize = 3;
+const MAX_PE_OTM_STEPS: usize = 3;
+// Cold-start Kelly is 16.25%; 3.0 caps a fresh one-lot entry near 49% of
+// deployable capital, enough for ATM-adjacent NIFTY options without scaling lots.
+const ENTRY_EXPOSURE_KELLY_MULT: f64 = 3.0;
+const RIGID_EXIT_MAX_DTE: f64 = 1.0;
+const RIGID_PROFIT_LOCK_ARM_PCT: f64 = 12.0;
+const RIGID_PROFIT_LOCK_GAIN_PCT: f64 = 2.0;
+const RIGID_TRAIL_ARM_PCT: f64 = 15.0;
+const RIGID_TRAIL_GIVEBACK_PCT: f64 = 50.0;
 
 /// Flat Zerodha options brokerage per EXECUTED ORDER (not per lot). Bug 5: this was
 /// baked into the per-lot cost and multiplied by lots, over-charging multi-lot orders
@@ -232,6 +252,35 @@ impl std::fmt::Display for StrategyType {
     }
 }
 
+fn standalone_spot_reversal_is_late_rsi_chase(action: SignalAction, rsi: f64) -> bool {
+    match action {
+        SignalAction::BuyCE => rsi >= STANDALONE_SPOT_REVERSAL_CE_RSI_MAX,
+        SignalAction::BuyPE => rsi <= STANDALONE_SPOT_REVERSAL_PE_RSI_MIN,
+        _ => false,
+    }
+}
+
+fn composite_spot_reversal_passes_quality(
+    action: SignalAction,
+    reversal: &crate::technicals::SpotReversal,
+) -> bool {
+    let desired_direction = match action {
+        SignalAction::BuyCE => crate::technicals::Direction::Bull,
+        SignalAction::BuyPE => crate::technicals::Direction::Bear,
+        _ => return false,
+    };
+    reversal.direction == desired_direction
+        && reversal.move_pct >= COMPOSITE_SPOT_REVERSAL_MIN_MOVE_PCT
+}
+
+fn far_dte_composite_is_late_rsi_chase(action: SignalAction, rsi: f64) -> bool {
+    match action {
+        SignalAction::BuyCE => rsi >= FAR_DTE_COMPOSITE_CE_RSI_MAX,
+        SignalAction::BuyPE => rsi <= FAR_DTE_COMPOSITE_PE_RSI_MIN,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SessionPhase {
     PreOpen,
@@ -257,6 +306,15 @@ impl std::fmt::Display for SessionPhase {
     }
 }
 
+fn far_dte_composite_midday_block(
+    dominant_signal_count: usize,
+    days_to_expiry: f64,
+    session: SessionPhase,
+) -> bool {
+    dominant_signal_count > 1
+        && days_to_expiry > FAR_DTE_COMPOSITE_MIN_DTE
+        && matches!(session, SessionPhase::Midday)
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct StrikeLevel {
@@ -597,7 +655,9 @@ impl RiskEngine {
         let risk_per_lot = (stop_loss_pct * option_price * lot_size as f64).max(1.0);
         let lots_from_risk = (max_risk_capital / risk_per_lot).floor() as u32;
 
-        let lots_from_exposure = (deployable * (kelly * 2.5).min(0.95) / cost_per_lot).floor() as u32;
+        let lots_from_exposure =
+            (deployable * (kelly * ENTRY_EXPOSURE_KELLY_MULT).min(0.95) / cost_per_lot)
+                .floor() as u32;
 
         // STRICT half-Kelly: NO `.max(1)` floor. If one lot's stop-risk exceeds the
         // half-Kelly budget (`lots_from_risk == 0`), return 0 → the caller SKIPS the
@@ -611,7 +671,8 @@ impl RiskEngine {
         let available = self.available_capital();
         let sizing_capital = available.min(self.daily_start_capital);
         let deployable = (sizing_capital - options_brokerage_per_order()).max(0.0);
-        deployable * (self.kelly_fraction() * 2.5).min(0.95) + options_brokerage_per_order()
+        deployable * (self.kelly_fraction() * ENTRY_EXPOSURE_KELLY_MULT).min(0.95)
+            + options_brokerage_per_order()
     }
 
     fn reserve_capital(&mut self, amount: f64) -> bool {
@@ -801,6 +862,10 @@ pub struct OptionsEngine {
 
     profit_target_pct: f64,
     stop_loss_pct: f64,
+    profit_lock_arm_pct: f64,
+    profit_lock_gain_pct: f64,
+    trail_arm_pct: f64,
+    trail_giveback_pct: f64,
     min_confidence: f64,
     expiry_day_min_confidence: f64,
 
@@ -920,6 +985,10 @@ impl OptionsEngine {
             next_sig_id: 1,
             profit_target_pct: cfg.profit_target_pct.clamp(1.0, 200.0),
             stop_loss_pct: cfg.stop_loss_pct.clamp(1.0, 95.0),
+            profit_lock_arm_pct: cfg.profit_lock_arm_pct.clamp(1.0, 100.0),
+            profit_lock_gain_pct: cfg.profit_lock_gain_pct.clamp(0.0, 50.0),
+            trail_arm_pct: cfg.trail_arm_pct.clamp(1.0, 150.0),
+            trail_giveback_pct: cfg.trail_giveback_pct.clamp(5.0, 95.0),
             min_confidence: cfg.min_confidence.clamp(0.0, 100.0),
             expiry_day_min_confidence: cfg.expiry_day_min_confidence.clamp(0.0, 100.0),
             risk_free_rate,
@@ -1035,6 +1104,13 @@ impl OptionsEngine {
 
     fn clear_clock_override(&mut self) {
         self.clock_override_ms = None;
+    }
+
+    fn process_market_tick(&mut self) {
+        self.process_order_updates();
+        self.poll_pending_orders();
+        self.check_open_positions();
+        self.execute_pending_signals();
     }
 
     pub fn process_replay_tick(&mut self, timestamp_ms: u64) {
@@ -1913,9 +1989,7 @@ impl OptionsEngine {
                         match tick_result {
                             Ok(_event) => {
                                 self.clear_clock_override();
-                                self.process_order_updates();
-                                self.poll_pending_orders();
-                                self.check_open_positions();
+                                self.process_market_tick();
                             }
                             Err(broadcast::error::RecvError::Lagged(n)) => {
                                 warn!("Options engine lagged by {} messages", n);
@@ -2222,11 +2296,12 @@ impl OptionsEngine {
                 continue;
             }
             // Don't apply scan-based cancellation to orders placed in the current scan cycle.
-            // execute_pending_signals() runs at the START of run_full_scan() — the Place command
-            // hasn't even reached the broker yet when validate runs at the END of the same call.
-            // Waiting until the next scan (scan_count > placed_at_scan_count) gives the broker
-            // time to confirm the fill and set order_id, at which point the guard above applies.
-            if pending.placed_at_scan_count >= self.scan_count {
+            // Tick-driven pending-entry execution can also place an order shortly before the
+            // next scan, so require both a later scan and a short wall-clock grace before using
+            // scan results to cancel an order that has not yet received a broker order_id.
+            if pending.placed_at_scan_count >= self.scan_count
+                || now.saturating_sub(pending.placed_ms) < ENTRY_SCAN_VALIDATION_GRACE_MS
+            {
                 continue;
             }
             let result = match self.last_scan_result.get(&pending.signal.underlying) {
@@ -3176,9 +3251,8 @@ impl OptionsEngine {
         let mut technical_note: Option<String> = None;
 
         // ── Technical confirmation gate (HARD veto on direction conflict) ──
-        // Only trade when the chain's chosen direction AGREES with the spot's price-action
-        // bias. A BuyPE (bearish) into a CONFIRMED uptrend — exactly today's losing trade —
-        // is vetoed. Neutral/unformed bias passes (no protection until indicators form).
+        // Short-dated gamma/reversal trades may lead slower indicators; far-DTE option buys
+        // need spot confirmation because they are mostly directional delta bets.
         if let Some(series) = self.spot_series.get(&snap.underlying) {
             let b = series.bias();
             let summary = series
@@ -3211,6 +3285,23 @@ impl OptionsEngine {
                 SignalAction::BuyPE => !series.allows_bearish(),
                 _ => false,
             };
+            if snap.days_to_expiry > 3.5
+                && desired_direction != crate::technicals::Direction::Neutral
+                && b.direction != desired_direction
+            {
+                warn!(
+                    "  {} gen_signals: {:?} VETOED — {:.1} DTE directional buy requires spot technical {:?}, got {:?} (strength {:.2}); {}{}",
+                    snap.underlying,
+                    dominant_action,
+                    snap.days_to_expiry,
+                    desired_direction,
+                    b.direction,
+                    b.strength,
+                    summary,
+                    scalp
+                );
+                return signals;
+            }
             if veto && !dominant_has_spot_reversal {
                 warn!(
                     "  {} gen_signals: {:?} VETOED by technicals — price-action bias {:?} (strength {:.2}) conflicts; {}",
@@ -3249,11 +3340,9 @@ impl OptionsEngine {
             }
         }
 
-        // 2026-06-30 fingerprint: expiry-morning compression with very low PCR created a false
-        // bearish read from call-writing/strike pinning. In that setup, the first PE cluster
-        // repeatedly stopped out before the tape developed real downside breadth. Keep later
-        // expiry-day PE continuation available once PCR normalizes, and keep multi-day trades out
-        // of this gate entirely.
+        // Very low-PCR expiry-morning compression is often strike-pinning/call-writing skew,
+        // not confirmed downside breadth. Keep later expiry-day PE continuation available once
+        // PCR normalizes, and keep multi-day trades out of this gate.
         if dominant_action == SignalAction::BuyPE
             && snap.days_to_expiry < 0.5
             && matches!(self.current_session(), SessionPhase::Morning)
@@ -3295,6 +3384,74 @@ impl OptionsEngine {
             return signals;
         }
 
+        let session_now = self.current_session();
+        let dominant_has_flow_confirmation = dominant_signals.iter().any(|(_, _, strat, _)| {
+            matches!(strat, StrategyType::OIDivergence | StrategyType::TrendFollow)
+        });
+        if dominant_signals.len() > 1 && !dominant_has_flow_confirmation {
+            if !dominant_has_spot_reversal {
+                warn!(
+                    "  {} gen_signals: {:?} composite blocked — GEX/IV/regime score has no fresh OI/volume flow or spot-reversal trigger",
+                    snap.underlying, dominant_action
+                );
+                return signals;
+            }
+
+            let reversal = self
+                .spot_series
+                .get(&snap.underlying)
+                .and_then(|series| series.reversal_break());
+            match reversal {
+                Some(r) if composite_spot_reversal_passes_quality(dominant_action, &r) => {}
+                Some(r) => {
+                    warn!(
+                        "  {} gen_signals: {:?} composite blocked — no fresh flow and weak spot-reversal move {:.2}% (<{:.2}%)",
+                        snap.underlying,
+                        dominant_action,
+                        r.move_pct * 100.0,
+                        COMPOSITE_SPOT_REVERSAL_MIN_MOVE_PCT * 100.0
+                    );
+                    return signals;
+                }
+                None => {
+                    warn!(
+                        "  {} gen_signals: {:?} composite blocked — no fresh flow and no current spot-reversal trigger",
+                        snap.underlying, dominant_action
+                    );
+                    return signals;
+                }
+            }
+        }
+        if far_dte_composite_midday_block(dominant_signals.len(), snap.days_to_expiry, session_now) {
+            warn!(
+                "  {} gen_signals: {:?} composite blocked — {:.1} DTE midday directional buy is treated as late score-stacking, not an opening/afternoon edge",
+                snap.underlying,
+                dominant_action,
+                snap.days_to_expiry
+            );
+            return signals;
+        }
+        if dominant_signals.len() > 1 && snap.days_to_expiry > FAR_DTE_COMPOSITE_MIN_DTE {
+            if let Some(rsi) = self
+                .spot_series
+                .get(&snap.underlying)
+                .and_then(|series| series.rsi14())
+            {
+                if far_dte_composite_is_late_rsi_chase(dominant_action, rsi) {
+                    warn!(
+                        "  {} gen_signals: {:?} composite blocked — {:.1} DTE late RSI chase (RSI14 {:.1}; CE max {:.0}, PE min {:.0})",
+                        snap.underlying,
+                        dominant_action,
+                        snap.days_to_expiry,
+                        rsi,
+                        FAR_DTE_COMPOSITE_CE_RSI_MAX,
+                        FAR_DTE_COMPOSITE_PE_RSI_MIN
+                    );
+                    return signals;
+                }
+            }
+        }
+
         let (composite_score, mut merged_reasons, primary_strategy) = {
 
             let max_score = dominant_signals.iter().map(|(_, s, _, _)| *s).fold(0.0_f64, f64::max);
@@ -3321,7 +3478,75 @@ impl OptionsEngine {
             snap.underlying, dominant_action, composite_score, confidence_floor, n_dominant);
         if composite_score < confidence_floor { return signals; }
 
-        let session_now = self.current_session();
+        if primary_strategy == StrategyType::SpotReversal {
+            if let Some(rsi) = self
+                .spot_series
+                .get(&snap.underlying)
+                .and_then(|series| series.rsi14())
+            {
+                if standalone_spot_reversal_is_late_rsi_chase(dominant_action, rsi) {
+                    warn!(
+                        "  {} gen_signals: {:?} blocked — standalone spot-reversal late RSI chase (RSI14 {:.1}; CE max {:.0}, PE min {:.0})",
+                        snap.underlying,
+                        dominant_action,
+                        rsi,
+                        STANDALONE_SPOT_REVERSAL_CE_RSI_MAX,
+                        STANDALONE_SPOT_REVERSAL_PE_RSI_MIN
+                    );
+                    return signals;
+                }
+            }
+        }
+
+        // In 0-DTE midday compression, a spot-reversal after a large extension is often a
+        // late gamma chase. Keep morning expiry gamma and strongly PCR-confirmed continuation.
+        if dominant_has_spot_reversal
+            && matches!(session_now, SessionPhase::Midday)
+            && snap.days_to_expiry < 0.5
+            && compressive
+        {
+            let direction = match dominant_action {
+                SignalAction::BuyCE => crate::technicals::Direction::Bull,
+                SignalAction::BuyPE => crate::technicals::Direction::Bear,
+                _ => crate::technicals::Direction::Neutral,
+            };
+            let weak_chain_confirmation = match dominant_action {
+                SignalAction::BuyPE => snap.pcr_oi >= 0.90,
+                SignalAction::BuyCE => snap.pcr_oi <= 1.10,
+                _ => false,
+            };
+            if weak_chain_confirmation {
+                if let Some(ext) = self
+                    .spot_series
+                    .get(&snap.underlying)
+                    .and_then(|series| {
+                        series.directional_extension_from_extreme(
+                            direction,
+                            LATE_0DTE_REVERSAL_LOOKBACK_BARS,
+                            snap.spot,
+                        )
+                    })
+                {
+                    if ext.points >= LATE_0DTE_REVERSAL_MIN_POINTS
+                        && ext.pct >= LATE_0DTE_REVERSAL_MIN_PCT
+                    {
+                        warn!(
+                            "  {} gen_signals: {:?} blocked — late 0-DTE midday spot-reversal chase after {:.0}pt ({:.2}%) from {:.0} to {:.0} over {} bars with weak PCR {:.2}",
+                            snap.underlying,
+                            dominant_action,
+                            ext.points,
+                            ext.pct * 100.0,
+                            ext.extreme,
+                            ext.current,
+                            ext.lookback_bars,
+                            snap.pcr_oi
+                        );
+                        return signals;
+                    }
+                }
+            }
+        }
+
         if matches!(session_now, SessionPhase::Midday)
             && snap.days_to_expiry > 3.5
             && matches!(dominant_action, SignalAction::BuyPE)
@@ -3608,10 +3833,11 @@ impl OptionsEngine {
                 picked_price,
                 otm_steps,
             );
-            // PE: max 2 OTM — deep OTM puts need large spot drops to profit; every
-            // winning PE in backtest used 0-1 OTM. CE: max 3 — markets trend up
-            // more smoothly and 3-OTM CEs have delivered (Apr 02: +₹6,134).
-            let max_otm = if *action == SignalAction::BuyPE { 2 } else { 3 };
+            let max_otm = if *action == SignalAction::BuyPE {
+                MAX_PE_OTM_STEPS
+            } else {
+                MAX_CE_OTM_STEPS
+            };
             if otm_steps > max_otm {
                 warn!(
                     "  pick_strike {} {:?}: {} OTM steps exceeds max {}, skipping",
@@ -4888,14 +5114,21 @@ impl OptionsEngine {
         let hard_close_all = close_ist_mins >= 920;
 
         // Two-stage profit protection (same code path for live + backtest):
-        //   • +12% gain (≥3-min hold): one-shot lock — stop → entry+2%, governs the +12–15% zone.
-        //   • +15%+ : half-of-peak trail — stop ratchets to (entry+peak)/2, i.e. give back at most
-        //     50% of the peak gain before closing (mirrors the multi-leg trail).
+        //   • profit_lock_arm_pct gain (≥3-min hold): one-shot lock above entry.
+        //   • trail_arm_pct gain: peak-giveback trail ratchets the stop upward.
         let now_ms = self.current_time_ms();
         for i in 0..self.positions.len() {
-            let (is_open, option_token, entry_price, entry_time_ms) = {
+            let (is_open, option_token, entry_price, entry_time_ms, days_to_expiry, strategy, session) = {
                 let pos = &self.positions[i];
-                (pos.is_open, pos.option_token, pos.entry_price, pos.entry_time_ms)
+                (
+                    pos.is_open,
+                    pos.option_token,
+                    pos.entry_price,
+                    pos.entry_time_ms,
+                    pos.entry_ctx.days_to_expiry,
+                    pos.strategy,
+                    pos.entry_ctx.session.clone(),
+                )
             };
             if !is_open { continue; }
 
@@ -4905,21 +5138,37 @@ impl OptionsEngine {
             };
             if entry_price <= 0.0 { continue; }
 
-            // One-shot profit lock — "free-flow" design (replaces the continuous 2.5% trail
-            // that chopped winners out on intraday noise before the move developed):
-            //   • below +15% gain: NO stop change — the trade rides on its original loss-stop
-            //     and is never knocked out by a shallow wobble (the +7% chop that cost the
-            //     +116% runner on 2026-06-24).
-            //   • at +12% gain (min 3-min hold): make EXACTLY ONE update — stop → entry+2%.
-            //     Downside is now capped at +2%; upside stays uncapped up to the strategy
-            //     target (~+25%). No further stop moves after this one ("free flow").
-            //   • checkpoints_evaluated → 3 so the hold cap extends to 240 min (room to target).
+            // One-shot profit lock: below the arm threshold the original stop stays in place;
+            // after the lock, the hold cap is extended so eligible runners have room to target.
             let hold_mins = (now_ms.saturating_sub(entry_time_ms)) as f64 / 60_000.0;
             let abs_gain_pct = (current_price - entry_price) / entry_price * 100.0;
-            if abs_gain_pct >= 12.0 && hold_mins >= 3.0 {
+            let runner_exit = days_to_expiry > RIGID_EXIT_MAX_DTE
+                && matches!(strategy, StrategyType::SpotReversal)
+                && session == SessionPhase::Morning.to_string();
+            let profit_lock_arm_pct = if runner_exit {
+                self.profit_lock_arm_pct
+            } else {
+                RIGID_PROFIT_LOCK_ARM_PCT
+            };
+            let profit_lock_gain_pct = if runner_exit {
+                self.profit_lock_gain_pct
+            } else {
+                RIGID_PROFIT_LOCK_GAIN_PCT
+            };
+            let trail_arm_pct = if runner_exit {
+                self.trail_arm_pct
+            } else {
+                RIGID_TRAIL_ARM_PCT
+            };
+            let trail_giveback_pct = if runner_exit {
+                self.trail_giveback_pct
+            } else {
+                RIGID_TRAIL_GIVEBACK_PCT
+            };
+            if abs_gain_pct >= profit_lock_arm_pct && hold_mins >= 3.0 {
                 let pos = &mut self.positions[i];
                 if !pos.breakeven_stop_set {
-                    let raw_lock = entry_price * 1.02;
+                    let raw_lock = entry_price * (1.0 + profit_lock_gain_pct / 100.0);
                     let target_guard = if pos.target_price > entry_price {
                         (pos.target_price * 0.995).max(entry_price)
                     } else {
@@ -4931,14 +5180,13 @@ impl OptionsEngine {
                     }
                     pos.breakeven_stop_set = true;
                     pos.checkpoints_evaluated = 3;
-                    info!("  Profit-lock +{:.1}%: pos #{} {} stop → ₹{:.2} (entry+2%), free-flow to target (ltp ₹{:.2})",
-                        abs_gain_pct, pos.id, pos.underlying, pos.stop_price, current_price);
+                    info!("  Profit-lock +{:.1}%: pos #{} {} stop → ₹{:.2} (entry+{:.1}%), free-flow to target (ltp ₹{:.2})",
+                        abs_gain_pct, pos.id, pos.underlying, pos.stop_price, profit_lock_gain_pct, current_price);
                 }
             }
 
-            // +15% half-of-peak trail (mirrors the multi-leg trail exactly: arm at 0.15, give
-            // back 0.50 of peak). Once the option reaches +15%, ratchet the stop to halfway
-            // between entry and the current price = give back at most 50% of the PEAK gain before
+            // Peak-giveback trail. Once the option reaches the configured trail arm, ratchet the
+            // stop so only a configured fraction of the peak gain can be given back before
             // closing. The `> stop_price` guard makes it a one-way ratchet: it locks the running
             // peak (when current == peak the midpoint is highest and is stored) and never lowers,
             // so a pullback can only hit it, not reset it. Sits ABOVE the +2% lock; the strategy
@@ -4946,9 +5194,10 @@ impl OptionsEngine {
             // No time gate (matches multileg::trail_exits, which arms purely on the peak
             // threshold) — a sub-3-min spike-then-crash is still protected. The +15% trigger is
             // itself the noise filter.
-            if abs_gain_pct >= 15.0 {
+            if abs_gain_pct >= trail_arm_pct {
                 let pos = &mut self.positions[i];
-                let raw_trail = (entry_price + current_price) / 2.0;
+                let keep_fraction = (1.0 - trail_giveback_pct / 100.0).clamp(0.05, 0.95);
+                let raw_trail = entry_price + (current_price - entry_price) * keep_fraction;
                 // Never park the trail on/above a tight target (the target fires first anyway) —
                 // same guard the +2% lock uses.
                 let trail_stop = if pos.target_price > entry_price {
@@ -4959,8 +5208,8 @@ impl OptionsEngine {
                 if trail_stop > pos.stop_price {
                     pos.stop_price = trail_stop;
                     pos.checkpoints_evaluated = pos.checkpoints_evaluated.max(3);
-                    info!("  Trail +{:.1}% (50%-of-peak): pos #{} {} stop → ₹{:.2} (ltp ₹{:.2})",
-                        abs_gain_pct, pos.id, pos.underlying, pos.stop_price, current_price);
+                    info!("  Trail +{:.1}% ({:.0}% giveback): pos #{} {} stop → ₹{:.2} (ltp ₹{:.2})",
+                        abs_gain_pct, trail_giveback_pct, pos.id, pos.underlying, pos.stop_price, current_price);
                 }
             }
         }
@@ -5146,9 +5395,14 @@ mod tests {
         entry_cost_per_lot_excl_brokerage,
         entry_cutoff_ist_mins_for_dte,
         entry_order_cost,
+        ENTRY_SCAN_VALIDATION_GRACE_MS,
         nearest_affordable_otm_idx,
         options_brokerage_per_order,
         past_entry_cutoff_ist,
+        composite_spot_reversal_passes_quality,
+        far_dte_composite_midday_block,
+        far_dte_composite_is_late_rsi_chase,
+        standalone_spot_reversal_is_late_rsi_chase,
         OptionsEngine,
         PendingEntryOrder,
         PendingExitOrder,
@@ -5164,8 +5418,9 @@ mod tests {
     use crate::config::OptionsEngineConfig;
     use crate::execution::{OrderCommand, OrderSide, OrderUpdate};
     use crate::ledger::EntryContext;
-    use crate::models::{Tick, TickMode};
+    use crate::models::{OptionContract, OptionType, Tick, TickMode};
     use crate::store::TickStore;
+    use chrono::TimeZone;
     use std::collections::HashMap;
 
     fn test_config() -> OptionsEngineConfig {
@@ -5176,6 +5431,10 @@ mod tests {
             max_daily_profit_pct: 35.0,
             profit_target_pct: 55.0,
             stop_loss_pct: 35.0,
+            profit_lock_arm_pct: 12.0,
+            profit_lock_gain_pct: 2.0,
+            trail_arm_pct: 15.0,
+            trail_giveback_pct: 50.0,
             min_confidence: 60.0,
             expiry_day_min_confidence: 60.0,
             scan_interval_secs: 45,
@@ -5189,6 +5448,141 @@ mod tests {
             session: SessionPhase::Morning.to_string(),
             ..EntryContext::default()
         }
+    }
+
+    fn test_ist_ms(hour: u32, minute: u32, second: u32) -> u64 {
+        let ist = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
+        ist.with_ymd_and_hms(2026, 7, 3, hour, minute, second)
+            .single()
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            .timestamp_millis() as u64
+    }
+
+    fn test_contract() -> OptionContract {
+        OptionContract {
+            instrument_token: 101,
+            tradingsymbol: "NIFTY26JUL22000CE".to_string(),
+            underlying: "NIFTY".to_string(),
+            expiry: "2026-07-30".to_string(),
+            strike: 22_000.0,
+            option_type: OptionType::CE,
+            lot_size: 50,
+        }
+    }
+
+    fn test_signal(timestamp_ms: u64) -> Signal {
+        Signal {
+            id: 1,
+            underlying: "NIFTY".to_string(),
+            expiry: "2026-07-30".to_string(),
+            action: SignalAction::BuyCE,
+            strike: 22_000.0,
+            option_price: 100.0,
+            target_price: 130.0,
+            stop_price: 80.0,
+            lots: 1,
+            lot_size: 50,
+            capital_required: 5_000.0,
+            confidence: 90.0,
+            strategy: StrategyType::SpotReversal,
+            reasons: Vec::new(),
+            timestamp_ms,
+            session: SessionPhase::Morning,
+            breakeven_move_pct: 0.0,
+            max_loss: 0.0,
+            max_profit_target: 0.0,
+            risk_reward: 1.0,
+            entry_ctx: test_entry_context(),
+        }
+    }
+
+    #[test]
+    fn standalone_spot_reversal_rsi_chase_gate_blocks_only_extended_direction() {
+        assert!(
+            standalone_spot_reversal_is_late_rsi_chase(SignalAction::BuyCE, 72.1),
+            "07-08-style standalone CE after RSI 70+ is a late upside chase"
+        );
+        assert!(
+            standalone_spot_reversal_is_late_rsi_chase(SignalAction::BuyPE, 31.0),
+            "07-07-style standalone PE after RSI <=35 is a late downside chase"
+        );
+        assert!(
+            !standalone_spot_reversal_is_late_rsi_chase(SignalAction::BuyCE, 56.6),
+            "06-24-style standalone CE in mid RSI band remains eligible"
+        );
+        assert!(!standalone_spot_reversal_is_late_rsi_chase(SignalAction::BuyPE, 37.0));
+        assert!(!standalone_spot_reversal_is_late_rsi_chase(SignalAction::Hold, 80.0));
+    }
+
+    #[test]
+    fn composite_spot_reversal_quality_requires_direction_and_real_move() {
+        let strong_bull = crate::technicals::SpotReversal {
+            direction: crate::technicals::Direction::Bull,
+            move_pct: 0.0022,
+            atr_multiple: 7.0,
+            lookback_bars: 30,
+        };
+        let weak_bull = crate::technicals::SpotReversal {
+            move_pct: 0.0010,
+            ..strong_bull
+        };
+        let strong_bear = crate::technicals::SpotReversal {
+            direction: crate::technicals::Direction::Bear,
+            move_pct: 0.0024,
+            atr_multiple: 5.2,
+            lookback_bars: 30,
+        };
+
+        assert!(
+            composite_spot_reversal_passes_quality(SignalAction::BuyCE, &strong_bull),
+            "06-24/06-30/06-19-style real reversal moves remain eligible"
+        );
+        assert!(
+            !composite_spot_reversal_passes_quality(SignalAction::BuyCE, &weak_bull),
+            "06-25-style 0.10% reversal should not be upgraded by GEX/IV score stacking"
+        );
+        assert!(
+            !composite_spot_reversal_passes_quality(SignalAction::BuyCE, &strong_bear),
+            "opposite-direction reversal must not validate a composite entry"
+        );
+    }
+
+    #[test]
+    fn far_dte_composite_rsi_chase_gate_blocks_only_exhausted_tail() {
+        assert!(
+            far_dte_composite_is_late_rsi_chase(SignalAction::BuyCE, 72.0),
+            "multi-day CE after RSI 70+ is a continuation chase"
+        );
+        assert!(
+            far_dte_composite_is_late_rsi_chase(SignalAction::BuyPE, 28.9),
+            "07-08-style multi-day PE after RSI <30 is a continuation chase"
+        );
+        assert!(
+            !far_dte_composite_is_late_rsi_chase(SignalAction::BuyPE, 32.4),
+            "06-19-style bearish continuation with RSI above panic tail remains eligible"
+        );
+        assert!(!far_dte_composite_is_late_rsi_chase(SignalAction::BuyCE, 64.2));
+    }
+
+    #[test]
+    fn far_dte_composite_midday_block_is_narrow() {
+        assert!(
+            far_dte_composite_midday_block(3, 6.1, SessionPhase::Midday),
+            "07-08-style midday far-DTE score stacking should be blocked"
+        );
+        assert!(
+            !far_dte_composite_midday_block(3, 4.0, SessionPhase::Afternoon),
+            "06-19-style afternoon flow continuation remains eligible"
+        );
+        assert!(
+            !far_dte_composite_midday_block(3, 0.2, SessionPhase::Midday),
+            "same-day expiry gamma is handled by separate 0-DTE gates"
+        );
+        assert!(
+            !far_dte_composite_midday_block(1, 6.0, SessionPhase::Midday),
+            "standalone strategies are not composite score stacking"
+        );
     }
 
     #[test]
@@ -5355,6 +5749,75 @@ mod tests {
         engine.check_open_positions();
         assert!((engine.positions[0].stop_price - 113.0).abs() < 1e-9, "trail never lowers");
         assert!(engine.positions[0].is_open);
+    }
+
+    #[test]
+    fn expiry_dte_keeps_rigid_exit_even_when_config_is_loose() {
+        let store = TickStore::new();
+        let mut engine = test_engine_with_store(store.clone());
+        engine.trail_arm_pct = 25.0;
+        engine.trail_giveback_pct = 70.0;
+        let mut pos = test_position(false);
+        pos.target_price = 160.0;
+        pos.entry_ctx.days_to_expiry = 1.0;
+        pos.strategy = StrategyType::SpotReversal;
+        pos.entry_ctx.session = SessionPhase::Morning.to_string();
+        engine.positions.push(pos);
+
+        store.update(Tick { token: 101, ltp: 130.0, mode: TickMode::Ltp, ..Tick::default() });
+        engine.set_clock_override_ms(60_000);
+        engine.check_open_positions();
+
+        assert!(
+            (engine.positions[0].stop_price - 115.0).abs() < 1e-9,
+            "<=1 DTE should keep the rigid 50%-of-peak trail"
+        );
+    }
+
+    #[test]
+    fn far_dte_uses_configured_looser_exit() {
+        let store = TickStore::new();
+        let mut engine = test_engine_with_store(store.clone());
+        engine.trail_arm_pct = 25.0;
+        engine.trail_giveback_pct = 70.0;
+        let mut pos = test_position(false);
+        pos.target_price = 160.0;
+        pos.entry_ctx.days_to_expiry = 5.0;
+        pos.strategy = StrategyType::SpotReversal;
+        pos.entry_ctx.session = SessionPhase::Morning.to_string();
+        engine.positions.push(pos);
+
+        store.update(Tick { token: 101, ltp: 130.0, mode: TickMode::Ltp, ..Tick::default() });
+        engine.set_clock_override_ms(60_000);
+        engine.check_open_positions();
+
+        assert!(
+            (engine.positions[0].stop_price - 109.0).abs() < 1e-9,
+            ">1 DTE should use configured 70% giveback"
+        );
+    }
+
+    #[test]
+    fn far_dte_composite_keeps_rigid_exit() {
+        let store = TickStore::new();
+        let mut engine = test_engine_with_store(store.clone());
+        engine.trail_arm_pct = 25.0;
+        engine.trail_giveback_pct = 70.0;
+        let mut pos = test_position(false);
+        pos.target_price = 160.0;
+        pos.entry_ctx.days_to_expiry = 5.0;
+        pos.strategy = StrategyType::Composite;
+        pos.entry_ctx.session = SessionPhase::Afternoon.to_string();
+        engine.positions.push(pos);
+
+        store.update(Tick { token: 101, ltp: 130.0, mode: TickMode::Ltp, ..Tick::default() });
+        engine.set_clock_override_ms(60_000);
+        engine.check_open_positions();
+
+        assert!(
+            (engine.positions[0].stop_price - 115.0).abs() < 1e-9,
+            "non-runner far-DTE trades should keep the rigid 50%-of-peak trail"
+        );
     }
 
     #[test]
@@ -6096,6 +6559,139 @@ mod tests {
             other => panic!("expected place command, got {:?}", other),
         }
         assert_eq!(engine.pending_entry_orders[0].signal_price, 100.25);
+    }
+
+    #[test]
+    fn market_tick_executes_matured_pending_signal_without_waiting_for_scan() {
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_tick_pending_entry_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+
+        let store = TickStore::new();
+        store.update(Tick {
+            token: 101,
+            ltp: 100.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
+
+        let mut engine = OptionsEngine::new(
+            vec![test_contract()],
+            store,
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+
+        let now = test_ist_ms(10, 0, 0);
+        engine.pending_signals.push_back(test_signal(now - 4_000));
+
+        engine.set_clock_override_ms(now);
+        engine.process_market_tick();
+        assert!(order_rx.try_recv().is_err(), "4s-old signal must still wait for its 5s delay");
+        assert_eq!(engine.pending_signals.len(), 1);
+
+        engine.set_clock_override_ms(now + 2_000);
+        engine.process_market_tick();
+
+        match order_rx.try_recv().expect("entry order after matured tick") {
+            OrderCommand::Place(cmd) => {
+                assert_eq!(cmd.tag, "SATAENTRY1");
+                assert_eq!(cmd.quantity, 50);
+                assert_eq!(cmd.side, OrderSide::Buy);
+                assert_eq!(cmd.limit_price, Some(100.25));
+            }
+            other => panic!("expected place command, got {:?}", other),
+        }
+        match order_rx.try_recv().expect("entry status poll") {
+            OrderCommand::StatusByTag { tag } => assert_eq!(tag, "SATAENTRY1"),
+            other => panic!("expected status command, got {:?}", other),
+        }
+
+        assert!(engine.pending_signals.is_empty());
+        assert_eq!(engine.pending_entry_orders.len(), 1);
+        assert_eq!(
+            engine.scan_count, 0,
+            "pending entry should execute on tick without waiting for a 45s scan"
+        );
+    }
+
+    #[test]
+    fn scan_validation_gives_tick_placed_entry_broker_ack_grace() {
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_entry_validation_grace_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+
+        let mut engine = OptionsEngine::new(
+            vec![test_contract()],
+            TickStore::new(),
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+
+        let now = test_ist_ms(10, 0, 0);
+        engine.scan_count = 6;
+        engine.pending_entry_orders.push(PendingEntryOrder {
+            pos_id: 1,
+            signal: test_signal(now - 6_000),
+            token: 101,
+            tradingsymbol: "NIFTY26JUL22000CE".to_string(),
+            estimated_capital: 5_100.0,
+            tag: "SATAENTRY1".to_string(),
+            placed_ms: now - 1_000,
+            last_status_poll_ms: 0,
+            cancel_requested: false,
+            cancel_reason: None,
+            last_cancel_attempt_ms: 0,
+            released_after_timeout: false,
+            order_id: None,
+            signal_price: 100.25,
+            placed_at_scan_count: 5,
+        });
+        engine.last_scan_result.insert(
+            "NIFTY".to_string(),
+            super::LastScanResult {
+                action: SignalAction::BuyPE,
+                best_score: 100.0,
+                scanned_at_ms: now,
+            },
+        );
+
+        engine.set_clock_override_ms(now);
+        engine.validate_pending_entries_against_scan();
+        assert!(
+            !engine.pending_entry_orders[0].cancel_requested,
+            "freshly placed live entry should not be scan-cancelled before broker ack grace"
+        );
+        assert!(order_rx.try_recv().is_err());
+
+        engine.set_clock_override_ms(now + ENTRY_SCAN_VALIDATION_GRACE_MS);
+        engine.validate_pending_entries_against_scan();
+        assert!(engine.pending_entry_orders[0].cancel_requested);
+
+        match order_rx.try_recv().expect("cancel command after grace") {
+            OrderCommand::CancelByTag { tag } => assert_eq!(tag, "SATAENTRY1"),
+            other => panic!("expected cancel command, got {:?}", other),
+        }
+        match order_rx.try_recv().expect("status command after cancel") {
+            OrderCommand::StatusByTag { tag } => assert_eq!(tag, "SATAENTRY1"),
+            other => panic!("expected status command, got {:?}", other),
+        }
     }
 
     #[test]

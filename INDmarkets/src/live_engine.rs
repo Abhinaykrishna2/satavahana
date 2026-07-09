@@ -34,30 +34,6 @@ fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
-/// Find NSE cash-equity tokens for the configured watchlist.
-pub fn resolve_equity_metas(instruments: &[Instrument], watchlist: &[String], product: &str) -> Vec<EquityMeta> {
-    let mut out = Vec::new();
-    for sym in watchlist {
-        let want = sym.trim().to_uppercase();
-        let found = instruments.iter().find(|i| {
-            i.exchange == "NSE" && i.instrument_type == "EQ" && i.tradingsymbol.eq_ignore_ascii_case(&want)
-        });
-        match found {
-            Some(i) => {
-                info!("  Strategy 1 leg: {} (NSE token {})", i.tradingsymbol, i.instrument_token);
-                out.push(EquityMeta {
-                    token: i.instrument_token,
-                    symbol: i.tradingsymbol.clone(),
-                    exchange: "NSE".to_string(),
-                    product: product.to_string(),
-                });
-            }
-            None => warn!("  Strategy 1: no NSE EQ instrument found for '{}'", sym),
-        }
-    }
-    out
-}
-
 /// Estimate NIFTY spot from the index instrument, falling back to the chain median.
 fn nifty_spot(instruments: &[Instrument], chain: &[OptionContract]) -> f64 {
     let idx = instruments.iter().find(|i| {
