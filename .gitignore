@@ -33,6 +33,10 @@ logs/
 # User options folder (as requested)
 usoptions/
 
+# Local research notes — contain real account balances / position sizes.
+# This repo is public; keep them off it.
+research/
+
 # Test data
 *.csv
 !**/test_fixtures/*.csv
