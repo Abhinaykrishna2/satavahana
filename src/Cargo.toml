@@ -27,6 +27,10 @@ path = "bin/backtest_quant.rs"
 name = "backtest_multileg"
 path = "bin/backtest_multileg.rs"
 
+[[bin]]
+name = "backtest_option_ideas"
+path = "bin/backtest_option_ideas.rs"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

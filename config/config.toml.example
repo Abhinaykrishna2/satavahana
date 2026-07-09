@@ -80,19 +80,27 @@ profit_target_pct = 55.0
 # 35% = if you bought at ₹100, exit when option falls to ₹65
 stop_loss_pct = 35.0
 
+# Runner-profile exits. These apply only to explicitly eligible >1-DTE morning
+# Spot Reversal Break positions. Expiry-day and 1-DTE trades always use the
+# rigid built-in safety profile: +12% lock, +2% locked gain, +15% trail arm,
+# 50% peak-gain giveback.
+profit_lock_arm_pct = 12.0
+profit_lock_gain_pct = 2.0
+trail_arm_pct = 20.0
+trail_giveback_pct = 60.0
+
 # Minimum composite confidence score (0-100) to act on a signal.
 # Each strategy scores sub-signals; composite must clear this bar.
-# 58 = balanced. Raise to 65+ for fewer, higher-quality signals.
-min_confidence = 58.0
+# 60 = balanced. Raise to 65+ for fewer, higher-quality signals.
+min_confidence = 60.0
 
-# Optional expiry-day carve-out for pure gamma scalp setups.
-# Keeps the regular floor at 58 while allowing same-day expiry gamma trades
-# to trigger from 51+ when that exact strategy is the dominant signal.
-expiry_day_min_confidence = 51.0
+# Expiry-day confidence floor. Keep this close to the regular floor; gamma
+# trades are still controlled by direction, flow, and affordability gates.
+expiry_day_min_confidence = 60.0
 
 # How often to run the full chain scan (seconds)
-# 45 = scan every 45s during market hours
-scan_interval_secs = 45
+# 30 = scan every 30s during market hours
+scan_interval_secs = 30
 
 # Max total entries per IST trading day (across all underlyings)
 # 1 = take the first qualifying signal of the day and stop. If it stops out,

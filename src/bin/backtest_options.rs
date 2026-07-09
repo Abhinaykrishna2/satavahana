@@ -57,6 +57,7 @@ fn print_usage(bin: &str) {
            --capital-mode <isolated|continuous>   Capital label mode (default: continuous; no persistence)\n\
            --isolated                              Alias for --capital-mode isolated\n\
            --continuous                            Alias for --capital-mode continuous\n\
+           --capital <N>                           Override starting capital\n\
            --fill-offset-inr <value>              Buy +x / Sell -x execution offset in INR (default: 0.5)\n\
            --max-daily-trades <N>                 Override config max_daily_trades (live=3, backtest=20)\n\
            -h, --help                             Show this help\n\
@@ -185,6 +186,19 @@ fn parse_ts_ms_fallback(s: &str) -> Option<u64> {
     }
 
     Some(dt.and_utc().timestamp_millis() as u64)
+}
+
+fn options_warmup_until_ms(first_ts_ms: u64) -> (u64, &'static str) {
+    let ist_offset_ms = (5 * 3600 + 30 * 60) * 1_000_u64;
+    let day_ms = 24 * 3600 * 1_000_u64;
+    let ist_ms_today = (first_ts_ms + ist_offset_ms) % day_ms;
+    let nine_forty_five_ist = first_ts_ms - ist_ms_today + 585 * 60_000;
+
+    if first_ts_ms < nine_forty_five_ist {
+        (nine_forty_five_ist, "09:45 IST opening-range warmup")
+    } else {
+        (first_ts_ms + 3 * 60 * 1_000, "post-09:45 restart warmup")
+    }
 }
 
 fn col_idx(headers: &StringRecord, name: &str) -> Result<usize, Box<dyn Error>> {
@@ -554,30 +568,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         });
 
-    // Warmup: 5 min if nearest expiry is 0-1 days from replay date, 15 min otherwise.
-    // replay_date from filename may be None (zsh tmp path) — fall back to date prefix
-    // of the first recv_ts row, which is always "YYYY-MM-DD..." regardless of path.
-    let warmup_secs: u64 = {
-        use chrono::NaiveDate;
-        let replay_day = replay_date.as_deref()
-            .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
-            .or_else(|| {
-                let mut peek = satavahana::open_csv(&options_file).ok()?;
-                let hdrs = peek.headers().ok()?.clone();
-                let i = col_idx(&hdrs, "recv_ts").ok()?;
-                let rec = peek.records().next()?.ok()?;
-                let ts = rec.get(i)?;
-                NaiveDate::parse_from_str(&ts[..10.min(ts.len())], "%Y-%m-%d").ok()
-            });
-        let nearest_expiry = contracts.iter()
-            .filter_map(|c| NaiveDate::parse_from_str(&c.expiry, "%Y-%m-%d").ok())
-            .min();
-        match (replay_day, nearest_expiry) {
-            (Some(day), Some(exp)) if (exp - day).num_days() <= 1 => 5 * 60,
-            _ => 15 * 60,
-        }
-    };
-
     let store = TickStore::new();
     let underlying_tokens: HashMap<String, u32> = HashMap::new();
     let mut engine = OptionsEngine::new_with_date(
@@ -686,10 +676,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         };
 
         if !warmup_armed && causal_ts_ms > 0 {
-            engine.set_warmup_until_ms(causal_ts_ms + warmup_secs * 1_000);
+            let (warmup_until_ms, warmup_reason) = options_warmup_until_ms(causal_ts_ms);
+            engine.set_warmup_until_ms(warmup_until_ms);
             eprintln!(
-                "Warmup set: suppressing signals for first {}min (until replay clock +{}s)",
-                warmup_secs / 60, warmup_secs
+                "Warmup set: suppressing signals until {}",
+                warmup_reason
             );
             warmup_armed = true;
         }

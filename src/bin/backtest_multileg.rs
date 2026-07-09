@@ -13,7 +13,7 @@ fn print_usage(bin: &str) {
          \n\
          Replays *_option_selling_ticks.csv (bid/ask + greeks required).\n\
          Picks the best structure per day via opening-regime indicators (matches live).\n\
-         One multi-leg trade/day; 0/1-DTE open, far-DTE confirmed-sideways gate matches live.\n\
+         One multi-leg trade/day. CRED-EDGE can trade through the weekly cycle; neutral spreads stay 0/1-DTE unless SATA_ML_NO_GATE is set.\n\
          \n\
          Examples:\n\
            {bin} ../data/2026-06-23_option_selling_ticks.csv\n\
@@ -133,8 +133,8 @@ fn main() {
     println!("==============================================================");
     println!("Starting capital    : ₹{start_cap:.2}");
     println!("Days replayed       : {}", summary.days.len());
-    println!("Regime picker       : Condor | Tight | Fly | WideFly (best score)");
-    println!("Trades/day cap      : 1 (0/1-DTE open; far-DTE confirmed-sideways gate)\n");
+    println!("Regime picker       : CRED-EDGE | Condor | Tight | Fly | WideFly (best score)");
+    println!("Trades/day cap      : 1 (CRED <=6DTE; neutral spreads 0/1-DTE unless SATA_ML_NO_GATE)\n");
 
     for d in &summary.days {
         println!("{}", format_day(d));
@@ -144,6 +144,34 @@ fn main() {
     let wins = traded.iter().filter(|d| d.net_pnl > 0.0).count();
     let losses = traded.iter().filter(|d| d.net_pnl < 0.0).count();
     let total = summary.end_capital - summary.start_capital;
+
+    if !traded.is_empty() {
+        println!("\n  TRADES");
+        println!(
+            "  {:<11} {:<11} {:<6} {:<5} {:>4} {:>8} {:>9} {:>9} {:>8} {:>9} {:<12}  {}",
+            "day", "structure", "entry", "exit", "lots", "credit", "maxloss/u", "gross", "costs", "net", "exit_reason", "legs"
+        );
+        for r in &traded {
+            let hhmm = |t: Option<chrono::NaiveDateTime>| {
+                t.map(|x| x.format("%H:%M").to_string()).unwrap_or_else(|| "-".into())
+            };
+            println!(
+                "  {:<11} {:<11} {:<6} {:<5} {:>4} {:>8.2} {:>9.2} {:>+9.2} {:>8.2} {:>+9.2} {:<12}  {}",
+                r.day.to_string(),
+                format!("{:?}", r.structure.unwrap()),
+                hhmm(r.entry_ts),
+                hhmm(r.exit_ts),
+                r.lots,
+                r.credit,
+                r.max_loss_unit,
+                r.gross_pnl,
+                r.costs,
+                r.net_pnl,
+                r.exit_reason,
+                r.legs_desc,
+            );
+        }
+    }
 
     println!();
     if traded.is_empty() {

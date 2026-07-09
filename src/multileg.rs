@@ -32,8 +32,25 @@ pub const WING: f64 = 100.0;
 /// and we never get stuck holding 3 of 4 legs.
 pub const ENTRY_SLIP: f64 = 0.50;
 
+pub const CREDIT_EDGE_THRESHOLD: f64 = 0.65;
+pub const CREDIT_EDGE_DELTA: f64 = 0.25;
+pub const CREDIT_EDGE_MAX_ER: f64 = 0.55;
+pub const CREDIT_EDGE_MAX_RANGE_PCT: f64 = 0.0200;
+pub const CREDIT_EDGE_MAX_DTE_DAYS: i64 = 6;
+pub const CREDIT_EDGE_TARGET_FRAC: f64 = 0.50;
+pub const CREDIT_EDGE_STOP_FRAC_ML: f64 = 0.25;
+pub const CREDIT_EDGE_HARD_STOP_FRAC_CAP: f64 = 0.15;
+pub const CREDIT_EDGE_ALLOC_FRAC: f64 = 0.90;
+/// Live cap for CRED. The research lab used up to 2 lots, but the live engine also enforces a
+/// 10%-of-capital hard stop; on the 13k account, 2 lots can hit that stop before the trained
+/// credit-spread exit recovers. Keep live CRED to 1 lot unless account capital/margin is larger.
+pub const CREDIT_EDGE_MAX_LOTS: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SellStructure {
+    /// One-sided 100pt vertical credit spread selected from the 09:15-09:45 opening edge:
+    /// close near high -> bull put credit, close near low -> bear call credit.
+    CreditEdge,
     /// OTM strangle + 100pt wings (~0.25Δ shorts) — widest zone, low credit, high win-prob.
     Condor,
     /// Shorts nearer ATM (~0.33Δ) + 100pt wings — narrower zone, more credit (aggressive condor).
@@ -48,6 +65,7 @@ impl SellStructure {
     /// (short |delta| target — None = ATM ; wing width in points). Mirrors satakarni `STRUCTURES`.
     fn params(self) -> (Option<f64>, f64) {
         match self {
+            SellStructure::CreditEdge => (Some(CREDIT_EDGE_DELTA), WING),
             SellStructure::Condor => (Some(0.25), WING),
             SellStructure::Tight => (Some(0.33), WING),
             SellStructure::Fly => (None, WING),
@@ -60,9 +78,11 @@ impl SellStructure {
         self.params().1
     }
 
-    /// The live structure ladder, safest/widest first: Condor → Tight → Fly → WideFly. The engine
-    /// opens the first that both clears its latents AND funds ≥1 lot (mirrors satakarni's set).
-    pub const LADDER: [SellStructure; 4] = [
+    /// The live structure ladder. CreditEdge is a separate 2-leg edge-open seller; it only seats
+    /// when the 09:45 close is near an opening-range edge. The remaining structures keep the
+    /// premium-selling ladder: Condor → Tight → Fly → WideFly.
+    pub const LADDER: [SellStructure; 5] = [
+        SellStructure::CreditEdge,
         SellStructure::Condor,
         SellStructure::Tight,
         SellStructure::Fly,
@@ -92,9 +112,24 @@ pub struct PlannedLeg {
     pub wing: bool,
 }
 
-/// Legacy weekday guard for the standard Tue-expiry NIFTY cycle.
-pub fn weekday_allows(wd: Weekday) -> bool {
-    matches!(wd, Weekday::Mon | Weekday::Tue)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreditDirection {
+    BullPut,
+    BearCall,
+}
+
+pub fn credit_edge_direction(edge_pos: f64, threshold: f64) -> Option<CreditDirection> {
+    if edge_pos >= threshold {
+        Some(CreditDirection::BullPut)
+    } else if edge_pos <= 1.0 - threshold {
+        Some(CreditDirection::BearCall)
+    } else {
+        None
+    }
+}
+
+pub fn credit_edge_er_admits(er: f64) -> bool {
+    er.is_finite() && er <= CREDIT_EDGE_MAX_ER
 }
 
 /// Near-expiry selling can use the normal 09:45 open because intraday theta is fast enough to
@@ -114,10 +149,6 @@ pub fn dte_allows(days_to_expiry: i64) -> bool {
 pub fn expiry_dte_days(day: NaiveDate, expiry: &str) -> Option<i64> {
     let expiry = NaiveDate::parse_from_str(expiry, "%Y-%m-%d").ok()?;
     Some(expiry.signed_duration_since(day).num_days())
-}
-
-pub fn expiry_proximity_allows(day: NaiveDate, expiry: &str) -> bool {
-    expiry_dte_days(day, expiry).is_some_and(dte_allows)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -177,6 +208,9 @@ fn has_strike(q: &[StrikeQuote], k: f64) -> bool {
 /// Select the 4 defined-risk legs for `structure`. Returns None if the chain can't seat the
 /// wings (e.g. the short would sit at the chain edge with no strike beyond it for the wing).
 pub fn select_legs(quotes: &[StrikeQuote], spot: f64, structure: SellStructure) -> Option<Vec<PlannedLeg>> {
+    if structure == SellStructure::CreditEdge {
+        return None;
+    }
     if quotes.is_empty() || !spot.is_finite() {
         return None;
     }
@@ -236,6 +270,67 @@ pub fn select_legs(quotes: &[StrikeQuote], spot: f64, structure: SellStructure) 
         PlannedLeg { strike: ce_w, opt: OptionType::CE, side: OrderSide::Buy, wing: true },
         PlannedLeg { strike: pe_s, opt: OptionType::PE, side: OrderSide::Sell, wing: false },
         PlannedLeg { strike: pe_w, opt: OptionType::PE, side: OrderSide::Buy, wing: true },
+    ])
+}
+
+pub fn select_credit_spread_legs(
+    quotes: &[StrikeQuote],
+    spot: f64,
+    direction: CreditDirection,
+    target_delta: f64,
+    width: f64,
+) -> Option<Vec<PlannedLeg>> {
+    if quotes.is_empty() || !spot.is_finite() || width <= 0.0 {
+        return None;
+    }
+
+    let opt = match direction {
+        CreditDirection::BullPut => OptionType::PE,
+        CreditDirection::BearCall => OptionType::CE,
+    };
+    let mut best: Option<(f64, f64)> = None;
+    for q in quotes {
+        let wing = match direction {
+            CreditDirection::BullPut => q.strike - width,
+            CreditDirection::BearCall => q.strike + width,
+        };
+        if !has_strike(quotes, wing) {
+            continue;
+        }
+        let delta = match direction {
+            CreditDirection::BullPut => q.pe_delta.abs(),
+            CreditDirection::BearCall => q.ce_delta.abs(),
+        };
+        if !delta.is_finite() {
+            continue;
+        }
+        let delta_score = (delta - target_delta).abs();
+        let spot_score = (q.strike - spot).abs() / 20_000.0;
+        let score = delta_score + spot_score;
+        match best {
+            Some((best_score, _)) if best_score <= score => {}
+            _ => best = Some((score, q.strike)),
+        }
+    }
+
+    let (_, short) = best?;
+    let wing = match direction {
+        CreditDirection::BullPut => short - width,
+        CreditDirection::BearCall => short + width,
+    };
+    Some(vec![
+        PlannedLeg {
+            strike: wing,
+            opt,
+            side: OrderSide::Buy,
+            wing: true,
+        },
+        PlannedLeg {
+            strike: short,
+            opt,
+            side: OrderSide::Sell,
+            wing: false,
+        },
     ])
 }
 
@@ -321,25 +416,6 @@ pub fn combo_close_cost(legs: &[PlannedLeg], quotes: &[StrikeQuote]) -> Option<f
     Some(cost)
 }
 
-/// Exit rule: `EXIT_MIN` hard close (14:55), else take-profit at 50% of credit, else stop at
-/// `STOP_FRAC_ML` of defined max loss. `ist_mins` = minutes since IST midnight (14:55 = 895).
-pub fn exit_reason(credit: f64, close_cost: f64, max_loss_unit: f64, ist_mins: u32) -> Option<ExitReason> {
-    if ist_mins >= EXIT_MIN {
-        return Some(ExitReason::Time);
-    }
-    if credit <= 0.0 || max_loss_unit <= 0.0 {
-        return None;
-    }
-    let gain = credit - close_cost;
-    if gain >= 0.5 * credit {
-        Some(ExitReason::TakeProfit)
-    } else if gain <= -STOP_FRAC_ML * max_loss_unit {
-        Some(ExitReason::Stop)
-    } else {
-        None
-    }
-}
-
 /// Defined max loss for one lot = (wing width − credit) × lot_size. `wing` is per-structure
 /// (100pt for condor/tight/fly, 200pt for widefly).
 pub fn max_loss_per_lot(credit: f64, wing: f64, lot_size: u32) -> f64 {
@@ -354,40 +430,6 @@ pub fn size_lots(capital: f64, max_loss_per_lot: f64, risk_frac: f64, max_lots: 
         return 0;
     }
     ((capital * risk_frac / max_loss_per_lot).floor() as u32).min(max_lots)
-}
-
-// ── Slice 3a: account-wide trade-admission policy (multi-leg priority) ─────────────────
-
-/// Account state the admission policy reads (shared across the buy + sell engines).
-#[derive(Debug, Clone, Copy)]
-pub struct AdmissionState {
-    /// Any position currently open, account-wide. A multi-leg spread counts as ONE.
-    pub position_open: bool,
-    /// A single-leg trade has completed today.
-    pub single_traded_today: bool,
-    /// A multi-leg trade has *completed* today.
-    pub multileg_traded_today: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Strategy {
-    SingleLeg,
-    MultiLeg,
-}
-
-/// Trade-admission policy (user's rule):
-///   • exactly one position open at a time, account-wide (a multi-leg = ONE position, all legs);
-///   • single-leg gets at most one completed trade/day;
-///   • multi-leg gets at most one completed trade/day;
-///   • a completed trade in one family does not bench the other family.
-pub fn may_enter(strategy: Strategy, st: AdmissionState) -> bool {
-    if st.position_open {
-        return false; // one trade at a time, whoever holds the slot
-    }
-    match strategy {
-        Strategy::MultiLeg => !st.multileg_traded_today,
-        Strategy::SingleLeg => !st.single_traded_today,
-    }
 }
 
 /// Pre-trade margin gate (slice 3b). A Kite order_id is NOT execution — RMS can REJECT for
@@ -413,6 +455,7 @@ pub fn basket_margin_ok(final_margin: f64, available_funds: f64, buffer_frac: f6
 /// `ENTRY_DRIFT_ZONE_CAP`).
 pub fn entry_drift_zone_cap(structure: SellStructure) -> f64 {
     match structure {
+        SellStructure::CreditEdge => 1.00,
         SellStructure::Condor => 0.50,
         SellStructure::Tight => 0.45,
         SellStructure::Fly => 0.45,
@@ -425,6 +468,7 @@ pub fn entry_drift_zone_cap(structure: SellStructure) -> f64 {
 /// `ENTRY_BALANCE_EDGE_CAP`).
 pub fn entry_balance_edge_cap(structure: SellStructure) -> f64 {
     match structure {
+        SellStructure::CreditEdge => 1.00,
         SellStructure::Condor => 0.70,
         SellStructure::Tight => 0.40,
         SellStructure::Fly => 0.35,
@@ -436,6 +480,7 @@ pub fn entry_balance_edge_cap(structure: SellStructure) -> f64 {
 /// satakarni `MOVE_ZONE_CAP`).
 pub fn move_zone_cap(structure: SellStructure) -> f64 {
     match structure {
+        SellStructure::CreditEdge => 1.00,
         SellStructure::Condor => 0.35,
         SellStructure::Tight => 0.30,
         SellStructure::Fly => 0.25,
@@ -449,8 +494,6 @@ pub const MOVE_WINDOW_MIN: u32 = 2;
 pub const TREND_ER: f64 = 0.50;
 /// In-trade trend-exit threshold. DISABLED (99) — the A/B showed a rolling-ER trend-exit false-fires
 /// on calm days and chops winners; the half-gain trail below is the validated profit protection.
-pub const TREND_EXIT_ER: f64 = 99.0;
-pub const TREND_ROLL_MIN: u32 = 20;
 /// Half-gain profit trail: arms once the running gain peaks past +15% of credit, then the stop locks
 /// at 50% of the PEAK gain (ratchets up, never down) — a winner gives back at most half its best.
 pub const TRAIL_TRIGGER: f64 = 0.15;
@@ -486,6 +529,42 @@ pub fn move_trims(move_pts: f64, spot: f64, zone_width: f64, structure: SellStru
     let by_spot = spot > 0.0 && move_pts / spot > MOVE_PCT;
     let by_zone = zone_width > 0.0 && move_pts / zone_width > move_zone_cap(structure);
     by_spot || by_zone
+}
+
+pub fn target_frac(structure: SellStructure) -> f64 {
+    match structure {
+        SellStructure::CreditEdge => CREDIT_EDGE_TARGET_FRAC,
+        SellStructure::Condor | SellStructure::Tight | SellStructure::Fly | SellStructure::WideFly => 0.50,
+    }
+}
+
+pub fn stop_frac_ml(structure: SellStructure) -> f64 {
+    match structure {
+        SellStructure::CreditEdge => CREDIT_EDGE_STOP_FRAC_ML,
+        SellStructure::Condor | SellStructure::Tight | SellStructure::Fly | SellStructure::WideFly => STOP_FRAC_ML,
+    }
+}
+
+pub fn hard_stop_frac_cap(structure: SellStructure) -> f64 {
+    match structure {
+        SellStructure::CreditEdge => CREDIT_EDGE_HARD_STOP_FRAC_CAP,
+        SellStructure::Condor | SellStructure::Tight | SellStructure::Fly | SellStructure::WideFly => STOP_FRAC_CAP,
+    }
+}
+
+pub fn exit_min_for(structure: SellStructure) -> u32 {
+    match structure {
+        SellStructure::CreditEdge => CREDIT_EDGE_EXIT_MIN,
+        SellStructure::Condor | SellStructure::Tight | SellStructure::Fly | SellStructure::WideFly => EXIT_MIN,
+    }
+}
+
+pub fn move_stop_enabled(structure: SellStructure) -> bool {
+    structure != SellStructure::CreditEdge
+}
+
+pub fn trail_enabled(structure: SellStructure) -> bool {
+    structure != SellStructure::CreditEdge
 }
 
 // ── Elite seller's regime gate (ported from satakarni; a-priori thresholds, NOT tuned) ──────
@@ -586,6 +665,13 @@ pub fn structure_regime_score(
     let hot = (rvs / 0.50).min(1.0);
 
     let affinity = match structure {
+        // Directional edge-open credit spread: it wants spot near one side of the opening range,
+        // unlike the centered neutral structures below. This score is only considered after the
+        // explicit `CREDIT_EDGE_THRESHOLD` direction gate has passed.
+        SellStructure::CreditEdge => {
+            let edge = regime.edge_frac.clamp(0.0, 1.0);
+            0.55 + edge * 0.30 + chop * 0.10 + calm * 0.05
+        }
         // Calm, centered chop → ATM/near-ATM premium harvest.
         SellStructure::Fly => chop * 0.35 + centered * 0.35 + calm * 0.30,
         SellStructure::Tight => chop * 0.30 + centered * 0.30 + calm * 0.20 + drift_headroom * 0.20,
@@ -632,6 +718,8 @@ pub fn trail_exits(gain: f64, peak_gain: f64, credit: f64) -> bool {
 
 const HOLDER: &str = "multileg";
 const ENTRY_MIN: u32 = 9 * 60 + 45;
+const CREDIT_EDGE_LATEST_ENTRY_MIN: u32 = ENTRY_MIN + 5;
+pub const CREDIT_EDGE_EXIT_MIN: u32 = 14 * 60 + 45;
 const CUTOFF_MIN: u32 = 14 * 60 + 30;
 const EXIT_MIN: u32 = 14 * 60 + 55;
 const OPEN_RANGE_START_SEC: u32 = 9 * 3600 + 15 * 60 + 5;
@@ -693,6 +781,37 @@ struct LiveEntryFailure {
 }
 
 #[derive(Debug, Clone)]
+struct MarginBlock {
+    structure: SellStructure,
+    lots: u32,
+    final_margin: f64,
+    funds: f64,
+    buffer_frac: f64,
+}
+
+#[derive(Debug, Clone)]
+enum MarginPreflightFailure {
+    Transient(String),
+    InsufficientFunds(MarginBlock),
+}
+
+impl MarginPreflightFailure {
+    fn message(&self) -> String {
+        match self {
+            MarginPreflightFailure::Transient(msg) => msg.clone(),
+            MarginPreflightFailure::InsufficientFunds(block) => format!(
+                "{:?} x{}lot final margin ₹{:.0} + {:.0}% buffer > funds ₹{:.0}",
+                block.structure,
+                block.lots,
+                block.final_margin,
+                block.buffer_frac * 100.0,
+                block.funds
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct ChainSnapshot {
     spot: f64,
     expiry: String,
@@ -704,6 +823,8 @@ struct ChainSnapshot {
 #[derive(Debug, Clone, Copy)]
 struct OpeningLatent {
     range_pts: f64,
+    /// Position of the latest opening-window spot inside [low, high]: 0 = low, 1 = high.
+    edge_pos: f64,
     edge_frac: f64,
 }
 
@@ -727,6 +848,7 @@ struct UnderlyingState {
     spot_history: VecDeque<(u64, f64)>,
     active: Option<ActiveCombo>,
     traded_today: bool,
+    margin_block: Option<MarginBlock>,
     last_scan_ms: u64,
     last_skip_log_ms: u64,
 }
@@ -816,7 +938,7 @@ impl MultiLegEngine {
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!(
-                "Multi-leg engine started | structure=CONDOR | holder={} | {} mode",
+                "Multi-leg engine started | structures=CRED-EDGE,CONDOR,TIGHT,FLY,WIDEFLY | holder={} | {} mode",
                 HOLDER,
                 if self.live.is_some() { "LIVE" } else { "paper" }
             );
@@ -841,7 +963,7 @@ impl MultiLegEngine {
                     _ = flatten_clock.tick() => {
                         let now = now_ms();
                         let (_day, _wd, mins, _secs) = ist_parts(now);
-                        if mins >= EXIT_MIN && self.has_active_positions() {
+                        if self.has_time_exit_due(mins) {
                             self.close_all_active(ExitReason::Time).await;
                         }
                         if shutdown_requested {
@@ -927,6 +1049,25 @@ impl MultiLegEngine {
         {
             return;
         }
+        if let Some(block) = self
+            .state
+            .get(underlying)
+            .and_then(|s| s.margin_block.clone())
+        {
+            self.log_skip(
+                underlying,
+                now_ms,
+                format!(
+                    "multi-leg margin blocked for today: {:?} x{}lot final ₹{:.0} + {:.0}% buffer > funds ₹{:.0}",
+                    block.structure,
+                    block.lots,
+                    block.final_margin,
+                    block.buffer_frac * 100.0,
+                    block.funds
+                ),
+            );
+            return;
+        }
 
         let Some(snapshot) = self.build_snapshot(underlying, now_ms) else {
             return;
@@ -951,36 +1092,51 @@ impl MultiLegEngine {
             }
         };
         let near_expiry = dte_allows(dte);
-        if !near_expiry && mins < FAR_DTE_ENTRY_MIN {
+        let credit_edge_window = mins <= CREDIT_EDGE_LATEST_ENTRY_MIN && dte <= CREDIT_EDGE_MAX_DTE_DAYS;
+        let mut standard_window = near_expiry || mins >= FAR_DTE_ENTRY_MIN;
+        if !credit_edge_window && !standard_window {
             return;
         }
-        let latent_end_ms = if near_expiry { None } else { Some(now_ms) };
+        let standard_latent_end_ms = if near_expiry { None } else { Some(now_ms) };
         // Elite seller's regime gate (ported from satakarni): block only a clearly trending open.
         // Range/straddle is logged for context, not used as an entry blocker in the current sandbox.
         // Insufficient opening data → stand aside (can't confirm a calm open, so don't sell into it).
-        let closes = self.entry_minute_closes(underlying, day, latent_end_ms);
-        if !near_expiry {
+        if !near_expiry && standard_window {
+            let closes = self.entry_minute_closes(underlying, day, standard_latent_end_ms);
             let recent = self.recent_minute_closes(underlying, day, now_ms, FAR_DTE_RECENT_MIN);
-            let Some(metrics) = far_dte_sideways_metrics(&closes, &recent, snapshot.spot) else {
-                return;
-            };
-            if let Some(why) = far_dte_sideways_reject(metrics) {
-                self.log_skip(
-                    underlying,
-                    now_ms,
-                    format!(
-                        "multi-leg far-DTE stand aside: {} (session ER {:.2}, recent ER {:.2}, drift {:.2}%, range {:.2}%, edge {:.0}%)",
-                        why,
-                        metrics.session_er,
-                        metrics.recent_er,
-                        metrics.session_net_pct * 100.0,
-                        metrics.session_range_pct * 100.0,
-                        metrics.edge_frac * 100.0
-                    ),
-                );
-                return;
+            match far_dte_sideways_metrics(&closes, &recent, snapshot.spot) {
+                Some(metrics) => {
+                    if let Some(why) = far_dte_sideways_reject(metrics) {
+                        self.log_skip(
+                            underlying,
+                            now_ms,
+                            format!(
+                                "multi-leg far-DTE stand aside: {} (session ER {:.2}, recent ER {:.2}, drift {:.2}%, range {:.2}%, edge {:.0}%)",
+                                why,
+                                metrics.session_er,
+                                metrics.recent_er,
+                                metrics.session_net_pct * 100.0,
+                                metrics.session_range_pct * 100.0,
+                                metrics.edge_frac * 100.0
+                            ),
+                        );
+                        standard_window = false;
+                    }
+                }
+                None => {
+                    standard_window = false;
+                    if !credit_edge_window {
+                        return;
+                    }
+                }
             }
         }
+        let regime_latent_end_ms = if standard_window {
+            standard_latent_end_ms
+        } else {
+            None
+        };
+        let closes = self.entry_minute_closes(underlying, day, regime_latent_end_ms);
         let regime = match (
             efficiency_ratio(&closes),
             atm_straddle(&snapshot.quotes, snapshot.spot),
@@ -989,12 +1145,13 @@ impl MultiLegEngine {
                 let max = closes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 let min = closes.iter().cloned().fold(f64::INFINITY, f64::min);
                 let range_pts = max - min;
-                if let Some(why) = sell_regime_skip(er, range_pts, straddle) {
+                let standard_regime_skip = sell_regime_skip(er, range_pts, straddle);
+                if let Some(why) = standard_regime_skip {
                     self.log_skip(
                         underlying,
                         now_ms,
                         format!(
-                            "multi-leg stand aside: {} (ER {:.2}, range {:.0}pt = {:.0}% of straddle {:.0})",
+                            "multi-leg neutral stand aside: {} (ER {:.2}, range {:.0}pt = {:.0}% of straddle {:.0}); CRED edge may still qualify",
                             why,
                             er,
                             range_pts,
@@ -1002,10 +1159,9 @@ impl MultiLegEngine {
                             straddle
                         ),
                     );
-                    return;
                 }
                 let edge_frac = self
-                    .opening_latent(underlying, day, latent_end_ms)
+                    .opening_latent(underlying, day, regime_latent_end_ms)
                     .map(|l| l.edge_frac)
                     .unwrap_or(0.5);
                 OpeningRegime {
@@ -1017,8 +1173,19 @@ impl MultiLegEngine {
             }
             _ => return,
         };
-        let Some((active, _drift_frac)) =
-            self.plan_entry(underlying, now_ms, day, &snapshot, regime, latent_end_ms)
+        let standard_regime_skip = sell_regime_skip(regime.er, regime.range_pts, regime.straddle);
+        let Some((active, _drift_frac)) = self.plan_entry(
+            underlying,
+            now_ms,
+            day,
+            mins,
+            &snapshot,
+            regime,
+            standard_latent_end_ms,
+            credit_edge_window,
+            standard_window,
+            standard_regime_skip,
+        )
         else {
             return;
         };
@@ -1142,24 +1309,63 @@ impl MultiLegEngine {
 
     /// Indicator-driven structure pick: evaluate every structure against the opening regime,
     /// keep those that clear hard gates (drift, balance, margin), then open the highest
-    /// `structure_regime_score`. One multi-leg trade/day is enforced by `traded_today` +
-    /// the per-holder cap on `shared_circuit`.
+    /// `structure_regime_score`. One multi-leg trade/day is enforced by `traded_today`;
+    /// the shared circuit also enforces the account-wide completed-trade cap.
     fn plan_entry(
         &mut self,
         underlying: &str,
         now_ms: u64,
         day: NaiveDate,
+        mins: u32,
         snapshot: &ChainSnapshot,
         regime: OpeningRegime,
-        latent_end_ms: Option<u64>,
+        standard_latent_end_ms: Option<u64>,
+        credit_edge_window: bool,
+        standard_window: bool,
+        standard_regime_skip: Option<&str>,
     ) -> Option<(ActiveCombo, f64)> {
-        let opening_latent = self.opening_latent(underlying, day, latent_end_ms)?;
+        let credit_latent = self.opening_latent(underlying, day, None);
+        let standard_latent = self.opening_latent(underlying, day, standard_latent_end_ms);
         let mut last_err = String::new();
         let mut scored: Vec<(SellStructure, f64, ActiveCombo)> = Vec::new();
         let mut scoreboard: Vec<(SellStructure, f64)> = Vec::new();
 
         for structure in SellStructure::LADDER {
-            match self.plan_structure(structure, underlying, snapshot, opening_latent) {
+            let opening_latent = if structure == SellStructure::CreditEdge {
+                if !credit_edge_window {
+                    continue;
+                }
+                if !credit_edge_er_admits(regime.er) {
+                    last_err = format!(
+                        "CreditEdge CRED ER {:.2} > {:.2}",
+                        regime.er, CREDIT_EDGE_MAX_ER
+                    );
+                    continue;
+                }
+                match credit_latent {
+                    Some(v) => v,
+                    None => {
+                        last_err = "CreditEdge insufficient 09:45 edge data".to_string();
+                        continue;
+                    }
+                }
+            } else {
+                if !standard_window {
+                    continue;
+                }
+                if let Some(why) = standard_regime_skip {
+                    last_err = format!("{:?} neutral-regime {}", structure, why);
+                    continue;
+                }
+                match standard_latent {
+                    Some(v) => v,
+                    None => {
+                        last_err = format!("{:?} insufficient opening latent", structure);
+                        continue;
+                    }
+                }
+            };
+            match self.plan_structure(structure, underlying, snapshot, opening_latent, mins) {
                 Ok((combo, drift_frac)) => {
                     let score = structure_regime_score(structure, regime, drift_frac);
                     scoreboard.push((structure, score));
@@ -1193,12 +1399,13 @@ impl MultiLegEngine {
         };
         info!(
             "MULTILEG regime pick {:?} score {:.2} | ER {:.2} RVS {:.0}% centered {:.0}% | \
-             Condor={} Tight={} Fly={} WideFly={}",
+             CRED={} Condor={} Tight={} Fly={} WideFly={}",
             best,
             scoreboard.iter().find(|(s, _)| *s == best).map(|(_, sc)| *sc).unwrap_or(0.0),
             regime.er,
             regime.range_straddle() * 100.0,
             regime.centered() * 100.0,
+            fmt(SellStructure::CreditEdge),
             fmt(SellStructure::Condor),
             fmt(SellStructure::Tight),
             fmt(SellStructure::Fly),
@@ -1216,34 +1423,76 @@ impl MultiLegEngine {
         underlying: &str,
         snapshot: &ChainSnapshot,
         opening_latent: OpeningLatent,
+        mins: u32,
     ) -> Result<(ActiveCombo, f64), String> {
-        let legs = select_legs(&snapshot.quotes, snapshot.spot, structure)
-            .ok_or("legs not seatable")?;
+        let legs = if structure == SellStructure::CreditEdge {
+            if mins > CREDIT_EDGE_LATEST_ENTRY_MIN {
+                return Err("CRED stale entry window".to_string());
+            }
+            let range_pct = opening_latent.range_pts / snapshot.spot;
+            if range_pct > CREDIT_EDGE_MAX_RANGE_PCT {
+                return Err(format!(
+                    "CRED range {:.2}% > {:.2}%",
+                    range_pct * 100.0,
+                    CREDIT_EDGE_MAX_RANGE_PCT * 100.0
+                ));
+            }
+            let direction = credit_edge_direction(opening_latent.edge_pos, CREDIT_EDGE_THRESHOLD)
+                .ok_or("CRED opening not near edge")?;
+            select_credit_spread_legs(
+                &snapshot.quotes,
+                snapshot.spot,
+                direction,
+                CREDIT_EDGE_DELTA,
+                structure.wing(),
+            )
+            .ok_or("CRED legs not seatable")?
+        } else {
+            select_legs(&snapshot.quotes, snapshot.spot, structure)
+                .ok_or("legs not seatable")?
+        };
         let credit = combo_credit(&legs, &snapshot.quotes).ok_or("no credit")?;
-        let (_zone_lo, _zone_hi, zone_width) = profit_zone(&legs, credit).ok_or("no zone")?;
         let max_loss_unit = structure.wing() - credit;
         if credit <= 0.0 || max_loss_unit <= 0.0 {
             return Err("non-positive credit/max-loss".to_string());
         }
+        let zone_width = if structure == SellStructure::CreditEdge {
+            structure.wing()
+        } else {
+            let (_zone_lo, _zone_hi, zone_width) = profit_zone(&legs, credit).ok_or("no zone")?;
+            zone_width
+        };
         let drift_frac = opening_latent.range_pts / zone_width;
-        let drift_cap = entry_drift_zone_cap(structure);
-        if !entry_drift_admits(opening_latent.range_pts, zone_width, structure) {
-            return Err(format!(
-                "DRIFT-ZONE {:.0}% > {:.0}%",
-                drift_frac * 100.0,
-                drift_cap * 100.0
-            ));
-        }
-        let edge_cap = entry_balance_edge_cap(structure);
-        if !entry_balance_admits(opening_latent.edge_frac, structure) {
-            return Err(format!(
-                "RANGE-BALANCE edge {:.0}% > {:.0}%",
-                opening_latent.edge_frac * 100.0,
-                edge_cap * 100.0
-            ));
+        if structure != SellStructure::CreditEdge {
+            let drift_cap = entry_drift_zone_cap(structure);
+            if !entry_drift_admits(opening_latent.range_pts, zone_width, structure) {
+                return Err(format!(
+                    "DRIFT-ZONE {:.0}% > {:.0}%",
+                    drift_frac * 100.0,
+                    drift_cap * 100.0
+                ));
+            }
+            let edge_cap = entry_balance_edge_cap(structure);
+            if !entry_balance_admits(opening_latent.edge_frac, structure) {
+                return Err(format!(
+                    "RANGE-BALANCE edge {:.0}% > {:.0}%",
+                    opening_latent.edge_frac * 100.0,
+                    edge_cap * 100.0
+                ));
+            }
         }
         let max_loss_lot = max_loss_unit * snapshot.lot_size as f64;
-        let lots = size_lots(self.capital, max_loss_lot, MARGIN_SIZING_FRAC, MAX_LOTS);
+        let sizing_frac = if structure == SellStructure::CreditEdge {
+            CREDIT_EDGE_ALLOC_FRAC
+        } else {
+            MARGIN_SIZING_FRAC
+        };
+        let max_lots = if structure == SellStructure::CreditEdge {
+            CREDIT_EDGE_MAX_LOTS
+        } else {
+            MAX_LOTS
+        };
+        let lots = size_lots(self.capital, max_loss_lot, sizing_frac, max_lots);
         if lots == 0 {
             return Err("margin cannot fund one lot".to_string());
         }
@@ -1315,9 +1564,11 @@ impl MultiLegEngine {
         } else {
             (last - min) / range_pts
         };
-        let edge_frac = (range_pos - 0.5).abs() * 2.0;
+        let edge_pos = range_pos.clamp(0.0, 1.0);
+        let edge_frac = (edge_pos - 0.5).abs() * 2.0;
         Some(OpeningLatent {
             range_pts,
+            edge_pos,
             edge_frac,
         })
     }
@@ -1376,9 +1627,21 @@ impl MultiLegEngine {
         if !crate::portfolio::try_claim(&self.shared_circuit, HOLDER) {
             return;
         }
-        if self.live.is_some() && !self.preflight_live_margin(&mut active, &snapshot).await {
-            crate::portfolio::release(&self.shared_circuit, HOLDER);
-            return;
+        if self.live.is_some() {
+            if let Err(failure) = self.preflight_live_margin(&mut active, &snapshot).await {
+                if let MarginPreflightFailure::InsufficientFunds(block) = &failure {
+                    let key = active.underlying.clone();
+                    self.state.entry(key).or_default().margin_block = Some(block.clone());
+                    warn!(
+                        "MULTILEG margin preflight latched for today: {}",
+                        failure.message()
+                    );
+                } else {
+                    warn!("MULTILEG margin preflight skipped entry: {}", failure.message());
+                }
+                crate::portfolio::release(&self.shared_circuit, HOLDER);
+                return;
+            }
         }
 
         if self.live.is_some() {
@@ -1413,17 +1676,24 @@ impl MultiLegEngine {
         }
     }
 
-    async fn preflight_live_margin(&self, active: &mut ActiveCombo, snapshot: &ChainSnapshot) -> bool {
-        let Some(live) = &self.live else { return true; };
+    async fn preflight_live_margin(
+        &self,
+        active: &mut ActiveCombo,
+        snapshot: &ChainSnapshot,
+    ) -> Result<(), MarginPreflightFailure> {
+        let Some(live) = &self.live else { return Ok(()); };
         let funds = match fetch_live_available_funds(&live.api_key, &live.access_token).await {
             Ok(v) => v,
             Err(e) => {
-                warn!("MULTILEG margin preflight skipped entry: live funds unavailable: {}", e);
-                return false;
+                return Err(MarginPreflightFailure::Transient(format!(
+                    "live funds unavailable: {}",
+                    e
+                )));
             }
         };
 
         let planned_lots = active.lots.max(1);
+        let mut last_block: Option<MarginBlock> = None;
         for lots in (1..=planned_lots).rev() {
             let qty = lots.saturating_mul(active.lot_size);
             let orders: Vec<BasketMarginOrder> = active
@@ -1443,8 +1713,10 @@ impl MultiLegEngine {
             let final_margin = match fetch_basket_final_margin(&live.api_key, &live.access_token, &orders).await {
                 Ok(v) => v,
                 Err(e) => {
-                    warn!("MULTILEG margin preflight skipped entry: basket margin unavailable: {}", e);
-                    return false;
+                    return Err(MarginPreflightFailure::Transient(format!(
+                        "basket margin unavailable: {}",
+                        e
+                    )));
                 }
             };
             if basket_margin_ok(final_margin, funds, MARGIN_BUFFER_FRAC) {
@@ -1459,8 +1731,15 @@ impl MultiLegEngine {
                     "MULTILEG margin preflight OK {} {:?}: final ₹{:.0}, funds ₹{:.0}, spot {:.0}, lots {}",
                     active.underlying, active.structure, final_margin, funds, snapshot.spot, active.lots
                 );
-                return true;
+                return Ok(());
             }
+            last_block = Some(MarginBlock {
+                structure: active.structure,
+                lots,
+                final_margin,
+                funds,
+                buffer_frac: MARGIN_BUFFER_FRAC,
+            });
             warn!(
                 "MULTILEG margin preflight rejected {} {:?} x{}lot: final margin ₹{:.0} + {:.0}% buffer > funds ₹{:.0}",
                 active.underlying,
@@ -1471,7 +1750,15 @@ impl MultiLegEngine {
                 funds
             );
         }
-        false
+        Err(MarginPreflightFailure::InsufficientFunds(
+            last_block.unwrap_or(MarginBlock {
+                structure: active.structure,
+                lots: active.lots.max(1),
+                final_margin: 0.0,
+                funds,
+                buffer_frac: MARGIN_BUFFER_FRAC,
+            }),
+        ))
     }
 
     async fn place_live_entry(&mut self, active: &mut ActiveCombo) -> Result<(), LiveEntryFailure> {
@@ -1558,9 +1845,11 @@ impl MultiLegEngine {
         let plans: Vec<PlannedLeg> = active.legs.iter().map(|l| l.plan.clone()).collect();
         let close_cost = combo_close_cost(&plans, &snapshot.quotes).unwrap_or(active.credit);
         let mut reason = None;
-        if let Some(move_pts) = self.recent_move_pts(underlying, now_ms) {
-            if move_trims(move_pts, snapshot.spot, active.zone_width, active.structure) {
-                reason = Some(ExitReason::Stop);
+        if move_stop_enabled(active.structure) {
+            if let Some(move_pts) = self.recent_move_pts(underlying, now_ms) {
+                if move_trims(move_pts, snapshot.spot, active.zone_width, active.structure) {
+                    reason = Some(ExitReason::Stop);
+                }
             }
         }
         if reason.is_none() {
@@ -1579,22 +1868,24 @@ impl MultiLegEngine {
             let qty = active.lots.saturating_mul(active.lot_size);
             let cur_exit_prices = self.exit_prices(&active, &snapshot);
             let net_now = realized_pnl(&active.legs, &cur_exit_prices, qty, now_ms);
-            if mins >= EXIT_MIN {
+            if mins >= exit_min_for(active.structure) {
                 reason = Some(ExitReason::Time);
-            } else if active.credit > 0.0 && gain >= 0.5 * active.credit {
+            } else if active.credit > 0.0 && gain >= target_frac(active.structure) * active.credit {
                 reason = Some(ExitReason::TakeProfit);
-            } else if trail_exits(gain, peak_gain, active.credit) {
+            } else if trail_enabled(active.structure) && trail_exits(gain, peak_gain, active.credit) {
                 // Half-gain profit trail: a winner that peaked past +15% gives back at most half.
                 reason = Some(ExitReason::Trail);
-            } else if net_now <= -STOP_FRAC_CAP * self.capital {
-                // Hard rupee stop on realized net: cut once the post-cost loss hits 10% of capital,
-                // regardless of lots — the active-stop alternative to limiting risk via position size.
+            } else if net_now <= -hard_stop_frac_cap(active.structure) * self.capital {
+                // Hard rupee stop on realized net: cut once the post-cost loss hits the
+                // structure-specific account cap, regardless of lots.
                 reason = Some(ExitReason::Stop);
-            } else if active.max_loss_unit > 0.0 && gain <= -STOP_FRAC_ML * active.max_loss_unit {
+            } else if active.max_loss_unit > 0.0
+                && gain <= -stop_frac_ml(active.structure) * active.max_loss_unit
+            {
                 reason = Some(ExitReason::Stop);
             }
         }
-        if mins >= EXIT_MIN {
+        if mins >= exit_min_for(active.structure) {
             reason = Some(ExitReason::Time);
         }
         if let Some(exit) = reason {
@@ -1604,6 +1895,13 @@ impl MultiLegEngine {
 
     fn has_active_positions(&self) -> bool {
         self.state.values().any(|st| st.active.is_some())
+    }
+
+    fn has_time_exit_due(&self, mins: u32) -> bool {
+        self.state
+            .values()
+            .filter_map(|st| st.active.as_ref())
+            .any(|active| mins >= exit_min_for(active.structure))
     }
 
     async fn close_all_active(&mut self, reason: ExitReason) {
@@ -2107,24 +2405,18 @@ mod tests {
     }
 
     #[test]
-    fn day_gate_mon_tue_only() {
-        assert!(weekday_allows(Weekday::Mon));
-        assert!(weekday_allows(Weekday::Tue));
-        for d in [Weekday::Wed, Weekday::Thu, Weekday::Fri, Weekday::Sat, Weekday::Sun] {
-            assert!(!weekday_allows(d));
-        }
-    }
-
-    #[test]
-    fn expiry_proximity_gate_allows_only_zero_or_one_dte() {
+    fn expiry_dte_gate_allows_only_zero_or_one_dte() {
         let mon = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
         let tue = NaiveDate::from_ymd_opt(2026, 6, 23).unwrap();
 
         assert_eq!(expiry_dte_days(mon, "2026-06-23"), Some(1));
-        assert!(expiry_proximity_allows(mon, "2026-06-23"));
-        assert!(expiry_proximity_allows(tue, "2026-06-23"));
-        assert!(!expiry_proximity_allows(mon, "2026-06-30"));
-        assert!(!expiry_proximity_allows(mon, "not-a-date"));
+        assert_eq!(expiry_dte_days(tue, "2026-06-23"), Some(0));
+        assert_eq!(expiry_dte_days(mon, "not-a-date"), None);
+
+        assert!(dte_allows(0));
+        assert!(dte_allows(1));
+        assert!(!dte_allows(2));
+        assert!(!dte_allows(-1));
     }
 
     #[test]
@@ -2149,6 +2441,62 @@ mod tests {
         assert_eq!(pe_s.strike, 23950.0); // ~|0.25|Δ put (23900 has no wing room → excluded)
         assert!(legs.iter().any(|l| l.opt == OptionType::CE && l.side == OrderSide::Buy && (l.strike - 24350.0).abs() < 1e-6 && l.wing));
         assert!(legs.iter().any(|l| l.opt == OptionType::PE && l.side == OrderSide::Buy && (l.strike - 23850.0).abs() < 1e-6 && l.wing));
+    }
+
+    #[test]
+    fn credit_edge_selects_one_sided_vertical_from_opening_edge() {
+        assert_eq!(
+            credit_edge_direction(0.70, CREDIT_EDGE_THRESHOLD),
+            Some(CreditDirection::BullPut)
+        );
+        assert_eq!(
+            credit_edge_direction(0.30, CREDIT_EDGE_THRESHOLD),
+            Some(CreditDirection::BearCall)
+        );
+        assert_eq!(credit_edge_direction(0.50, CREDIT_EDGE_THRESHOLD), None);
+
+        let bull_put = select_credit_spread_legs(
+            &chain(),
+            24109.0,
+            CreditDirection::BullPut,
+            CREDIT_EDGE_DELTA,
+            WING,
+        )
+        .expect("bull-put credit spread must seat");
+        assert_eq!(bull_put.len(), 2);
+        assert!(bull_put.iter().any(|l| {
+            l.opt == OptionType::PE && l.side == OrderSide::Sell && (l.strike - 23950.0).abs() < 1e-6
+        }));
+        assert!(bull_put.iter().any(|l| {
+            l.opt == OptionType::PE && l.side == OrderSide::Buy && l.wing && (l.strike - 23850.0).abs() < 1e-6
+        }));
+
+        let bear_call = select_credit_spread_legs(
+            &chain(),
+            24109.0,
+            CreditDirection::BearCall,
+            CREDIT_EDGE_DELTA,
+            WING,
+        )
+        .expect("bear-call credit spread must seat");
+        assert_eq!(bear_call.len(), 2);
+        assert!(bear_call.iter().any(|l| {
+            l.opt == OptionType::CE && l.side == OrderSide::Sell && (l.strike - 24250.0).abs() < 1e-6
+        }));
+        assert!(bear_call.iter().any(|l| {
+            l.opt == OptionType::CE && l.side == OrderSide::Buy && l.wing && (l.strike - 24350.0).abs() < 1e-6
+        }));
+
+        let seq = placement_sequence(&bear_call);
+        assert_eq!(seq[0].side, OrderSide::Buy, "CRED must buy the hedge before selling the short");
+        assert_eq!(seq[1].side, OrderSide::Sell);
+    }
+
+    #[test]
+    fn credit_edge_er_gate_rejects_trending_open() {
+        assert!(credit_edge_er_admits(0.55), "trained boundary should remain tradable");
+        assert!(!credit_edge_er_admits(0.60), "2026-06-30 style trending open should be vetoed");
+        assert!(!credit_edge_er_admits(f64::NAN), "invalid ER must not admit a credit spread");
     }
 
     #[test]
@@ -2255,7 +2603,10 @@ mod tests {
 
     #[test]
     fn per_structure_caps_match_satakarni() {
+        assert_eq!(stop_frac_ml(SellStructure::CreditEdge), 0.25, "CRED uses the optimized 25%ML stop");
+        assert_eq!(target_frac(SellStructure::CreditEdge), 0.50, "CRED target remains 50% credit capture");
         for (s, drift, edge, mv) in [
+            (SellStructure::CreditEdge, 1.00, 1.00, 1.00),
             (SellStructure::Condor, 0.50, 0.70, 0.35),
             (SellStructure::Tight, 0.45, 0.40, 0.30),
             (SellStructure::Fly, 0.45, 0.35, 0.25),
@@ -2265,18 +2616,6 @@ mod tests {
             assert_eq!(entry_balance_edge_cap(s), edge, "balance cap {:?}", s);
             assert_eq!(move_zone_cap(s), mv, "move cap {:?}", s);
         }
-    }
-
-    #[test]
-    fn exit_rule_fires_on_tp_stop_and_time() {
-        let credit = 31.2;
-        let maxloss = WING - credit;
-        assert_eq!(exit_reason(credit, 31.55, maxloss, 600), None);            // just opened, mid-session
-        assert_eq!(exit_reason(credit, 15.0, maxloss, 600), Some(ExitReason::TakeProfit)); // gain 16.2 ≥ 15.6
-        assert_eq!(exit_reason(credit, 41.0, maxloss, 600), None);             // loss still below 15% ML
-        assert_eq!(exit_reason(credit, 41.6, maxloss, 600), Some(ExitReason::Stop));        // loss exceeds 15% ML
-        assert_eq!(exit_reason(credit, 5.0, maxloss, 895), Some(ExitReason::Time));        // 14:55 overrides
-        assert_eq!(exit_reason(credit, 31.55, maxloss, 894), None);                        // 14:54 not yet forced
     }
 
     #[test]
@@ -2344,44 +2683,6 @@ mod tests {
         assert!(move_trims(130.0, 24100.0, 362.0, SellStructure::Condor));   // 0.54% of spot → trim
         assert!(move_trims(130.0, 100_000.0, 300.0, SellStructure::Condor)); // 0.13% spot but 43% zone
         assert!(move_trims(80.0, 100_000.0, 300.0, SellStructure::Fly));     // fly cap is tighter: 27% zone
-    }
-
-    #[test]
-    fn admission_policy_gives_multileg_priority() {
-        let flat = AdmissionState {
-            position_open: false,
-            single_traded_today: false,
-            multileg_traded_today: false,
-        };
-        // flat morning, nothing traded yet → both may fire (equal edge at 09:45)
-        assert!(may_enter(Strategy::MultiLeg, flat));
-        assert!(may_enter(Strategy::SingleLeg, flat));
-
-        // any position open → one-at-a-time, nothing else fires
-        let busy = AdmissionState {
-            position_open: true,
-            single_traded_today: false,
-            multileg_traded_today: false,
-        };
-        assert!(!may_enter(Strategy::MultiLeg, busy));
-        assert!(!may_enter(Strategy::SingleLeg, busy));
-
-        // multi-leg already traded today, now flat → single may still fire later.
-        let after_multi = AdmissionState {
-            position_open: false,
-            single_traded_today: false,
-            multileg_traded_today: true,
-        };
-        assert!(!may_enter(Strategy::MultiLeg, after_multi));
-        assert!(may_enter(Strategy::SingleLeg, after_multi));
-
-        let after_both = AdmissionState {
-            position_open: false,
-            single_traded_today: true,
-            multileg_traded_today: true,
-        };
-        assert!(!may_enter(Strategy::MultiLeg, after_both));
-        assert!(!may_enter(Strategy::SingleLeg, after_both));
     }
 
     fn test_engine_with_live_bridge(
@@ -2796,5 +3097,116 @@ mod tests {
         assert_eq!(active.structure, SellStructure::Condor);
         assert!(active.lots >= 1);
         assert!(crate::portfolio::is_locked(&engine.shared_circuit));
+    }
+
+    #[tokio::test]
+    async fn runtime_opens_credit_edge_on_high_opening_edge_even_when_neutral_er_skips() {
+        let day = NaiveDate::from_ymd_opt(2026, 6, 23).unwrap();
+        let (contracts, store, underlyings) = runtime_contracts_and_store();
+        let mut engine = MultiLegEngine::new(
+            contracts,
+            store.clone(),
+            underlyings,
+            0.065,
+            0.0,
+            50_000.0,
+            crate::portfolio::new_shared(50_000.0, 15.0, 25.0, 1),
+        );
+
+        for (h, m, s, spot) in [
+            (9, 15, 5, 24_000.0),
+            (9, 20, 0, 24_015.0),
+            (9, 25, 0, 24_005.0),
+            (9, 30, 0, 24_025.0),
+            (9, 35, 0, 24_015.0),
+            (9, 40, 0, 24_035.0),
+            (9, 45, 0, 24_048.0),
+        ] {
+            store.update(crate::models::Tick {
+                token: 1,
+                ltp: spot,
+                mode: crate::models::TickMode::Ltp,
+                ..crate::models::Tick::default()
+            });
+            engine.on_event_at(ist_ms(day, h, m, s)).await;
+        }
+
+        let active = engine
+            .state
+            .get("NIFTY")
+            .and_then(|s| s.active.as_ref())
+            .expect("paper runtime should open the CRED edge spread");
+        assert_eq!(active.structure, SellStructure::CreditEdge);
+        assert_eq!(active.legs.len(), 2);
+        assert!(active
+            .legs
+            .iter()
+            .any(|l| l.plan.opt == OptionType::PE && l.plan.side == OrderSide::Sell));
+        assert!(active
+            .legs
+            .iter()
+            .any(|l| l.plan.opt == OptionType::PE && l.plan.side == OrderSide::Buy && l.plan.wing));
+    }
+
+    #[tokio::test]
+    async fn margin_latch_blocks_repeated_multileg_attempts_for_the_day() {
+        let day = NaiveDate::from_ymd_opt(2026, 6, 23).unwrap();
+        let (contracts, store, underlyings) = runtime_contracts_and_store();
+        let circuit = crate::portfolio::new_shared(13_000.0, 15.0, 25.0, 1);
+        let mut engine = MultiLegEngine::new(
+            contracts,
+            store.clone(),
+            underlyings,
+            0.065,
+            0.0,
+            13_000.0,
+            circuit.clone(),
+        );
+
+        for (h, m, s, spot) in [
+            (9, 15, 5, 24_000.0),
+            (9, 20, 0, 24_020.0),
+            (9, 25, 0, 24_040.0),
+            (9, 30, 0, 24_060.0),
+            (9, 35, 0, 24_080.0),
+            (9, 40, 0, 24_100.0),
+        ] {
+            store.update(crate::models::Tick {
+                token: 1,
+                ltp: spot,
+                mode: crate::models::TickMode::Ltp,
+                ..crate::models::Tick::default()
+            });
+            engine.on_event_at(ist_ms(day, h, m, s)).await;
+        }
+
+        engine.state.entry("NIFTY".to_string()).or_default().margin_block = Some(MarginBlock {
+            structure: SellStructure::CreditEdge,
+            lots: 1,
+            final_margin: 36_000.0,
+            funds: 13_000.0,
+            buffer_frac: MARGIN_BUFFER_FRAC,
+        });
+
+        store.update(crate::models::Tick {
+            token: 1,
+            ltp: 24_120.0,
+            mode: crate::models::TickMode::Ltp,
+            ..crate::models::Tick::default()
+        });
+        engine.on_event_at(ist_ms(day, 9, 45, 0)).await;
+
+        assert!(
+            engine
+                .state
+                .get("NIFTY")
+                .and_then(|s| s.active.as_ref())
+                .is_none(),
+            "margin latch must block a CRED entry that would otherwise qualify"
+        );
+        assert!(
+            !crate::portfolio::is_locked(&circuit),
+            "a margin-latched skip must not hold the global position lock"
+        );
     }
 }

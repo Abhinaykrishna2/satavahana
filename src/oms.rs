@@ -1437,7 +1437,7 @@ mod tests {
         assert!(!crate::portfolio::is_locked(&circuit), "lock is free after the trade closed");
         assert_eq!(
             crate::portfolio::halt_reason_for(&circuit, "micro"),
-            Some("daily trade cap reached for this strategy"),
+            Some("daily account trade cap reached"),
             "halt reason must be the daily cap, not a P&L circuit"
         );
 

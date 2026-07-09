@@ -18,46 +18,15 @@
 //! opens; if another engine already holds it, the new signal is cancelled. The
 //! claim is **race-free** — the circuit check and the slot grab happen in a single
 //! mutex critical section, so two engines evaluating concurrently can never both win.
-//! ([`CapitalSplit`] is retained for tests/back-compat but the orchestrator now
-//! hands each engine the full capital.)
+//! The daily trade cap is account-wide as well: with `max_trades_per_day = 1`, a
+//! completed multileg trade blocks same-day single-leg/micro re-entry.
+//! Each engine is handed the full capital; co-deployment is prevented by the lock,
+//! not by a static split.
 
 use crate::risk::CircuitState;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-
-/// Fraction of total capital assigned to each engine family (static).
-#[derive(Debug, Clone, Copy)]
-pub struct CapitalSplit {
-    pub options: f64,
-    pub micro: f64,
-    pub quant: f64,
-}
-
-impl CapitalSplit {
-    /// Clamp each fraction to [0,1] and, if they sum to > 1, scale them down so the
-    /// engines can never be allocated more than the total capital.
-    pub fn normalized(self) -> Self {
-        let o = self.options.max(0.0);
-        let m = self.micro.max(0.0);
-        let q = self.quant.max(0.0);
-        let sum = o + m + q;
-        if sum > 1.0 && sum > 0.0 {
-            CapitalSplit { options: o / sum, micro: m / sum, quant: q / sum }
-        } else {
-            CapitalSplit { options: o, micro: m, quant: q }
-        }
-    }
-    pub fn options_capital(&self, total: f64) -> f64 {
-        (total * self.options).max(0.0)
-    }
-    pub fn micro_capital(&self, total: f64) -> f64 {
-        (total * self.micro).max(0.0)
-    }
-    pub fn quant_capital(&self, total: f64) -> f64 {
-        (total * self.quant).max(0.0)
-    }
-}
 
 /// One account-wide circuit breaker + single-position lock shared by every engine.
 #[derive(Debug)]
@@ -72,9 +41,9 @@ pub struct PortfolioCircuit {
     /// When the slot was claimed — used by the stale-claim watchdog ([`reap_stale`]).
     claimed_at: Option<Instant>,
     /// Completed trades today by engine holder (`options`, `multileg`, `micro`, ...).
+    /// Summed for the account-wide daily trade cap.
     trades_by_holder: HashMap<&'static str, u32>,
-    /// Hard cap on trades per day per holder (`max 1/day` = one single-leg and one
-    /// multi-leg can both trade, provided the global open-position lock is free).
+    /// Hard account-wide cap on completed trades per day.
     /// `u32::MAX` = uncapped. Resets only on process restart (which happens daily via
     /// the stale-token re-login — confirm the engine restarts each trading day).
     max_trades_per_day: u32,
@@ -151,8 +120,8 @@ impl PortfolioCircuit {
         self.state() == CircuitState::Open
     }
 
-    pub fn can_enter_holder(&self, holder: &'static str) -> bool {
-        self.can_enter() && !self.daily_cap_reached_for(holder)
+    pub fn can_enter_holder(&self, _holder: &'static str) -> bool {
+        self.can_enter() && !self.daily_cap_reached()
     }
 
     /// A human-legible reason new entries are blocked account-wide, or `None` if open.
@@ -164,12 +133,11 @@ impl PortfolioCircuit {
         }
     }
 
-    /// A human-legible reason entries are blocked for a holder. Keeps the per-holder
-    /// daily cap distinct from the account-wide P&L circuit.
-    pub fn halt_reason_for(&self, holder: &'static str) -> Option<&'static str> {
+    /// A human-legible reason entries are blocked for a holder.
+    pub fn halt_reason_for(&self, _holder: &'static str) -> Option<&'static str> {
         self.halt_reason().or_else(|| {
-            self.daily_cap_reached_for(holder)
-                .then_some("daily trade cap reached for this strategy")
+            self.daily_cap_reached()
+                .then_some("daily account trade cap reached")
         })
     }
 
@@ -262,7 +230,7 @@ pub fn can_enter(c: &SharedCircuit) -> bool {
     c.lock().map(|g| g.can_enter()).unwrap_or(false)
 }
 
-/// Whether a new entry is allowed for one holder by P&L circuit and holder trade cap.
+/// Whether a new entry is allowed for one holder by the account P&L circuit and daily account cap.
 pub fn can_enter_holder(c: &SharedCircuit, holder: &'static str) -> bool {
     c.lock().map(|g| g.can_enter_holder(holder)).unwrap_or(false)
 }
@@ -345,14 +313,14 @@ mod tests {
     }
 
     #[test]
-    fn daily_cap_is_per_holder_not_account_wide() {
+    fn daily_cap_is_account_wide() {
         let c = new_shared(100_000.0, 15.0, 25.0, 1);
         record_for(&c, "multileg", 1_000.0);
         assert!(!can_enter_holder(&c, "multileg"), "multi-leg used its one slot");
-        assert!(can_enter_holder(&c, "options"), "single-leg still has its own slot");
+        assert!(!can_enter_holder(&c, "options"), "single-leg must not trade after account daily cap");
         assert_eq!(
             halt_reason_for(&c, "multileg"),
-            Some("daily trade cap reached for this strategy")
+            Some("daily account trade cap reached")
         );
     }
 
@@ -417,15 +385,5 @@ mod tests {
         assert_eq!(reap_stale(&c, 3600), None, "fresh claim is not reaped");
         assert_eq!(reap_stale(&c, 0), Some("options"), "held >= 0s is force-released");
         assert!(!is_locked(&c), "watchdog frees the slot for the next signal");
-    }
-
-    #[test]
-    fn split_normalizes_when_over_allocated() {
-        let s = CapitalSplit { options: 0.8, micro: 0.8, quant: 0.8 }.normalized();
-        let total = s.options + s.micro + s.quant;
-        assert!((total - 1.0).abs() < 1e-9, "over-allocation scaled to <= 1.0");
-        // Under-allocation is left as-is (intentional cash buffer).
-        let u = CapitalSplit { options: 0.5, micro: 0.3, quant: 0.1 }.normalized();
-        assert!((u.options - 0.5).abs() < 1e-9);
-    }
+        }
 }

@@ -40,42 +40,6 @@ pub struct Config {
     #[serde(default)]
     pub risk: RiskConfig,
 
-    /// Static capital allocation across the engines (so they don't each size off
-    /// the full pool) + the account-level shared circuit baseline.
-    #[serde(default)]
-    pub portfolio: PortfolioConfig,
-}
-
-/// Per-engine capital allocation (fractions of total polled capital). Engines size
-/// off their slice; the account-level circuit is on the total.
-#[derive(Debug, Clone, Deserialize)]
-pub struct PortfolioConfig {
-    #[serde(default = "default_alloc_options")]
-    pub options_capital_frac: f64,
-    #[serde(default = "default_alloc_micro")]
-    pub micro_capital_frac: f64,
-    #[serde(default = "default_alloc_quant")]
-    pub quant_capital_frac: f64,
-}
-
-impl Default for PortfolioConfig {
-    fn default() -> Self {
-        PortfolioConfig {
-            options_capital_frac: default_alloc_options(),
-            micro_capital_frac: default_alloc_micro(),
-            quant_capital_frac: default_alloc_quant(),
-        }
-    }
-}
-
-fn default_alloc_options() -> f64 {
-    0.5
-}
-fn default_alloc_micro() -> f64 {
-    0.3
-}
-fn default_alloc_quant() -> f64 {
-    0.2
 }
 
 fn default_options_engine_config() -> OptionsEngineConfig {
@@ -86,9 +50,13 @@ fn default_options_engine_config() -> OptionsEngineConfig {
         max_daily_profit_pct: 25.0,
         profit_target_pct: 55.0,
         stop_loss_pct: 35.0,
+        profit_lock_arm_pct: default_profit_lock_arm_pct(),
+        profit_lock_gain_pct: default_profit_lock_gain_pct(),
+        trail_arm_pct: default_trail_arm_pct(),
+        trail_giveback_pct: default_trail_giveback_pct(),
         min_confidence: 60.0,
         expiry_day_min_confidence: 60.0,
-        scan_interval_secs: 45,
+        scan_interval_secs: 30,
         max_daily_trades: default_max_daily_trades(),
     }
 }
@@ -388,9 +356,9 @@ pub struct RiskConfig {
     /// Minute past each hour to poll live margins for capital sync. Default: 14.
     #[serde(default = "default_capital_poll_minute")]
     pub capital_poll_minute: u32,
-    /// Hard cap on trades per day per strategy holder. The shared portfolio still
-    /// allows only one open position at a time, but a closed multi-leg trade does not
-    /// consume the single-leg quota. 1 = one trade/day per strategy. Default: 1.
+    /// Hard account-wide cap on completed trades per day across all real-order engines.
+    /// The shared portfolio also allows only one open position at a time.
+    /// 1 = one real trade/day for the account. Default: 1.
     #[serde(default = "default_max_trades_per_day")]
     pub max_trades_per_day: u32,
 }
@@ -504,6 +472,24 @@ pub struct OptionsEngineConfig {
     #[serde(default = "default_stop_loss")]
     pub stop_loss_pct: f64,
 
+    /// Runner-profile option premium gain required before moving stop above entry.
+    /// The engine applies this only to explicitly eligible >1-DTE runner trades;
+    /// expiry-day and 1-DTE exits stay on the rigid built-in safety profile.
+    #[serde(default = "default_profit_lock_arm_pct")]
+    pub profit_lock_arm_pct: f64,
+
+    /// Runner-profile locked gain after profit lock arms, as % of entry premium.
+    #[serde(default = "default_profit_lock_gain_pct")]
+    pub profit_lock_gain_pct: f64,
+
+    /// Runner-profile option premium gain required before the peak-giveback trail starts.
+    #[serde(default = "default_trail_arm_pct")]
+    pub trail_arm_pct: f64,
+
+    /// Runner-profile percent of peak gain allowed to be given back once trailing is armed.
+    #[serde(default = "default_trail_giveback_pct")]
+    pub trail_giveback_pct: f64,
+
     #[serde(default = "default_min_confidence")]
     pub min_confidence: f64,
 
@@ -523,9 +509,13 @@ fn default_max_daily_loss()   -> f64 { 15.0 }
 fn default_max_daily_profit()  -> f64 { 25.0 }
 fn default_profit_target()    -> f64 { 55.0 }
 fn default_stop_loss()        -> f64 { 35.0 }
+fn default_profit_lock_arm_pct() -> f64 { 12.0 }
+fn default_profit_lock_gain_pct() -> f64 { 2.0 }
+fn default_trail_arm_pct() -> f64 { 20.0 }
+fn default_trail_giveback_pct() -> f64 { 60.0 }
 fn default_min_confidence()   -> f64 { 60.0 }
 fn default_expiry_day_min_confidence() -> f64 { 60.0 }
-fn default_scan_interval()    -> u64 { 45 }
+fn default_scan_interval()    -> u64 { 30 }
 fn default_max_daily_trades() -> u32 { 3 }
 
 impl Config {
