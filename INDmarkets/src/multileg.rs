@@ -41,6 +41,8 @@ pub const CREDIT_EDGE_TARGET_FRAC: f64 = 0.50;
 pub const CREDIT_EDGE_STOP_FRAC_ML: f64 = 0.25;
 pub const CREDIT_EDGE_HARD_STOP_FRAC_CAP: f64 = 0.15;
 pub const CREDIT_EDGE_ALLOC_FRAC: f64 = 0.90;
+pub const CREDIT_EDGE_LATE_EXIT_MIN: u32 = 14 * 60 + 30;
+pub const CREDIT_EDGE_LATE_NET_PROFIT_FRAC_CAP: f64 = 0.0075;
 /// Live cap for CRED. The research lab used up to 2 lots, but the live engine also enforces a
 /// 10%-of-capital hard stop; on the 13k account, 2 lots can hit that stop before the trained
 /// credit-spread exit recovers. Keep live CRED to 1 lot unless account capital/margin is larger.
@@ -557,6 +559,18 @@ pub fn exit_min_for(structure: SellStructure) -> u32 {
         SellStructure::CreditEdge => CREDIT_EDGE_EXIT_MIN,
         SellStructure::Condor | SellStructure::Tight | SellStructure::Fly | SellStructure::WideFly => EXIT_MIN,
     }
+}
+
+pub fn credit_edge_late_net_exit(
+    structure: SellStructure,
+    mins: u32,
+    net_pnl: f64,
+    capital: f64,
+) -> bool {
+    structure == SellStructure::CreditEdge
+        && mins >= CREDIT_EDGE_LATE_EXIT_MIN
+        && capital > 0.0
+        && net_pnl >= CREDIT_EDGE_LATE_NET_PROFIT_FRAC_CAP * capital
 }
 
 pub fn move_stop_enabled(structure: SellStructure) -> bool {
@@ -1872,6 +1886,8 @@ impl MultiLegEngine {
                 reason = Some(ExitReason::Time);
             } else if active.credit > 0.0 && gain >= target_frac(active.structure) * active.credit {
                 reason = Some(ExitReason::TakeProfit);
+            } else if credit_edge_late_net_exit(active.structure, mins, net_now, self.capital) {
+                reason = Some(ExitReason::TakeProfit);
             } else if trail_enabled(active.structure) && trail_exits(gain, peak_gain, active.credit) {
                 // Half-gain profit trail: a winner that peaked past +15% gives back at most half.
                 reason = Some(ExitReason::Trail);
@@ -2616,6 +2632,36 @@ mod tests {
             assert_eq!(entry_balance_edge_cap(s), edge, "balance cap {:?}", s);
             assert_eq!(move_zone_cap(s), mv, "move cap {:?}", s);
         }
+    }
+
+    #[test]
+    fn credit_edge_late_net_exit_only_locks_real_late_profit() {
+        let cap = 13_094.0;
+        let floor = CREDIT_EDGE_LATE_NET_PROFIT_FRAC_CAP * cap;
+        assert!(!credit_edge_late_net_exit(
+            SellStructure::CreditEdge,
+            CREDIT_EDGE_LATE_EXIT_MIN - 1,
+            floor + 1.0,
+            cap
+        ));
+        assert!(!credit_edge_late_net_exit(
+            SellStructure::Condor,
+            CREDIT_EDGE_LATE_EXIT_MIN,
+            floor + 1.0,
+            cap
+        ));
+        assert!(!credit_edge_late_net_exit(
+            SellStructure::CreditEdge,
+            CREDIT_EDGE_LATE_EXIT_MIN,
+            floor - 1.0,
+            cap
+        ));
+        assert!(credit_edge_late_net_exit(
+            SellStructure::CreditEdge,
+            CREDIT_EDGE_LATE_EXIT_MIN,
+            floor,
+            cap
+        ));
     }
 
     #[test]

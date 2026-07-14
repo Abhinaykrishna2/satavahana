@@ -5,10 +5,11 @@ use crate::execution::OrderSide;
 use crate::models::OptionType;
 use crate::multileg::{
     atm_straddle, combo_close_cost, combo_credit, credit_edge_direction, credit_edge_er_admits,
-    dte_allows, efficiency_ratio, entry_balance_admits, entry_balance_edge_cap,
-    entry_drift_admits, entry_drift_zone_cap, exit_min_for, hard_stop_frac_cap,
-    max_loss_per_lot, move_stop_enabled, move_trims, option_order_cost, pick_best_structure,
-    profit_zone, select_credit_spread_legs, select_legs, sell_regime_skip, size_lots,
+    credit_edge_late_net_exit, dte_allows, efficiency_ratio, entry_balance_admits,
+    entry_balance_edge_cap, entry_drift_admits, entry_drift_zone_cap, exit_min_for,
+    hard_stop_frac_cap, max_loss_per_lot, move_stop_enabled, move_trims, option_order_cost,
+    pick_best_structure, profit_zone, select_credit_spread_legs, select_legs, sell_regime_skip,
+    size_lots,
     stop_frac_ml, structure_regime_score, target_frac, trail_enabled, trail_exits,
     OpeningRegime, PlannedLeg, SellStructure, StrikeQuote, CREDIT_EDGE_ALLOC_FRAC,
     CREDIT_EDGE_DELTA, CREDIT_EDGE_MAX_DTE_DAYS, CREDIT_EDGE_MAX_ER, CREDIT_EDGE_MAX_LOTS,
@@ -399,6 +400,17 @@ fn manage(
             return (t, format!("TARGET {:.0}%", target_frac(plan.structure) * 100.0));
         }
         peak_gain = peak_gain.max(gain);
+        // NET (post-cost) P&L the exit would realize right now. Live checks the late CRED
+        // profit lock before the trail, so preserve that reason precedence in replay.
+        let t_ms = t.and_utc().timestamp_millis() as u64;
+        let net_now = pnl(&plan.legs, entry_quotes, &quotes, plan.lots, t_ms)
+            .map(|(net, _gross, _costs)| net);
+        if let Some(net) = net_now {
+            let mins = t.hour() * 60 + t.minute();
+            if credit_edge_late_net_exit(plan.structure, mins, net, capital) {
+                return (t, format!("LATE-NET ₹{net:.0}"));
+            }
+        }
         if trail_enabled(plan.structure) && trail_exits(gain, peak_gain, plan.credit) {
             return (
                 t,
@@ -409,8 +421,7 @@ fn manage(
         // booked loss lands at the structure-specific capital cap, not cap+costs+slippage.
         // Same realized formula (pnl) used at the real exit; live mirrors this via realized_pnl
         // in manage_active.
-        let t_ms = t.and_utc().timestamp_millis() as u64;
-        if let Some((net, _g, _c)) = pnl(&plan.legs, entry_quotes, &quotes, plan.lots, t_ms) {
+        if let Some(net) = net_now {
             if net <= -stop_rupees {
                 return (
                     t,
