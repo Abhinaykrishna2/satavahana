@@ -260,6 +260,17 @@ fn standalone_spot_reversal_is_late_rsi_chase(action: SignalAction, rsi: f64) ->
     }
 }
 
+fn should_block_zero_dte_spot_reversal(
+    strategy: StrategyType,
+    days_to_expiry: f64,
+    aligned: u32,
+    observed: u32,
+) -> bool {
+    strategy == StrategyType::SpotReversal
+        && days_to_expiry < 0.5
+        && (observed == 0 || aligned * 2 <= observed)
+}
+
 fn composite_spot_reversal_passes_quality(
     action: SignalAction,
     reversal: &crate::technicals::SpotReversal,
@@ -3496,6 +3507,30 @@ impl OptionsEngine {
                     return signals;
                 }
             }
+
+            let direction = match dominant_action {
+                SignalAction::BuyCE => crate::technicals::Direction::Bull,
+                SignalAction::BuyPE => crate::technicals::Direction::Bear,
+                _ => crate::technicals::Direction::Neutral,
+            };
+            let (aligned, observed) = self
+                .spot_series
+                .get(&snap.underlying)
+                .and_then(|series| series.scalp_assessment(direction))
+                .map(|assessment| (assessment.aligned, assessment.observed))
+                .unwrap_or((0, 0));
+            if should_block_zero_dte_spot_reversal(
+                primary_strategy,
+                snap.days_to_expiry,
+                aligned,
+                observed,
+            ) {
+                warn!(
+                    "  {} gen_signals: {:?} blocked — standalone 0-DTE spot-reversal needs strict spot-confirmation majority, got {}/{}",
+                    snap.underlying, dominant_action, aligned, observed
+                );
+                return signals;
+            }
         }
 
         // In 0-DTE midday compression, a spot-reversal after a large extension is often a
@@ -5402,6 +5437,7 @@ mod tests {
         composite_spot_reversal_passes_quality,
         far_dte_composite_midday_block,
         far_dte_composite_is_late_rsi_chase,
+        should_block_zero_dte_spot_reversal,
         standalone_spot_reversal_is_late_rsi_chase,
         OptionsEngine,
         PendingEntryOrder,
@@ -5513,6 +5549,34 @@ mod tests {
         );
         assert!(!standalone_spot_reversal_is_late_rsi_chase(SignalAction::BuyPE, 37.0));
         assert!(!standalone_spot_reversal_is_late_rsi_chase(SignalAction::Hold, 80.0));
+    }
+
+    #[test]
+    fn zero_dte_spot_reversal_requires_strict_confirmation_majority() {
+        assert!(should_block_zero_dte_spot_reversal(
+            StrategyType::SpotReversal,
+            0.2,
+            2,
+            4
+        ));
+        assert!(!should_block_zero_dte_spot_reversal(
+            StrategyType::SpotReversal,
+            0.2,
+            2,
+            3
+        ));
+        assert!(!should_block_zero_dte_spot_reversal(
+            StrategyType::SpotReversal,
+            1.0,
+            2,
+            4
+        ));
+        assert!(!should_block_zero_dte_spot_reversal(
+            StrategyType::Composite,
+            0.2,
+            2,
+            4
+        ));
     }
 
     #[test]
