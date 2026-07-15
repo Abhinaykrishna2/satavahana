@@ -407,7 +407,7 @@ fn manage(
             .map(|(net, _gross, _costs)| net);
         if let Some(net) = net_now {
             let mins = t.hour() * 60 + t.minute();
-            if credit_edge_late_net_exit(plan.structure, mins, net, capital) {
+            if credit_edge_late_net_exit(plan.structure, mins, net, plan.lots) {
                 return (t, format!("LATE-NET ₹{net:.0}"));
             }
         }
