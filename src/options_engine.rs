@@ -260,15 +260,23 @@ fn standalone_spot_reversal_is_late_rsi_chase(action: SignalAction, rsi: f64) ->
     }
 }
 
-fn should_block_zero_dte_spot_reversal(
-    strategy: StrategyType,
+fn should_block_zero_dte_flow(
     days_to_expiry: f64,
     aligned: u32,
     observed: u32,
+    desired: crate::technicals::Direction,
+    opening_range: Option<crate::technicals::Direction>,
 ) -> bool {
-    strategy == StrategyType::SpotReversal
-        && days_to_expiry < 0.5
-        && (observed == 0 || aligned * 2 <= observed)
+    let opening_range_conflicts = matches!(
+        (desired, opening_range),
+        (crate::technicals::Direction::Bull, Some(crate::technicals::Direction::Bear))
+            | (crate::technicals::Direction::Bear, Some(crate::technicals::Direction::Bull))
+    );
+    days_to_expiry < 0.5
+        && (observed < 3
+            || aligned * 2 <= observed
+            || opening_range.is_none()
+            || opening_range_conflicts)
 }
 
 fn composite_spot_reversal_passes_quality(
@@ -325,6 +333,15 @@ fn far_dte_composite_midday_block(
     dominant_signal_count > 1
         && days_to_expiry > FAR_DTE_COMPOSITE_MIN_DTE
         && matches!(session, SessionPhase::Midday)
+}
+
+fn advance_replay_scan_anchor(last: Option<u64>, now: u64, interval: u64) -> u64 {
+    match last {
+        Some(last) if interval > 0 => {
+            last.saturating_add(now.saturating_sub(last) / interval * interval)
+        }
+        _ => now,
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1145,7 +1162,11 @@ impl OptionsEngine {
             .unwrap_or(true);
         if should_scan {
             self.scan_count += 1;
-            self.replay_last_scan_ms = Some(timestamp_ms);
+            self.replay_last_scan_ms = Some(advance_replay_scan_anchor(
+                self.replay_last_scan_ms,
+                timestamp_ms,
+                scan_interval_ms,
+            ));
             self.run_full_scan();
         }
     }
@@ -3489,6 +3510,37 @@ impl OptionsEngine {
             snap.underlying, dominant_action, composite_score, confidence_floor, n_dominant);
         if composite_score < confidence_floor { return signals; }
 
+        let direction = match dominant_action {
+            SignalAction::BuyCE => crate::technicals::Direction::Bull,
+            SignalAction::BuyPE => crate::technicals::Direction::Bear,
+            _ => crate::technicals::Direction::Neutral,
+        };
+        let (aligned, observed, opening_range) = self
+            .spot_series
+            .get(&snap.underlying)
+            .map(|series| {
+                let assessment = series.scalp_assessment(direction);
+                let (aligned, observed) = assessment
+                    .map(|value| (value.aligned, value.observed))
+                    .unwrap_or((0, 0));
+                let opening_range = series.opening_range().map(|read| read.direction);
+                (aligned, observed, opening_range)
+            })
+            .unwrap_or((0, 0, None));
+        if should_block_zero_dte_flow(
+            snap.days_to_expiry,
+            aligned,
+            observed,
+            direction,
+            opening_range,
+        ) {
+            warn!(
+                "  {} gen_signals: {:?} blocked — 0-DTE signal needs a warm spot majority without opening-range conflict, got {}/{} and OR {:?}",
+                snap.underlying, dominant_action, aligned, observed, opening_range
+            );
+            return signals;
+        }
+
         if primary_strategy == StrategyType::SpotReversal {
             if let Some(rsi) = self
                 .spot_series
@@ -3506,30 +3558,6 @@ impl OptionsEngine {
                     );
                     return signals;
                 }
-            }
-
-            let direction = match dominant_action {
-                SignalAction::BuyCE => crate::technicals::Direction::Bull,
-                SignalAction::BuyPE => crate::technicals::Direction::Bear,
-                _ => crate::technicals::Direction::Neutral,
-            };
-            let (aligned, observed) = self
-                .spot_series
-                .get(&snap.underlying)
-                .and_then(|series| series.scalp_assessment(direction))
-                .map(|assessment| (assessment.aligned, assessment.observed))
-                .unwrap_or((0, 0));
-            if should_block_zero_dte_spot_reversal(
-                primary_strategy,
-                snap.days_to_expiry,
-                aligned,
-                observed,
-            ) {
-                warn!(
-                    "  {} gen_signals: {:?} blocked — standalone 0-DTE spot-reversal needs strict spot-confirmation majority, got {}/{}",
-                    snap.underlying, dominant_action, aligned, observed
-                );
-                return signals;
             }
         }
 
@@ -5427,6 +5455,7 @@ impl OptionsEngine {
 #[cfg(test)]
 mod tests {
     use super::{
+        advance_replay_scan_anchor,
         entry_cost_per_lot_excl_brokerage,
         entry_cutoff_ist_mins_for_dte,
         entry_order_cost,
@@ -5437,7 +5466,7 @@ mod tests {
         composite_spot_reversal_passes_quality,
         far_dte_composite_midday_block,
         far_dte_composite_is_late_rsi_chase,
-        should_block_zero_dte_spot_reversal,
+        should_block_zero_dte_flow,
         standalone_spot_reversal_is_late_rsi_chase,
         OptionsEngine,
         PendingEntryOrder,
@@ -5458,6 +5487,13 @@ mod tests {
     use crate::store::TickStore;
     use chrono::TimeZone;
     use std::collections::HashMap;
+
+    #[test]
+    fn replay_scan_anchor_does_not_accumulate_tick_delay() {
+        assert_eq!(advance_replay_scan_anchor(None, 1_000, 30_000), 1_000);
+        assert_eq!(advance_replay_scan_anchor(Some(1_000), 31_600, 30_000), 31_000);
+        assert_eq!(advance_replay_scan_anchor(Some(31_000), 61_900, 30_000), 61_000);
+    }
 
     fn test_config() -> OptionsEngineConfig {
         OptionsEngineConfig {
@@ -5552,30 +5588,41 @@ mod tests {
     }
 
     #[test]
-    fn zero_dte_spot_reversal_requires_strict_confirmation_majority() {
-        assert!(should_block_zero_dte_spot_reversal(
-            StrategyType::SpotReversal,
+    fn zero_dte_flow_requires_warm_majority_without_opening_range_conflict() {
+        assert!(should_block_zero_dte_flow(
             0.2,
-            2,
-            4
+            3,
+            4,
+            crate::technicals::Direction::Bull,
+            Some(crate::technicals::Direction::Bear)
         ));
-        assert!(!should_block_zero_dte_spot_reversal(
-            StrategyType::SpotReversal,
+        assert!(should_block_zero_dte_flow(
             0.2,
-            2,
-            3
+            0,
+            0,
+            crate::technicals::Direction::Bull,
+            None
         ));
-        assert!(!should_block_zero_dte_spot_reversal(
-            StrategyType::SpotReversal,
-            1.0,
-            2,
-            4
-        ));
-        assert!(!should_block_zero_dte_spot_reversal(
-            StrategyType::Composite,
+        assert!(!should_block_zero_dte_flow(
             0.2,
-            2,
-            4
+            3,
+            4,
+            crate::technicals::Direction::Bull,
+            Some(crate::technicals::Direction::Neutral)
+        ));
+        assert!(should_block_zero_dte_flow(
+            0.2,
+            3,
+            4,
+            crate::technicals::Direction::Bear,
+            Some(crate::technicals::Direction::Bull)
+        ));
+        assert!(!should_block_zero_dte_flow(
+            1.2,
+            0,
+            0,
+            crate::technicals::Direction::Bull,
+            None
         ));
     }
 

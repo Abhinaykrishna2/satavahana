@@ -6,6 +6,9 @@
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use satavahana::models::OptionType;
+use satavahana::multileg::{
+    CREDIT_EDGE_LATE_EXIT_MIN, CREDIT_EDGE_LATE_NET_PROFIT_PER_LOT,
+};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::error::Error;
@@ -17,7 +20,7 @@ const DEFAULT_CAPITAL: f64 = 15_000.0;
 const DEFAULT_TOP: usize = 10;
 const DEFAULT_MIN_TRADES: usize = 2;
 const MAX_SPREAD_PCT: f64 = 0.22;
-const VERIFIED_CREDIT_SPREAD_MARGIN_INR: f64 = 35_950.0;
+const OBSERVED_CREDIT_SPREAD_MARGIN_INR: f64 = 36_717.0;
 const CREDIT_SPREAD_MARGIN_BUFFER: f64 = 0.15;
 const DELAY_OPENING_ER: f64 = 0.55;
 const DELAY_OPENING_DRIFT_PCT: f64 = 0.0025;
@@ -98,6 +101,7 @@ struct IdeaSpec {
     trail_pct: f64,
     alloc_frac: f64,
     enforce_credit_margin: bool,
+    late_lock_per_lot: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -189,23 +193,29 @@ struct CliArgs {
     cross_verify: bool,
     safe_credit: bool,
     delayed_credit: bool,
+    regime_credit: bool,
+    robust_credit: bool,
     enforce_credit_margin: bool,
 }
 
 fn print_usage(bin: &str) {
     eprintln!(
-        "Usage: {bin} [--all] [--capital N] [--top N] [--min-trades N] [--cross-verify] [--safe-credit|--delayed-credit] [--enforce-credit-margin] [selling_csv_files...]\n\
+        "Usage: {bin} [--all] [--capital N] [--top N] [--min-trades N] [--cross-verify] [--safe-credit|--delayed-credit|--regime-credit|--robust-credit] [--enforce-credit-margin] [selling_csv_files...]\n\
          \n\
          Backtest-only option strategy lab. Reads *_option_selling_ticks.csv(.gz),\n\
          uses bid/ask fills and costs, and never touches live engine code.\n\
          --safe-credit isolates CRED-EDGE 09:45 edge65 delta0.25 stop25 target50 er<=0.55.\n\
          --delayed-credit keeps that 09:45 profile, but delays high-ER/high-drift opens until a pullback fails.\n\
-         --enforce-credit-margin filters credit spreads unless capital covers the verified Zerodha margin estimate.\n\
+         --regime-credit sweeps opening ER, edge, and short-delta gates for CRED-EDGE.\n\
+         --robust-credit isolates ER<=0.50, delta0.30 with a 14:30 Rs112.50/lot net lock.\n\
+         --enforce-credit-margin filters credit spreads unless capital covers the observed broker margin plus buffer.\n\
          \n\
          Examples:\n\
            {bin} --all\n\
            {bin} --all --safe-credit --capital 42000 --enforce-credit-margin --cross-verify\n\
            {bin} --all --delayed-credit --capital 42000 --enforce-credit-margin --cross-verify\n\
+           {bin} --all --regime-credit --capital 42000 --enforce-credit-margin --cross-verify\n\
+           {bin} --all --robust-credit --capital 42000 --enforce-credit-margin --cross-verify\n\
            {bin} --capital 15000 --top 15 --all\n\
            {bin} ../data/2026-07-06_option_selling_ticks.csv.gz"
     );
@@ -222,6 +232,8 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
     let mut cross_verify = false;
     let mut safe_credit = false;
     let mut delayed_credit = false;
+    let mut regime_credit = false;
+    let mut robust_credit = false;
     let mut enforce_credit_margin = false;
 
     while let Some(arg) = args.next() {
@@ -234,6 +246,8 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
             "--cross-verify" => cross_verify = true,
             "--safe-credit" => safe_credit = true,
             "--delayed-credit" => delayed_credit = true,
+            "--regime-credit" => regime_credit = true,
+            "--robust-credit" => robust_credit = true,
             "--enforce-credit-margin" => enforce_credit_margin = true,
             "--capital" => {
                 let value = args.next().ok_or("missing --capital value")?;
@@ -267,8 +281,13 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
     if paths.is_empty() {
         return Err("no *_option_selling_ticks.csv(.gz) files found".into());
     }
-    if safe_credit && delayed_credit {
-        return Err("--safe-credit and --delayed-credit are mutually exclusive".into());
+    if [safe_credit, delayed_credit, regime_credit, robust_credit]
+        .into_iter()
+        .filter(|enabled| *enabled)
+        .count()
+        > 1
+    {
+        return Err("credit profile flags are mutually exclusive".into());
     }
 
     Ok(CliArgs {
@@ -279,6 +298,8 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
         cross_verify,
         safe_credit,
         delayed_credit,
+        regime_credit,
+        robust_credit,
         enforce_credit_margin,
     })
 }
@@ -310,18 +331,18 @@ fn selling_files_in_data() -> Vec<PathBuf> {
     out
 }
 
-fn verified_credit_margin_with_buffer() -> f64 {
-    VERIFIED_CREDIT_SPREAD_MARGIN_INR * (1.0 + CREDIT_SPREAD_MARGIN_BUFFER)
+fn observed_credit_margin_with_buffer() -> f64 {
+    OBSERVED_CREDIT_SPREAD_MARGIN_INR * (1.0 + CREDIT_SPREAD_MARGIN_BUFFER)
 }
 
 fn credit_margin_filter_reason(capital: f64, enabled: bool) -> Option<String> {
-    if !enabled || capital >= verified_credit_margin_with_buffer() {
+    if !enabled || capital >= observed_credit_margin_with_buffer() {
         return None;
     }
     Some(format!(
-        "verified Zerodha margin filter: Rs {:.0} < Rs {:.0} required",
+        "observed broker margin filter: Rs {:.0} < Rs {:.0} required",
         capital,
-        verified_credit_margin_with_buffer()
+        observed_credit_margin_with_buffer()
     ))
 }
 
@@ -866,8 +887,15 @@ fn size_credit_lots(
     if !enforce_credit_margin {
         return risk_sized;
     }
-    let margin_sized = (capital / verified_credit_margin_with_buffer()).floor() as u32;
+    let margin_sized = (capital / observed_credit_margin_with_buffer()).floor() as u32;
     risk_sized.min(margin_sized).clamp(0, MAX_LOTS)
+}
+
+fn late_credit_lock(mins: u32, net_pnl: f64, lots: u32, per_lot: f64) -> bool {
+    mins >= CREDIT_EDGE_LATE_EXIT_MIN
+        && lots > 0
+        && per_lot > 0.0
+        && net_pnl >= per_lot * lots as f64
 }
 
 fn simulate_credit_spread(
@@ -965,6 +993,25 @@ fn simulate_credit_spread(
         if gain_unit >= spec.target_pct * entry_credit {
             reason = format!("target {:.0}% credit", spec.target_pct * 100.0);
             break;
+        }
+        if spec.late_lock_per_lot > 0.0
+            && t.hour() * 60 + t.minute() >= CREDIT_EDGE_LATE_EXIT_MIN
+        {
+            let exit_ms = ts_ms(t);
+            let costs = option_order_cost(spread.short.entry.bid, qty, Side::Sell, exit_ms)
+                + option_order_cost(spread.wing.entry.ask, qty, Side::Buy, exit_ms)
+                + option_order_cost(short_ask, qty, Side::Buy, exit_ms)
+                + option_order_cost(wing_bid, qty, Side::Sell, exit_ms);
+            let net = gain_unit * qty as f64 - costs;
+            if late_credit_lock(
+                t.hour() * 60 + t.minute(),
+                net,
+                lots,
+                spec.late_lock_per_lot,
+            ) {
+                reason = format!("late net Rs {:.0}/lot", net / lots as f64);
+                break;
+            }
         }
         if gain_unit <= -spec.stop_pct * max_loss_unit {
             reason = format!("stop {:.0}% maxloss", spec.stop_pct * 100.0);
@@ -1273,6 +1320,7 @@ fn idea_grid(enforce_credit_margin: bool) -> Vec<IdeaSpec> {
             trail_pct,
             alloc_frac,
             enforce_credit_margin,
+            late_lock_per_lot: 0.0,
         });
     };
 
@@ -1530,6 +1578,44 @@ fn build_specs(args: &CliArgs) -> Result<Vec<IdeaSpec>, Box<dyn Error>> {
         return Ok(out);
     }
 
+    if args.regime_credit {
+        let base = specs
+            .into_iter()
+            .find(is_safe_credit_spec)
+            .ok_or("canonical safe-credit spec not found")?;
+        let mut out = Vec::new();
+        for max_er in [0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60] {
+            for edge in [0.60, 0.65, 0.70, 0.75] {
+                for delta in [0.20, 0.25, 0.30, 0.35] {
+                    let mut sp = base.clone();
+                    sp.max_er = max_er;
+                    sp.edge_threshold = edge;
+                    sp.delta_target = delta;
+                    sp.name = format!(
+                        "CRED-EDGE REGIME er<={:.2} edge{:.0} d{:.2} e09:45 s25 t50",
+                        max_er,
+                        edge * 100.0,
+                        delta
+                    );
+                    out.push(sp);
+                }
+            }
+        }
+        return Ok(out);
+    }
+
+    if args.robust_credit {
+        let mut sp = specs
+            .into_iter()
+            .find(is_safe_credit_spec)
+            .ok_or("canonical safe-credit spec not found")?;
+        sp.max_er = 0.50;
+        sp.delta_target = 0.30;
+        sp.late_lock_per_lot = CREDIT_EDGE_LATE_NET_PROFIT_PER_LOT;
+        sp.name = "CRED-EDGE ROBUST er<=0.50 edge65 d0.30 e09:45 s25 t50 lnet112".to_string();
+        return Ok(vec![sp]);
+    }
+
     // Backtest-only what-if: isolate the canonical CRED-EDGE spec and override only its stop,
     // e.g. SATA_STOP_PCT=0.10 tests a tight 10%-of-max-loss stop.
     if let Ok(v) = std::env::var("SATA_STOP_PCT") {
@@ -1611,7 +1697,7 @@ fn sort_scores(scores: &mut [IdeaScore]) {
             .partial_cmp(&a.total_net)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.trades.cmp(&a.trades))
-            .then_with(|| a.worst.partial_cmp(&b.worst).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| b.worst.partial_cmp(&a.worst).unwrap_or(std::cmp::Ordering::Equal))
     });
 }
 
@@ -1843,6 +1929,57 @@ fn print_neighborhood(scores: &[IdeaScore], best: &IdeaScore) {
     }
 }
 
+fn print_anchored_walk_forward(
+    days: &[DayData],
+    candidate_specs: &[IdeaSpec],
+    capital: f64,
+) {
+    const MIN_TRAIN_DAYS: usize = 8;
+    const MIN_TRAIN_TRADES: usize = 3;
+    println!("\nCross-check D: anchored walk-forward selection");
+    println!(
+        "  Start with {MIN_TRAIN_DAYS} days; select only on prior days, then test the next day."
+    );
+    let mut trades = 0usize;
+    let mut wins = 0usize;
+    let mut losses = 0usize;
+    let mut net = 0.0;
+    for test_idx in MIN_TRAIN_DAYS..days.len() {
+        let train: Vec<&DayData> = days[..test_idx].iter().collect();
+        let mut train_scores: Vec<IdeaScore> = candidate_specs
+            .iter()
+            .cloned()
+            .map(|spec| score_spec_refs(spec, &train, capital))
+            .filter(|score| score.trades >= MIN_TRAIN_TRADES)
+            .collect();
+        sort_scores(&mut train_scores);
+        let Some(chosen) = train_scores.first() else {
+            println!("  test {} -> no trained candidate", days[test_idx].day);
+            continue;
+        };
+        let test = run_spec_on_day(&days[test_idx], &chosen.spec, capital + net);
+        if test.traded {
+            trades += 1;
+            net += test.net_pnl;
+            wins += usize::from(test.net_pnl > 0.0);
+            losses += usize::from(test.net_pnl < 0.0);
+            println!(
+                "  test {} -> {} | Rs {:+.2} [{}]",
+                test.day, chosen.spec.name, test.net_pnl, test.reason
+            );
+        } else {
+            println!(
+                "  test {} -> {} | no trade ({})",
+                test.day, chosen.spec.name, test.reason
+            );
+        }
+    }
+    println!(
+        "  Walk-forward traded {trades}/{} | W/L {wins}/{losses} | net Rs {net:+.2}",
+        days.len().saturating_sub(MIN_TRAIN_DAYS)
+    );
+}
+
 fn print_cross_verification(
     days: &[DayData],
     scores: &[IdeaScore],
@@ -1859,6 +1996,7 @@ fn print_cross_verification(
     print_fixed_leave_one_out(best);
     print_leave_one_out_selection(days, candidate_specs, capital, min_trades);
     print_neighborhood(scores, best);
+    print_anchored_walk_forward(days, candidate_specs, capital);
     println!("==============================================================");
 }
 
@@ -1884,7 +2022,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .partial_cmp(&a.total_net)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| b.trades.cmp(&a.trades))
-            .then_with(|| a.worst.partial_cmp(&b.worst).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| b.worst.partial_cmp(&a.worst).unwrap_or(std::cmp::Ordering::Equal))
     });
 
     println!("==============================================================");
@@ -1896,10 +2034,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Max lots          : {}", MAX_LOTS);
     println!("Spread cap        : {:.0}%", MAX_SPREAD_PCT * 100.0);
     println!(
-        "Credit margin     : Zerodha verified approx Rs {:.0} + {:.0}% buffer = Rs {:.0}/lot",
-        VERIFIED_CREDIT_SPREAD_MARGIN_INR,
+        "Credit margin     : observed broker preflight Rs {:.0} + {:.0}% buffer = Rs {:.0}/lot",
+        OBSERVED_CREDIT_SPREAD_MARGIN_INR,
         CREDIT_SPREAD_MARGIN_BUFFER * 100.0,
-        verified_credit_margin_with_buffer()
+        observed_credit_margin_with_buffer()
     );
     println!(
         "Credit margin gate: {}",
@@ -1917,6 +2055,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!(
             "Profile filter    : delayed credit edge (high ER/drift waits for pullback failure)"
         );
+    }
+    if args.regime_credit {
+        println!("Profile filter    : credit opening-regime sweep");
+    }
+    if args.robust_credit {
+        println!("Profile filter    : robust credit edge (er<=0.50, delta0.30)");
     }
     println!("Min trades shown  : {}\n", args.min_trades);
     for day in &days {
@@ -1944,4 +2088,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     println!("==============================================================");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_credit_lock_scales_with_lots_not_account_capital() {
+        assert!(late_credit_lock(
+            CREDIT_EDGE_LATE_EXIT_MIN,
+            225.0,
+            2,
+            CREDIT_EDGE_LATE_NET_PROFIT_PER_LOT
+        ));
+        assert!(!late_credit_lock(
+            CREDIT_EDGE_LATE_EXIT_MIN - 1,
+            225.0,
+            2,
+            CREDIT_EDGE_LATE_NET_PROFIT_PER_LOT
+        ));
+        assert!(!late_credit_lock(
+            CREDIT_EDGE_LATE_EXIT_MIN,
+            224.99,
+            2,
+            CREDIT_EDGE_LATE_NET_PROFIT_PER_LOT
+        ));
+    }
 }

@@ -33,8 +33,8 @@ pub const WING: f64 = 100.0;
 pub const ENTRY_SLIP: f64 = 0.50;
 
 pub const CREDIT_EDGE_THRESHOLD: f64 = 0.65;
-pub const CREDIT_EDGE_DELTA: f64 = 0.25;
-pub const CREDIT_EDGE_MAX_ER: f64 = 0.55;
+pub const CREDIT_EDGE_DELTA: f64 = 0.30;
+pub const CREDIT_EDGE_MAX_ER: f64 = 0.50;
 pub const CREDIT_EDGE_MAX_RANGE_PCT: f64 = 0.0200;
 pub const CREDIT_EDGE_MAX_DTE_DAYS: i64 = 6;
 pub const CREDIT_EDGE_TARGET_FRAC: f64 = 0.50;
@@ -42,7 +42,7 @@ pub const CREDIT_EDGE_STOP_FRAC_ML: f64 = 0.25;
 pub const CREDIT_EDGE_HARD_STOP_FRAC_CAP: f64 = 0.15;
 pub const CREDIT_EDGE_ALLOC_FRAC: f64 = 0.90;
 pub const CREDIT_EDGE_LATE_EXIT_MIN: u32 = 14 * 60 + 30;
-pub const CREDIT_EDGE_LATE_NET_PROFIT_FRAC_CAP: f64 = 0.0075;
+pub const CREDIT_EDGE_LATE_NET_PROFIT_PER_LOT: f64 = 112.50;
 /// Live cap for CRED. The research lab used up to 2 lots, but the live engine also enforces a
 /// 10%-of-capital hard stop; on the 13k account, 2 lots can hit that stop before the trained
 /// credit-spread exit recovers. Keep live CRED to 1 lot unless account capital/margin is larger.
@@ -565,12 +565,12 @@ pub fn credit_edge_late_net_exit(
     structure: SellStructure,
     mins: u32,
     net_pnl: f64,
-    capital: f64,
+    lots: u32,
 ) -> bool {
     structure == SellStructure::CreditEdge
         && mins >= CREDIT_EDGE_LATE_EXIT_MIN
-        && capital > 0.0
-        && net_pnl >= CREDIT_EDGE_LATE_NET_PROFIT_FRAC_CAP * capital
+        && lots > 0
+        && net_pnl >= CREDIT_EDGE_LATE_NET_PROFIT_PER_LOT * lots as f64
 }
 
 pub fn move_stop_enabled(structure: SellStructure) -> bool {
@@ -1886,7 +1886,7 @@ impl MultiLegEngine {
                 reason = Some(ExitReason::Time);
             } else if active.credit > 0.0 && gain >= target_frac(active.structure) * active.credit {
                 reason = Some(ExitReason::TakeProfit);
-            } else if credit_edge_late_net_exit(active.structure, mins, net_now, self.capital) {
+            } else if credit_edge_late_net_exit(active.structure, mins, net_now, active.lots) {
                 reason = Some(ExitReason::TakeProfit);
             } else if trail_enabled(active.structure) && trail_exits(gain, peak_gain, active.credit) {
                 // Half-gain profit trail: a winner that peaked past +15% gives back at most half.
@@ -2481,10 +2481,10 @@ mod tests {
         .expect("bull-put credit spread must seat");
         assert_eq!(bull_put.len(), 2);
         assert!(bull_put.iter().any(|l| {
-            l.opt == OptionType::PE && l.side == OrderSide::Sell && (l.strike - 23950.0).abs() < 1e-6
+            l.opt == OptionType::PE && l.side == OrderSide::Sell && (l.strike - 24000.0).abs() < 1e-6
         }));
         assert!(bull_put.iter().any(|l| {
-            l.opt == OptionType::PE && l.side == OrderSide::Buy && l.wing && (l.strike - 23850.0).abs() < 1e-6
+            l.opt == OptionType::PE && l.side == OrderSide::Buy && l.wing && (l.strike - 23900.0).abs() < 1e-6
         }));
 
         let bear_call = select_credit_spread_legs(
@@ -2497,10 +2497,10 @@ mod tests {
         .expect("bear-call credit spread must seat");
         assert_eq!(bear_call.len(), 2);
         assert!(bear_call.iter().any(|l| {
-            l.opt == OptionType::CE && l.side == OrderSide::Sell && (l.strike - 24250.0).abs() < 1e-6
+            l.opt == OptionType::CE && l.side == OrderSide::Sell && (l.strike - 24200.0).abs() < 1e-6
         }));
         assert!(bear_call.iter().any(|l| {
-            l.opt == OptionType::CE && l.side == OrderSide::Buy && l.wing && (l.strike - 24350.0).abs() < 1e-6
+            l.opt == OptionType::CE && l.side == OrderSide::Buy && l.wing && (l.strike - 24300.0).abs() < 1e-6
         }));
 
         let seq = placement_sequence(&bear_call);
@@ -2510,8 +2510,8 @@ mod tests {
 
     #[test]
     fn credit_edge_er_gate_rejects_trending_open() {
-        assert!(credit_edge_er_admits(0.55), "trained boundary should remain tradable");
-        assert!(!credit_edge_er_admits(0.60), "2026-06-30 style trending open should be vetoed");
+        assert!(credit_edge_er_admits(0.50), "trained boundary should remain tradable");
+        assert!(!credit_edge_er_admits(0.53), "2026-07-15 trending open should be vetoed");
         assert!(!credit_edge_er_admits(f64::NAN), "invalid ER must not admit a credit spread");
     }
 
@@ -2636,31 +2636,31 @@ mod tests {
 
     #[test]
     fn credit_edge_late_net_exit_only_locks_real_late_profit() {
-        let cap = 13_094.0;
-        let floor = CREDIT_EDGE_LATE_NET_PROFIT_FRAC_CAP * cap;
+        let lots = 2;
+        let floor = CREDIT_EDGE_LATE_NET_PROFIT_PER_LOT * lots as f64;
         assert!(!credit_edge_late_net_exit(
             SellStructure::CreditEdge,
             CREDIT_EDGE_LATE_EXIT_MIN - 1,
             floor + 1.0,
-            cap
+            lots
         ));
         assert!(!credit_edge_late_net_exit(
             SellStructure::Condor,
             CREDIT_EDGE_LATE_EXIT_MIN,
             floor + 1.0,
-            cap
+            lots
         ));
         assert!(!credit_edge_late_net_exit(
             SellStructure::CreditEdge,
             CREDIT_EDGE_LATE_EXIT_MIN,
             floor - 1.0,
-            cap
+            lots
         ));
         assert!(credit_edge_late_net_exit(
             SellStructure::CreditEdge,
             CREDIT_EDGE_LATE_EXIT_MIN,
             floor,
-            cap
+            lots
         ));
     }
 
@@ -3146,7 +3146,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_opens_credit_edge_on_high_opening_edge_even_when_neutral_er_skips() {
+    async fn runtime_opens_credit_edge_on_high_opening_edge_below_er_cap() {
         let day = NaiveDate::from_ymd_opt(2026, 6, 23).unwrap();
         let (contracts, store, underlyings) = runtime_contracts_and_store();
         let mut engine = MultiLegEngine::new(
@@ -3161,11 +3161,11 @@ mod tests {
 
         for (h, m, s, spot) in [
             (9, 15, 5, 24_000.0),
-            (9, 20, 0, 24_015.0),
+            (9, 20, 0, 24_025.0),
             (9, 25, 0, 24_005.0),
-            (9, 30, 0, 24_025.0),
-            (9, 35, 0, 24_015.0),
-            (9, 40, 0, 24_035.0),
+            (9, 30, 0, 24_035.0),
+            (9, 35, 0, 24_010.0),
+            (9, 40, 0, 24_045.0),
             (9, 45, 0, 24_048.0),
         ] {
             store.update(crate::models::Tick {

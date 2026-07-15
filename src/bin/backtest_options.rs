@@ -59,7 +59,7 @@ fn print_usage(bin: &str) {
            --continuous                            Alias for --capital-mode continuous\n\
            --capital <N>                           Override starting capital\n\
            --fill-offset-inr <value>              Buy +x / Sell -x execution offset in INR (default: 0.5)\n\
-           --max-daily-trades <N>                 Override config max_daily_trades (live=3, backtest=20)\n\
+           --max-daily-trades <N>                 Override live config max_daily_trades (currently 1)\n\
            -h, --help                             Show this help\n\
          \n\
          Examples:\n\
@@ -186,19 +186,6 @@ fn parse_ts_ms_fallback(s: &str) -> Option<u64> {
     }
 
     Some(dt.and_utc().timestamp_millis() as u64)
-}
-
-fn options_warmup_until_ms(first_ts_ms: u64) -> (u64, &'static str) {
-    let ist_offset_ms = (5 * 3600 + 30 * 60) * 1_000_u64;
-    let day_ms = 24 * 3600 * 1_000_u64;
-    let ist_ms_today = (first_ts_ms + ist_offset_ms) % day_ms;
-    let nine_forty_five_ist = first_ts_ms - ist_ms_today + 585 * 60_000;
-
-    if first_ts_ms < nine_forty_five_ist {
-        (nine_forty_five_ist, "09:45 IST opening-range warmup")
-    } else {
-        (first_ts_ms + 3 * 60 * 1_000, "post-09:45 restart warmup")
-    }
 }
 
 fn col_idx(headers: &StringRecord, name: &str) -> Result<usize, Box<dyn Error>> {
@@ -602,8 +589,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let i_last_qty = col_idx(&headers, "last_qty")?;
     let i_exchange_ts = col_idx(&headers, "exchange_ts")?;
 
-    let mut warmup_armed = false;
-
     let mut rows_seen: u64 = 0;
     let mut rows_replayed: u64 = 0;
     let mut last_ts_raw = String::new();
@@ -626,23 +611,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             continue;
         }
 
-        let exchange_ts = parse_u32(&rec, i_exchange_ts) as u64;
-        let ts_ms = if exchange_ts > 0 {
-            exchange_ts.saturating_mul(1_000)
+        // Live scans run on wall-clock arrival time; exchange_ts stays in the Tick payload.
+        let ts_raw = rec.get(i_ts).unwrap_or("").trim();
+        let ts_ms = if ts_raw == last_ts_raw {
+            last_ts_ms
         } else {
-            let ts_raw = rec.get(i_ts).unwrap_or("").trim();
-            if ts_raw == last_ts_raw {
-                last_ts_ms
-            } else {
-                let parsed = match parse_ts_ms_fallback(ts_raw) {
-                    Some(v) => v,
-                    None => continue,
-                };
-                last_ts_raw.clear();
-                last_ts_raw.push_str(ts_raw);
-                last_ts_ms = parsed;
-                parsed
-            }
+            let parsed = match parse_ts_ms_fallback(ts_raw) {
+                Some(v) => v,
+                None => continue,
+            };
+            last_ts_raw.clear();
+            last_ts_raw.push_str(ts_raw);
+            last_ts_ms = parsed;
+            parsed
         };
 
         let tick = Tick {
@@ -675,16 +656,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             ts_ms
         };
 
-        if !warmup_armed && causal_ts_ms > 0 {
-            let (warmup_until_ms, warmup_reason) = options_warmup_until_ms(causal_ts_ms);
-            engine.set_warmup_until_ms(warmup_until_ms);
-            eprintln!(
-                "Warmup set: suppressing signals until {}",
-                warmup_reason
-            );
-            warmup_armed = true;
-        }
-
         store.update(tick);
         engine.process_replay_tick(causal_ts_ms);
         rows_replayed += 1;
@@ -715,7 +686,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let report = format!(
         "==============================================================\n\
-         SATAVAHANA — INDIAN OPTIONS BACKTEST (PATCHED LOGIC)\n\
+         SATAVAHANA — INDIAN OPTIONS BACKTEST (CURRENT LIVE CODE)\n\
          ==============================================================\n\
          Data file           : {}\n\
          Run directory       : {}\n\
