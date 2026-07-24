@@ -39,6 +39,8 @@ pub const CREDIT_EDGE_THRESHOLD: f64 = 0.65;
 pub const CREDIT_EDGE_DELTA: f64 = 0.30;
 pub const CREDIT_EDGE_MAX_ER: f64 = 0.50;
 pub const CREDIT_EDGE_MAX_RANGE_PCT: f64 = 0.0200;
+/// Far-DTE CRED needs net opening displacement to explain at least 40% of its opening range.
+pub const CREDIT_EDGE_FAR_DTE_MIN_DIRECTIONAL_EFFICIENCY: f64 = 0.40;
 pub const CREDIT_EDGE_MAX_DTE_DAYS: i64 = 6;
 pub const CREDIT_EDGE_TARGET_FRAC: f64 = 0.50;
 pub const CREDIT_EDGE_STOP_FRAC_ML: f64 = 0.25;
@@ -135,6 +137,21 @@ pub fn credit_edge_direction(edge_pos: f64, threshold: f64) -> Option<CreditDire
 
 pub fn credit_edge_er_admits(er: f64) -> bool {
     er.is_finite() && er <= CREDIT_EDGE_MAX_ER
+}
+
+pub fn opening_directional_efficiency(closes: &[f64]) -> Option<f64> {
+    let (&first, &last) = (closes.first()?, closes.last()?);
+    let min = closes.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = closes.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let range = max - min;
+    (range > 0.0 && range.is_finite())
+        .then(|| ((last - first).abs() / range).clamp(0.0, 1.0))
+}
+
+pub fn credit_edge_directional_efficiency_admits(dte: i64, efficiency: f64) -> bool {
+    dte_allows(dte)
+        || (efficiency.is_finite()
+            && efficiency >= CREDIT_EDGE_FAR_DTE_MIN_DIRECTIONAL_EFFICIENCY)
 }
 
 /// Near-expiry selling can use the normal 09:45 open because intraday theta is fast enough to
@@ -638,6 +655,7 @@ pub struct OpeningRegime {
     pub er: f64,
     pub range_pts: f64,
     pub straddle: f64,
+    pub directional_efficiency: f64,
     /// Where 09:45 spot sits in the opening range: 0 = low, 1 = high, 0.5 = centered.
     pub edge_frac: f64,
 }
@@ -1274,6 +1292,8 @@ impl MultiLegEngine {
                     er,
                     range_pts,
                     straddle,
+                    directional_efficiency: opening_directional_efficiency(&closes)
+                        .unwrap_or(0.0),
                     edge_frac,
                 }
             }
@@ -1287,6 +1307,7 @@ impl MultiLegEngine {
             mins,
             &snapshot,
             regime,
+            dte,
             standard_latent_end_ms,
             credit_edge_window,
             standard_window,
@@ -1425,6 +1446,7 @@ impl MultiLegEngine {
         mins: u32,
         snapshot: &ChainSnapshot,
         regime: OpeningRegime,
+        dte: i64,
         standard_latent_end_ms: Option<u64>,
         credit_edge_window: bool,
         standard_window: bool,
@@ -1445,6 +1467,17 @@ impl MultiLegEngine {
                     last_err = format!(
                         "CreditEdge CRED ER {:.2} > {:.2}",
                         regime.er, CREDIT_EDGE_MAX_ER
+                    );
+                    continue;
+                }
+                if !credit_edge_directional_efficiency_admits(
+                    dte,
+                    regime.directional_efficiency,
+                ) {
+                    last_err = format!(
+                        "CreditEdge CRED directional efficiency {:.2} < {:.2}",
+                        regime.directional_efficiency,
+                        CREDIT_EDGE_FAR_DTE_MIN_DIRECTIONAL_EFFICIENCY
                     );
                     continue;
                 }
@@ -2610,6 +2643,10 @@ mod tests {
         assert!(credit_edge_er_admits(0.50), "trained boundary should remain tradable");
         assert!(!credit_edge_er_admits(0.53), "2026-07-15 trending open should be vetoed");
         assert!(!credit_edge_er_admits(f64::NAN), "invalid ER must not admit a credit spread");
+        assert!(credit_edge_directional_efficiency_admits(1, 0.10));
+        assert!(credit_edge_directional_efficiency_admits(4, 0.51));
+        assert!(!credit_edge_directional_efficiency_admits(4, 0.34));
+        assert_eq!(opening_directional_efficiency(&[100.0, 90.0, 95.0]), Some(0.5));
     }
 
     #[test]
@@ -2957,6 +2994,7 @@ mod tests {
             er: 0.07,
             range_pts: 42.0,
             straddle: 162.0,
+            directional_efficiency: 0.50,
             edge_frac: 0.30,
         };
         let s_fly = structure_regime_score(SellStructure::Fly, regime, 0.20);
@@ -2973,6 +3011,7 @@ mod tests {
             er: 0.15,
             range_pts: 100.0,
             straddle: 140.0,
+            directional_efficiency: 0.50,
             edge_frac: 0.30,
         };
         assert!(regime.range_straddle() > 0.5);
