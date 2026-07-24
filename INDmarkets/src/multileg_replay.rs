@@ -15,11 +15,13 @@ use crate::multileg::{
     CREDIT_EDGE_DELTA, CREDIT_EDGE_MAX_DTE_DAYS, CREDIT_EDGE_MAX_ER, CREDIT_EDGE_MAX_LOTS,
     CREDIT_EDGE_MAX_RANGE_PCT, CREDIT_EDGE_THRESHOLD, MOVE_WINDOW_MIN,
 };
+use crate::websocket::FEED_SOFT_STALE_MS;
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+const REPLAY_FEED_HARD_STALE_MS: u64 = 120_000;
 const LOT_SIZE: u32 = 65;
 const MARGIN_SIZING_FRAC: f64 = 1.0;
 const MAX_LOTS: u32 = 5;
@@ -77,6 +79,12 @@ fn ts(day: NaiveDate, hhmm: &str) -> NaiveDateTime {
 
 fn ts_min(day: NaiveDate, minute: u32) -> NaiveDateTime {
     day.and_time(NaiveTime::from_hms_opt(minute / 60, minute % 60, 0).unwrap())
+}
+
+fn feed_age_ms_at(rows: &[TickRow], t: NaiveDateTime) -> Option<u64> {
+    let idx = rows.partition_point(|row| row.ts <= t);
+    let last = rows.get(idx.checked_sub(1)?)?;
+    Some(t.signed_duration_since(last.ts).num_milliseconds().max(0) as u64)
 }
 
 fn entry_px(leg: &PlannedLeg, q: &StrikeQuote) -> f64 {
@@ -319,6 +327,7 @@ fn manage(
 ) -> (NaiveDateTime, String) {
     let t_entry = plan.entry_ts;
     let t_exit = ts_min(day, exit_min_for(plan.structure));
+    let hard_stale = chrono::Duration::milliseconds(REPLAY_FEED_HARD_STALE_MS as i64);
     let mut peak_gain = 0.0_f64;
     let stop_rupees = hard_stop_frac_cap(plan.structure) * capital;
 
@@ -336,12 +345,24 @@ fn manage(
     let mut spot = 0.0_f64;
     let mut spot_hist: Vec<(NaiveDateTime, f64)> = Vec::new();
     let mut mv = 0usize; // pointer to the latest spot_hist entry ≤ t − MOVE_WINDOW_MIN
+    let mut last_tick = None;
 
     let mut idx = 0usize;
     while idx < rows.len() {
         let t = rows[idx].ts;
         if t > t_exit {
             break;
+        }
+        if t > t_entry {
+            if let Some(last) = last_tick {
+                let deadline = last + hard_stale;
+                if deadline <= t && deadline <= t_exit {
+                    return (
+                        deadline,
+                        format!("FEED-STALE {}s", REPLAY_FEED_HARD_STALE_MS / 1000),
+                    );
+                }
+            }
         }
         // Fold every row stamped at this tick into the running leg-quote state.
         while idx < rows.len() && rows[idx].ts == t {
@@ -360,6 +381,7 @@ fn manage(
             }
             idx += 1;
         }
+        last_tick = Some(t);
         if t <= t_entry || spot <= 0.0 {
             continue;
         }
@@ -434,6 +456,16 @@ fn manage(
         }
         if gain <= -stop_frac_ml(plan.structure) * plan.max_loss_unit {
             return (t, format!("STOP {:.0}%ML", stop_frac_ml(plan.structure) * 100.0));
+        }
+    }
+
+    if let Some(last) = last_tick.filter(|last| *last >= t_entry) {
+        let deadline = last + hard_stale;
+        if deadline <= t_exit {
+            return (
+                deadline,
+                format!("FEED-STALE {}s", REPLAY_FEED_HARD_STALE_MS / 1000),
+            );
         }
     }
 
@@ -559,6 +591,10 @@ pub(crate) fn replay_day(
         } else {
             ts(day, "12:00")
         };
+        if !matches!(feed_age_ms_at(rows, t_entry), Some(age) if age < FEED_SOFT_STALE_MS) {
+            last_err = format!("{structure:?} feed stale at entry");
+            continue;
+        }
         let closes = minute_closes(rows, t_open, t_entry);
         let Some(er) = efficiency_ratio(&closes) else {
             last_err = format!("{structure:?} insufficient morning ER data");
@@ -740,6 +776,59 @@ mod tests {
         assert!(!r.traded);
         assert!(r.skip_reason.as_ref().unwrap().contains("expired"));
         assert_eq!(cap, 15_000.0);
+    }
+
+    #[test]
+    fn active_replay_halts_after_two_minute_feed_timeout() {
+        let day = NaiveDate::from_ymd_opt(2026, 7, 20).unwrap();
+        let t_entry = ts(day, "09:45");
+        let legs = vec![
+            PlannedLeg { strike: 24300.0, opt: OptionType::CE, side: OrderSide::Sell, wing: false },
+            PlannedLeg { strike: 24400.0, opt: OptionType::CE, side: OrderSide::Buy, wing: true },
+        ];
+        let plan = Plan {
+            structure: SellStructure::CreditEdge,
+            entry_ts: t_entry,
+            legs,
+            credit: 20.0,
+            max_loss_unit: 80.0,
+            zone_width: 100.0,
+            lots: 1,
+            score: 1.0,
+            er: 0.30,
+        };
+        let quote = |strike: f64| StrikeQuote {
+            strike,
+            ce_delta: 0.3,
+            pe_delta: -0.3,
+            ce_bid: if strike == 24300.0 { 30.0 } else { 10.0 },
+            ce_ask: if strike == 24300.0 { 30.0 } else { 10.0 },
+            pe_bid: 10.0,
+            pe_ask: 10.0,
+        };
+        let entry_quotes = vec![quote(24300.0), quote(24400.0)];
+        let mut rows = Vec::new();
+        for secs in [0_i64, 10] {
+            let t = t_entry + chrono::Duration::seconds(secs);
+            for strike in [24300.0, 24400.0] {
+                for opt in [OptionType::CE, OptionType::PE] {
+                    let px = if opt == OptionType::CE && strike == 24300.0 { 30.0 } else { 10.0 };
+                    rows.push(TickRow {
+                        ts: t,
+                        strike,
+                        opt,
+                        spot: 24200.0,
+                        bid: px,
+                        ask: px,
+                        delta: 0.3,
+                    });
+                }
+            }
+        }
+
+        let (t_out, why) = manage(&rows, day, &plan, 15_000.0, &entry_quotes);
+        assert_eq!(why, "FEED-STALE 120s");
+        assert_eq!(t_out, t_entry + chrono::Duration::seconds(130));
     }
 
     // Exercises the per-tick manage() loop's MOVE-exit path (untested by the 3 sample days, none of

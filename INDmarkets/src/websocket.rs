@@ -1,14 +1,44 @@
 use crate::models::{DepthEntry, MarketDepth, Tick, TickMode, OHLC};
 use byteorder::{BigEndian, ByteOrder};
+use chrono::{Datelike, FixedOffset, Timelike, Utc, Weekday};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::broadcast;
+use tokio::time::{timeout_at, Duration, Instant};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
+
+/// Heartbeats do not count as market data. Reconnect if quotes stop for this long.
+const FEED_SILENCE_TIMEOUT_SECS: u64 = 10;
+pub const FEED_SOFT_STALE_MS: u64 = 20_000;
+pub const FEED_HARD_STALE_MS: u64 = 60_000;
+pub const FEED_RECOVERY_STABLE_MS: u64 = 5_000;
 
 #[derive(Debug, Clone)]
 pub struct TickEvent {
     pub ticks: Vec<Tick>,
+    /// Control event emitted before a tickless connection is recycled.
+    pub feed_stale: bool,
+}
+
+impl TickEvent {
+    fn market_data(ticks: Vec<Tick>) -> Self {
+        Self { ticks, feed_stale: false }
+    }
+
+    fn stale() -> Self {
+        Self { ticks: Vec::new(), feed_stale: true }
+    }
+}
+
+pub fn market_data_expected(timestamp_ms: u64) -> bool {
+    let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
+    let now = chrono::DateTime::from_timestamp_millis(timestamp_ms as i64)
+        .unwrap_or_else(Utc::now)
+        .with_timezone(&ist);
+    let mins = now.hour() * 60 + now.minute();
+    matches!(now.weekday(), Weekday::Mon | Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri)
+        && (555..930).contains(&mins)
 }
 
 pub struct WsConnection {
@@ -68,8 +98,41 @@ impl WsConnection {
         }
 
         info!("[{}] Subscribed and mode set. Streaming...", self.name);
+        let mut quotes_expected = market_data_expected(now_ms());
+        let mut quote_deadline = Instant::now() + Duration::from_secs(FEED_SILENCE_TIMEOUT_SECS);
 
-        while let Some(msg) = read.next().await {
+        loop {
+            let expected_now = market_data_expected(now_ms());
+            if expected_now && !quotes_expected {
+                quote_deadline = Instant::now() + Duration::from_secs(FEED_SILENCE_TIMEOUT_SECS);
+            }
+            quotes_expected = expected_now;
+            let deadline = if quotes_expected {
+                quote_deadline
+            } else {
+                Instant::now() + Duration::from_secs(FEED_SILENCE_TIMEOUT_SECS)
+            };
+
+            // Absolute quote deadline: heartbeat/text/ping frames do not extend it.
+            let msg = match timeout_at(deadline, read.next()).await {
+                Ok(Some(msg)) => msg,
+                Ok(None) => break, // stream ended
+                Err(_) => {
+                    if quotes_expected {
+                        let _ = self.tx.send(TickEvent::stale());
+                        warn!(
+                            "[{}] No market data for {}s (heartbeats do not count) — forcing resubscribe",
+                            self.name, FEED_SILENCE_TIMEOUT_SECS
+                        );
+                    } else {
+                        warn!(
+                            "[{}] No WebSocket frame for {}s — forcing reconnect",
+                            self.name, FEED_SILENCE_TIMEOUT_SECS
+                        );
+                    }
+                    break;
+                }
+            };
             match msg {
                 Ok(Message::Binary(data)) => {
                     if data.len() <= 1 {
@@ -80,7 +143,9 @@ impl WsConnection {
                     match parse_binary_message(&data) {
                         Ok(ticks) => {
                             if !ticks.is_empty() {
-                                let _ = self.tx.send(TickEvent { ticks });
+                                quote_deadline = Instant::now()
+                                    + Duration::from_secs(FEED_SILENCE_TIMEOUT_SECS);
+                                let _ = self.tx.send(TickEvent::market_data(ticks));
                             }
                         }
                         Err(e) => {
@@ -108,6 +173,13 @@ impl WsConnection {
 
         Ok(())
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 pub fn parse_binary_message(
@@ -494,6 +566,39 @@ mod tests {
         let data = vec![0u8];
         let ticks = parse_binary_message(&data).unwrap();
         assert!(ticks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn heartbeats_do_not_extend_quote_deadline() {
+        use futures_util::stream;
+        let beats = stream::unfold((), |_| async {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            Some((Message::Binary(vec![0].into()), ()))
+        });
+        let mut beats = Box::pin(beats);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        let mut received = 0;
+        loop {
+            match timeout_at(deadline, beats.next()).await {
+                Ok(Some(Message::Binary(data))) if data.len() == 1 => received += 1,
+                Err(_) => break,
+                other => panic!("unexpected stream result: {:?}", other),
+            }
+        }
+        assert!(received > 1, "heartbeats arrived but did not keep the quote deadline alive");
+    }
+
+    #[test]
+    fn market_hours_are_weekday_0915_to_1530_ist() {
+        let ms = |s: &str| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .unwrap()
+                .timestamp_millis() as u64
+        };
+        assert!(market_data_expected(ms("2026-07-13T09:15:00+05:30")));
+        assert!(market_data_expected(ms("2026-07-13T15:29:59+05:30")));
+        assert!(!market_data_expected(ms("2026-07-13T15:30:00+05:30")));
+        assert!(!market_data_expected(ms("2026-07-18T13:00:00+05:30")));
     }
 
     #[test]

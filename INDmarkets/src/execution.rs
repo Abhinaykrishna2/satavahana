@@ -166,6 +166,10 @@ pub enum OrderCommand {
     ModifyByTag { tag: String, new_price: f64 },
 }
 
+fn effective_order_type(limit_price: Option<f64>) -> &'static str {
+    if limit_price.is_some() { "LIMIT" } else { "MARKET" }
+}
+
 #[derive(Debug, Clone)]
 pub struct OrderUpdate {
     pub tag: String,
@@ -326,12 +330,8 @@ impl OrderExecutor {
 
     async fn place_order(&self, cmd: &PlaceOrderCmd) -> Result<String, String> {
         let url = format!("{}/{}", KITE_ORDERS_URL, self.cfg.variety);
-        // Use LIMIT when a price is provided; fall back to configured order_type otherwise.
-        let effective_order_type = if cmd.limit_price.is_some() {
-            "LIMIT".to_string()
-        } else {
-            self.cfg.order_type.clone()
-        };
+        // PlaceOrderCmd's contract: a price means LIMIT; no price means MARKET.
+        let effective_order_type = effective_order_type(cmd.limit_price).to_string();
         let mut params = vec![
             ("exchange", self.cfg.exchange.clone()),
             ("tradingsymbol", cmd.tradingsymbol.clone()),
@@ -698,4 +698,15 @@ struct OrderSnapshot {
     average_price: Option<f64>,
     filled_quantity: Option<u32>,
     pending_quantity: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_order_type;
+
+    #[test]
+    fn missing_limit_price_is_always_market() {
+        assert_eq!(effective_order_type(None), "MARKET");
+        assert_eq!(effective_order_type(Some(100.0)), "LIMIT");
+    }
 }

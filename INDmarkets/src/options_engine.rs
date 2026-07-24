@@ -5,10 +5,13 @@ use crate::greeks::{compute_greeks, compute_time_to_expiry_at};
 use crate::ledger::{EntryContext, OptionsJournal};
 use crate::models::{OptionContract, OptionType};
 use crate::store::TickStore;
-use crate::websocket::TickEvent;
+use crate::websocket::{
+    market_data_expected, TickEvent, FEED_HARD_STALE_MS, FEED_RECOVERY_STABLE_MS,
+    FEED_SOFT_STALE_MS,
+};
 
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Timelike, Utc};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
@@ -37,6 +40,7 @@ const RIGID_PROFIT_LOCK_ARM_PCT: f64 = 12.0;
 const RIGID_PROFIT_LOCK_GAIN_PCT: f64 = 2.0;
 const RIGID_TRAIL_ARM_PCT: f64 = 15.0;
 const RIGID_TRAIL_GIVEBACK_PCT: f64 = 50.0;
+const FEED_WATCHDOG_SECS: u64 = 15;
 
 /// Flat Zerodha options brokerage per EXECUTED ORDER (not per lot). Bug 5: this was
 /// baked into the per-lot cost and multiplied by lots, over-charging multi-lot orders
@@ -335,6 +339,32 @@ fn far_dte_composite_midday_block(
         && matches!(session, SessionPhase::Midday)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum FeedAction {
+    Normal,
+    SkipNewEntries,
+    FlattenAndHalt,
+}
+
+/// Decide what to do based on how long since the last live tick. Pure, so the policy can be
+/// tested without a socket. Outside market hours a quiet feed is expected and never an incident.
+fn feed_stale_action(feed_age_ms: u64, in_market_hours: bool, has_open_position: bool) -> FeedAction {
+    if !in_market_hours {
+        return FeedAction::Normal;
+    }
+    if feed_age_ms >= FEED_HARD_STALE_MS {
+        if has_open_position {
+            FeedAction::FlattenAndHalt
+        } else {
+            FeedAction::SkipNewEntries
+        }
+    } else if feed_age_ms >= FEED_SOFT_STALE_MS {
+        FeedAction::SkipNewEntries
+    } else {
+        FeedAction::Normal
+    }
+}
+
 fn advance_replay_scan_anchor(last: Option<u64>, now: u64, interval: u64) -> u64 {
     match last {
         Some(last) if interval > 0 => {
@@ -567,6 +597,7 @@ enum CancelReasonKind {
     PriceReversal,
     ScanDirectionFlip,
     ScanScoreCollapse,
+    FeedStale,
 }
 
 impl CancelReasonKind {
@@ -576,6 +607,7 @@ impl CancelReasonKind {
             CancelReasonKind::PriceReversal     => "price reversal",
             CancelReasonKind::ScanDirectionFlip => "scan direction flip",
             CancelReasonKind::ScanScoreCollapse => "scan score collapse",
+            CancelReasonKind::FeedStale         => "feed stale",
         }
     }
 }
@@ -944,6 +976,13 @@ pub struct OptionsEngine {
     /// Most recent scan result per underlying — used to invalidate pending entry orders
     /// when the engine's view of direction or confidence changes between scans.
     last_scan_result: HashMap<String, LastScanResult>,
+    /// Set when the live feed goes stale; blocks new entries until ticks resume.
+    feed_halted: bool,
+    feed_recovery_started_ms: Option<u64>,
+    last_underlying_tick_ms: u64,
+    last_option_tick_ms: u64,
+    last_position_tick_ms: u64,
+    option_tokens: HashSet<u32>,
 
     // Live capital refresh from Kite margins API
     kite_api_key: String,
@@ -991,6 +1030,7 @@ impl OptionsEngine {
         replay_date: Option<&str>,
     ) -> Self {
         let initial_capital = cfg.initial_capital.max(0.0);
+        let option_tokens = contracts.iter().map(|c| c.instrument_token).collect();
         let max_daily_loss_fraction = (cfg.max_daily_loss_pct / 100.0).clamp(0.01, 0.95);
         let max_daily_profit_fraction = (cfg.max_daily_profit_pct / 100.0).clamp(0.01, 5.0);
         let journal = OptionsJournal::new(log_dir, initial_capital, replay_date)
@@ -1052,6 +1092,12 @@ impl OptionsEngine {
             order_status_poll_interval_ms: 2_000,
             limit_cancel_reversal_pct: 0.15,
             last_scan_result: HashMap::new(),
+            feed_halted: false,
+            feed_recovery_started_ms: None,
+            last_underlying_tick_ms: 0,
+            last_option_tick_ms: 0,
+            last_position_tick_ms: 0,
+            option_tokens,
             kite_api_key: String::new(),
             kite_access_token: String::new(),
             capital_sync_needed: false,
@@ -1491,14 +1537,19 @@ impl OptionsEngine {
                 Some(CancelReasonKind::PriceReversal)
                     | Some(CancelReasonKind::ScanDirectionFlip)
                     | Some(CancelReasonKind::ScanScoreCollapse)
+                    | Some(CancelReasonKind::FeedStale)
             );
             if should_flatten {
                 warn!(
-                    "Entry fill arrived after direction-based cancel [{}] tag={} avg=₹{:.2} — flattening immediately",
+                    "Entry fill arrived after guard-based cancel [{}] tag={} avg=₹{:.2} — flattening immediately",
                     self.pending_entry_orders[idx].cancel_reason.map(|r| r.as_str()).unwrap_or("?"),
                     update.tag, avg_price
                 );
-                self.flatten_stale_filled_entry(idx, avg_price);
+                if self.pending_entry_orders[idx].cancel_reason == Some(CancelReasonKind::FeedStale) {
+                    self.flatten_feed_stale_filled_entry(idx, avg_price);
+                } else {
+                    self.flatten_stale_filled_entry(idx, avg_price);
+                }
             } else {
                 self.promote_filled_entry(idx, avg_price);
             }
@@ -1976,6 +2027,144 @@ impl OptionsEngine {
         }
     }
 
+    fn flatten_feed_stale_filled_entry(&mut self, idx: usize, broker_avg_price: f64) {
+        if self.promote_filled_entry(idx, broker_avg_price) {
+            self.flatten_all_open_market("FEED STALE — entry filled during cancel");
+            self.daily_trades_opened = self.daily_trades_opened.saturating_sub(1);
+        }
+    }
+
+    fn record_feed_ticks(&mut self, event: &TickEvent, now: u64) {
+        let open_tokens: Vec<u32> = self
+            .positions
+            .iter()
+            .filter(|p| p.is_open)
+            .map(|p| p.option_token)
+            .collect();
+        for tick in &event.ticks {
+            if self.underlying_tokens.values().any(|token| *token == tick.token) {
+                self.last_underlying_tick_ms = now;
+            }
+            if self.option_tokens.contains(&tick.token) {
+                self.last_option_tick_ms = now;
+            }
+            if open_tokens.contains(&tick.token) {
+                self.last_position_tick_ms = now;
+            }
+        }
+    }
+
+    fn feed_age_ms(&self, now: u64) -> u64 {
+        let option_clock = if self.has_open_position() {
+            self.last_position_tick_ms
+        } else {
+            self.last_option_tick_ms
+        };
+        let required_clock = if self.underlying_tokens.is_empty() {
+            option_clock
+        } else {
+            option_clock.min(self.last_underlying_tick_ms)
+        };
+        now.saturating_sub(required_clock)
+    }
+
+    fn cancel_pending_entries_for_feed_stale(&mut self, now: u64) {
+        self.pending_signals.clear();
+        let mut cancel_tags = Vec::new();
+        let mut status_tags = Vec::new();
+        for pending in &mut self.pending_entry_orders {
+            if !pending.cancel_requested {
+                pending.cancel_requested = true;
+                pending.last_cancel_attempt_ms = now;
+                cancel_tags.push(pending.tag.clone());
+            }
+            // Feed safety supersedes an earlier timeout/circuit cancel: if the order
+            // fills while its cancel races, the fill must be flattened immediately.
+            pending.cancel_reason = Some(CancelReasonKind::FeedStale);
+            status_tags.push(pending.tag.clone());
+        }
+        for tag in cancel_tags {
+            warn!("Feed stale — cancelling pending entry {}", tag);
+            self.send_order_command(OrderCommand::CancelByTag { tag: tag.clone() });
+        }
+        for tag in status_tags {
+            self.send_order_command(OrderCommand::StatusByTag { tag });
+        }
+    }
+
+    fn accelerate_pending_exits_for_feed_stale(&mut self, now: u64) {
+        let mut cancel_tags = Vec::new();
+        let mut status_tags = Vec::new();
+        for pending in &mut self.pending_exit_orders {
+            if pending.market_fallback_sent {
+                continue;
+            }
+            if !pending.cancel_requested {
+                pending.cancel_requested = true;
+                pending.last_cancel_attempt_ms = now;
+                cancel_tags.push(pending.tag.clone());
+            }
+            status_tags.push(pending.tag.clone());
+        }
+        for tag in cancel_tags {
+            warn!("Feed stale — cancelling pending limit exit {} before MARKET fallback", tag);
+            self.send_order_command(OrderCommand::CancelByTag { tag: tag.clone() });
+        }
+        for tag in status_tags {
+            self.send_order_command(OrderCommand::StatusByTag { tag });
+        }
+    }
+
+    fn note_feed_recovery(&mut self, now: u64) -> bool {
+        if self.feed_age_ms(now) >= FEED_SOFT_STALE_MS {
+            self.feed_recovery_started_ms = None;
+            return false;
+        }
+        let started = self.feed_recovery_started_ms.get_or_insert(now);
+        if now.saturating_sub(*started) < FEED_RECOVERY_STABLE_MS {
+            return false;
+        }
+        self.feed_halted = false;
+        self.feed_recovery_started_ms = None;
+        warn!("Feed recovered and stayed healthy for 5s — new-entry halt lifted");
+        true
+    }
+
+    fn enforce_feed_watchdog(&mut self) {
+        if !self.live_mode_enabled() {
+            return;
+        }
+        let now = now_ms();
+        let in_hours = market_data_expected(now);
+        let feed_age = self.feed_age_ms(now);
+        let initial_action = feed_stale_action(feed_age, in_hours, self.has_open_position());
+        if initial_action == FeedAction::Normal {
+            return;
+        }
+
+        if !self.feed_halted {
+            warn!("Feed stale {}s — halting new entries until verified recovery", feed_age / 1000);
+        }
+        self.feed_halted = true;
+        self.feed_recovery_started_ms = None;
+        self.cancel_pending_entries_for_feed_stale(now);
+
+        // Mark pending buys before consuming updates so a fill racing the cancel is
+        // immediately routed through the blind-feed MARKET exit.
+        self.process_order_updates();
+        if feed_stale_action(feed_age, in_hours, self.has_open_position())
+            == FeedAction::FlattenAndHalt
+        {
+            self.accelerate_pending_exits_for_feed_stale(now);
+            error!(
+                "🚨 FEED STALE {}s with an open position — flattening via MARKET",
+                feed_age / 1000
+            );
+            self.flatten_all_open_market("FEED STALE — blind-feed watchdog");
+        }
+        self.poll_pending_orders();
+    }
+
     pub fn diagnostics(&self) -> (u64, u64, u64, u64, u64, usize) {
         (
             self.signals_generated,
@@ -2006,6 +2195,12 @@ impl OptionsEngine {
                 tokio::time::Duration::from_secs(self.scan_interval_secs)
             );
 
+            // Wall-clock backstop for feed staleness; socket control events take the fast path.
+            let mut feed_watchdog = tokio::time::interval(
+                tokio::time::Duration::from_secs(FEED_WATCHDOG_SECS)
+            );
+            feed_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
             // Capital refresh: every hour + after every trade close.
             // First tick fires immediately — skip it so we don't double-fetch at startup.
             let mut capital_timer = {
@@ -2015,11 +2210,28 @@ impl OptionsEngine {
             };
             capital_timer.tick().await; // consume the immediate first tick
 
+            // Seed each required feed clock so startup gets one soft-stale grace window.
+            let started_ms = now_ms();
+            self.last_underlying_tick_ms = started_ms;
+            self.last_option_tick_ms = started_ms;
+            self.last_position_tick_ms = started_ms;
+
             loop {
                 tokio::select! {
                     tick_result = rx.recv() => {
                         match tick_result {
-                            Ok(_event) => {
+                            Ok(event) => {
+                                if event.feed_stale {
+                                    self.enforce_feed_watchdog();
+                                    continue;
+                                }
+                                let now = now_ms();
+                                self.record_feed_ticks(&event, now);
+                                if self.feed_halted && !self.note_feed_recovery(now) {
+                                    self.process_order_updates();
+                                    self.poll_pending_orders();
+                                    continue;
+                                }
                                 self.clear_clock_override();
                                 self.process_market_tick();
                             }
@@ -2048,10 +2260,17 @@ impl OptionsEngine {
                         self.scan_count += 1;
                         self.process_order_updates();
                         self.poll_pending_orders();
+                        // Never open new positions on stale/blind data — the watchdog owns this flag.
+                        if self.feed_halted {
+                            continue;
+                        }
                         self.run_full_scan();
                     }
                     _ = capital_timer.tick() => {
                         self.sync_capital_from_kite().await;
+                    }
+                    _ = feed_watchdog.tick() => {
+                        self.enforce_feed_watchdog();
                     }
                 }
             }
@@ -4796,6 +5015,7 @@ impl OptionsEngine {
             signal.id, signal.strategy);
 
         self.positions.push(pos);
+        self.last_position_tick_ms = self.current_time_ms();
         self.positions_opened += 1;
         self.daily_trades_opened += 1;
     }
@@ -4980,6 +5200,7 @@ impl OptionsEngine {
 
         self.last_signal_ms.insert(signal.underlying.clone(), self.current_time_ms());
         self.positions.push(pos);
+        self.last_position_tick_ms = self.current_time_ms();
         self.positions_opened += 1;
         self.daily_trades_opened += 1;
         info!(
@@ -4991,6 +5212,80 @@ impl OptionsEngine {
             entry_fill_price
         );
         true
+    }
+
+    fn has_open_position(&self) -> bool {
+        self.positions.iter().any(|p| p.is_open)
+    }
+
+    /// Emergency flatten of every open position via MARKET orders. Used by the feed-staleness
+    /// watchdog: when we are blind we cannot price a limit, so we take the market and get out.
+    /// Reuses the pending-exit tracking (market_fallback_sent=true so poll won't re-escalate).
+    /// Order fills arrive on the order channel, which is independent of the (dead) tick feed.
+    fn flatten_all_open_market(&mut self, reason: &str) {
+        if !self.live_mode_enabled() {
+            return;
+        }
+        let open_idxs: Vec<usize> = (0..self.positions.len())
+            .filter(|&i| self.positions[i].is_open && !self.positions[i].exit_pending)
+            .collect();
+        let now = self.current_time_ms();
+        for i in open_idxs {
+            // Read each field in its own short borrow, then mutate — avoids overlapping borrows.
+            let option_token = self.positions[i].option_token;
+            let entry_price = self.positions[i].entry_price;
+            let book_price = self
+                .store
+                .get(option_token)
+                .map(|t| t.ltp)
+                .filter(|&p| p > 0.0)
+                .unwrap_or(entry_price);
+            let quantity = self.positions[i]
+                .lots
+                .saturating_mul(self.positions[i].lot_size);
+            let tradingsymbol = self.positions[i].tradingsymbol.clone();
+            let pos_id = self.positions[i].id;
+            if quantity == 0 || tradingsymbol.is_empty() {
+                continue;
+            }
+            {
+                let pos = &mut self.positions[i];
+                pos.exit_pending = true;
+                pos.exit_reason = reason.to_string();
+            }
+            let exit_tag = self.build_order_tag("EXIT", pos_id);
+            error!(
+                "🚨 FEED STALE — flattening pos #{} {} qty {} via MARKET ({})",
+                pos_id, tradingsymbol, quantity, reason
+            );
+            self.send_order_command(OrderCommand::Place(PlaceOrderCmd {
+                tag: exit_tag.clone(),
+                tradingsymbol: tradingsymbol.clone(),
+                quantity,
+                side: OrderSide::Sell,
+                limit_price: None, // MARKET — we are blind; exit now, do not sit on a limit
+            }));
+            self.send_order_command(OrderCommand::StatusByTag {
+                tag: exit_tag.clone(),
+            });
+            self.pending_exit_orders.push(PendingExitOrder {
+                pos_id,
+                tag: exit_tag,
+                tradingsymbol,
+                total_quantity: quantity,
+                placed_ms: now,
+                last_status_poll_ms: now,
+                reason: reason.to_string(),
+                cancel_requested: false,
+                last_cancel_attempt_ms: 0,
+                market_fallback_sent: true,
+                fallback_book_price: book_price,
+                total_filled_quantity: 0,
+                total_filled_notional: 0.0,
+                current_order_filled_quantity: 0,
+                current_order_filled_notional: 0.0,
+            });
+        }
     }
 
     fn close_position_at(&mut self, idx: usize, current_price: f64, reason: String) {
@@ -5478,6 +5773,7 @@ mod tests {
         SignalAction,
         StrikeScanDirection,
         StrategyType,
+        FEED_SOFT_STALE_MS,
         MIN_TRADEABLE_OPTION_PRICE,
     };
     use crate::config::OptionsEngineConfig;
@@ -5493,6 +5789,22 @@ mod tests {
         assert_eq!(advance_replay_scan_anchor(None, 1_000, 30_000), 1_000);
         assert_eq!(advance_replay_scan_anchor(Some(1_000), 31_600, 30_000), 31_000);
         assert_eq!(advance_replay_scan_anchor(Some(31_000), 61_900, 30_000), 61_000);
+    }
+
+    #[test]
+    fn feed_watchdog_flattens_only_when_blind_with_a_position() {
+        use super::{feed_stale_action, FeedAction, FEED_HARD_STALE_MS, FEED_SOFT_STALE_MS};
+        // Fresh feed: business as usual.
+        assert_eq!(feed_stale_action(1_000, true, true), FeedAction::Normal);
+        // Soft-stale: stop opening new trades, but do not panic-flatten yet (WS may recover).
+        assert_eq!(feed_stale_action(FEED_SOFT_STALE_MS, true, true), FeedAction::SkipNewEntries);
+        assert_eq!(feed_stale_action(FEED_SOFT_STALE_MS, true, false), FeedAction::SkipNewEntries);
+        // Hard-stale with an open position: flatten + halt.
+        assert_eq!(feed_stale_action(FEED_HARD_STALE_MS, true, true), FeedAction::FlattenAndHalt);
+        // Hard-stale but flat: nothing to protect, just hold new entries.
+        assert_eq!(feed_stale_action(FEED_HARD_STALE_MS, true, false), FeedAction::SkipNewEntries);
+        // Outside market hours a quiet feed is normal — never a false flatten.
+        assert_eq!(feed_stale_action(FEED_HARD_STALE_MS, false, true), FeedAction::Normal);
     }
 
     fn test_config() -> OptionsEngineConfig {
@@ -5567,6 +5879,122 @@ mod tests {
             risk_reward: 1.0,
             entry_ctx: test_entry_context(),
         }
+    }
+
+    #[test]
+    fn feed_stale_cancels_pending_entries_before_they_can_fill_blind() {
+        let mut engine = test_engine_with_store(TickStore::new());
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+        let now = test_ist_ms(13, 0, 0);
+        engine.pending_signals.push_back(test_signal(now));
+        engine.pending_entry_orders.push(PendingEntryOrder {
+            pos_id: 1,
+            signal: test_signal(now),
+            token: 101,
+            tradingsymbol: "NIFTY26JUL22000CE".to_string(),
+            estimated_capital: 5_100.0,
+            tag: "SATAENTRY1".to_string(),
+            placed_ms: now,
+            last_status_poll_ms: now,
+            cancel_requested: false,
+            cancel_reason: None,
+            last_cancel_attempt_ms: 0,
+            released_after_timeout: false,
+            order_id: None,
+            signal_price: 100.25,
+            placed_at_scan_count: 1,
+        });
+
+        engine.cancel_pending_entries_for_feed_stale(now + FEED_SOFT_STALE_MS);
+
+        assert!(engine.pending_signals.is_empty());
+        assert!(engine.pending_entry_orders[0].cancel_requested);
+        assert_eq!(
+            engine.pending_entry_orders[0].cancel_reason,
+            Some(super::CancelReasonKind::FeedStale)
+        );
+        assert!(matches!(
+            order_rx.try_recv(),
+            Ok(OrderCommand::CancelByTag { tag }) if tag == "SATAENTRY1"
+        ));
+        assert!(matches!(
+            order_rx.try_recv(),
+            Ok(OrderCommand::StatusByTag { tag }) if tag == "SATAENTRY1"
+        ));
+
+        // An earlier cancel reason must not let a racing fill become a valid position
+        // after the feed has halted.
+        engine.pending_entry_orders[0].cancel_reason = Some(super::CancelReasonKind::Timeout);
+        engine.cancel_pending_entries_for_feed_stale(now + FEED_SOFT_STALE_MS + 1);
+        assert_eq!(
+            engine.pending_entry_orders[0].cancel_reason,
+            Some(super::CancelReasonKind::FeedStale)
+        );
+        assert!(matches!(
+            order_rx.try_recv(),
+            Ok(OrderCommand::StatusByTag { tag }) if tag == "SATAENTRY1"
+        ));
+    }
+
+    #[test]
+    fn open_position_requires_its_own_tick_to_keep_feed_fresh() {
+        let cfg = test_config();
+        let mut underlyings = HashMap::new();
+        underlyings.insert("NIFTY".to_string(), 999);
+        let log_dir = std::env::temp_dir().join("satavahana_position_feed_age_test");
+        let mut engine = OptionsEngine::new(
+            vec![test_contract()],
+            TickStore::new(),
+            underlyings,
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+        let now = 100_000;
+        engine.last_underlying_tick_ms = now;
+        engine.last_option_tick_ms = now;
+        engine.last_position_tick_ms = now - FEED_SOFT_STALE_MS;
+        engine.positions.push(test_position(false));
+
+        assert_eq!(engine.feed_age_ms(now), FEED_SOFT_STALE_MS);
+    }
+
+    #[test]
+    fn feed_stale_accelerates_pending_limit_exit_to_market_fallback() {
+        let mut engine = test_engine_with_store(TickStore::new());
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+        engine.pending_exit_orders.push(PendingExitOrder {
+            pos_id: 1,
+            tag: "SATAEXIT1".to_string(),
+            tradingsymbol: "NIFTY26JUL22000CE".to_string(),
+            total_quantity: 75,
+            placed_ms: 1,
+            last_status_poll_ms: 1,
+            reason: "STOP".to_string(),
+            cancel_requested: false,
+            last_cancel_attempt_ms: 0,
+            market_fallback_sent: false,
+            fallback_book_price: 100.0,
+            total_filled_quantity: 0,
+            total_filled_notional: 0.0,
+            current_order_filled_quantity: 0,
+            current_order_filled_notional: 0.0,
+        });
+
+        engine.accelerate_pending_exits_for_feed_stale(2);
+
+        assert!(engine.pending_exit_orders[0].cancel_requested);
+        assert!(matches!(
+            order_rx.try_recv(),
+            Ok(OrderCommand::CancelByTag { tag }) if tag == "SATAEXIT1"
+        ));
+        assert!(matches!(
+            order_rx.try_recv(),
+            Ok(OrderCommand::StatusByTag { tag }) if tag == "SATAEXIT1"
+        ));
     }
 
     #[test]
