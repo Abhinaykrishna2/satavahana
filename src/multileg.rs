@@ -18,12 +18,15 @@ use crate::greeks::{compute_greeks, compute_time_to_expiry_at};
 use crate::models::{OptionContract, OptionType};
 use crate::portfolio::SharedCircuit;
 use crate::store::TickStore;
-use crate::websocket::TickEvent;
+use crate::websocket::{
+    market_data_expected, TickEvent, FEED_HARD_STALE_MS, FEED_RECOVERY_STABLE_MS,
+    FEED_SOFT_STALE_MS,
+};
 use chrono::{Datelike, FixedOffset, NaiveDate, TimeZone, Timelike, Utc, Weekday};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use tokio::sync::{broadcast, mpsc, watch};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Wing width in points (NIFTY strikes are 50 apart; 100 = 2 strikes — the only width the
 /// recorded ±5-strike chain can seat).
@@ -360,6 +363,10 @@ pub fn marketable_limit(side: OrderSide, bid: f64, ask: f64) -> f64 {
     }
 }
 
+fn flatten_limit(label: &str, side: OrderSide, bid: f64, ask: f64) -> Option<f64> {
+    (label != "feed-stale").then(|| marketable_limit(side, bid, ask))
+}
+
 // ── Slice 2: combo economics + exit/sizing (pure decision logic) ──────────────────────
 
 /// Why a live combo was closed.
@@ -370,6 +377,7 @@ pub enum ExitReason {
     /// Half-gain profit trail: gave back to 50% of the peak gain (a protective win-keeper, not a loss).
     Trail,
     Time,
+    FeedStale,
 }
 
 fn quote_at(quotes: &[StrikeQuote], strike: f64) -> Option<&StrikeQuote> {
@@ -890,6 +898,10 @@ pub struct MultiLegEngine {
     updates_rx: Option<mpsc::UnboundedReceiver<OrderUpdate>>,
     state: HashMap<String, UnderlyingState>,
     order_seq: u64,
+    last_tick_ms: u64,
+    last_tick_by_token: HashMap<u32, u64>,
+    feed_halted: bool,
+    feed_recovery_started_ms: Option<u64>,
 }
 
 impl MultiLegEngine {
@@ -914,6 +926,10 @@ impl MultiLegEngine {
             updates_rx: None,
             state: HashMap::new(),
             order_seq: 0,
+            last_tick_ms: 0,
+            last_tick_by_token: HashMap::new(),
+            feed_halted: false,
+            feed_recovery_started_ms: None,
         }
     }
 
@@ -957,12 +973,24 @@ impl MultiLegEngine {
                 if self.live.is_some() { "LIVE" } else { "paper" }
             );
             let mut flatten_clock = tokio::time::interval(std::time::Duration::from_secs(2));
+            self.last_tick_ms = now_ms();
             let mut shutdown_requested = false;
             let mut shutdown_deadline_ms = 0_u64;
             loop {
                 tokio::select! {
                     event = rx.recv() => match event {
-                        Ok(event) => self.on_event(&event).await,
+                        Ok(event) => {
+                            if event.feed_stale {
+                                self.enforce_feed_watchdog().await;
+                                continue;
+                            }
+                            let now = now_ms();
+                            self.record_feed_ticks(&event, now);
+                            if self.feed_halted && !self.note_feed_recovery(now) {
+                                continue;
+                            }
+                            self.on_event_at(now).await;
+                        }
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             warn!("Multi-leg engine lagged by {} messages", n);
                         }
@@ -976,6 +1004,7 @@ impl MultiLegEngine {
                     },
                     _ = flatten_clock.tick() => {
                         let now = now_ms();
+                        self.enforce_feed_watchdog().await;
                         let (_day, _wd, mins, _secs) = ist_parts(now);
                         if self.has_time_exit_due(mins) {
                             self.close_all_active(ExitReason::Time).await;
@@ -1007,8 +1036,71 @@ impl MultiLegEngine {
         })
     }
 
-    async fn on_event(&mut self, _event: &TickEvent) {
-        self.on_event_at(now_ms()).await;
+    fn record_feed_ticks(&mut self, event: &TickEvent, now: u64) {
+        if event.ticks.is_empty() {
+            return;
+        }
+        self.last_tick_ms = now;
+        for tick in &event.ticks {
+            self.last_tick_by_token.insert(tick.token, now);
+        }
+    }
+
+    fn feed_age_ms(&self, now: u64) -> u64 {
+        let mut required_clock = self.last_tick_ms;
+        for active in self.state.values().filter_map(|state| state.active.as_ref()) {
+            if let Some(token) = self.underlying_tokens.get(&active.underlying) {
+                required_clock = required_clock.min(
+                    self.last_tick_by_token.get(token).copied().unwrap_or(0),
+                );
+            }
+            for leg in active.legs.iter().filter(|leg| leg.plan.side == OrderSide::Sell) {
+                required_clock = required_clock.min(
+                    self.last_tick_by_token
+                        .get(&leg.market.token)
+                        .copied()
+                        .unwrap_or(0),
+                );
+            }
+        }
+        now.saturating_sub(required_clock)
+    }
+
+    fn note_feed_recovery(&mut self, now: u64) -> bool {
+        if self.feed_age_ms(now) >= FEED_SOFT_STALE_MS {
+            self.feed_recovery_started_ms = None;
+            return false;
+        }
+        let started = self.feed_recovery_started_ms.get_or_insert(now);
+        if now.saturating_sub(*started) < FEED_RECOVERY_STABLE_MS {
+            return false;
+        }
+        self.feed_halted = false;
+        self.feed_recovery_started_ms = None;
+        warn!("MULTILEG feed recovered and stayed healthy for 5s — entries resumed");
+        true
+    }
+
+    async fn enforce_feed_watchdog(&mut self) {
+        if self.live.is_none() || !market_data_expected(now_ms()) {
+            return;
+        }
+        let age = self.feed_age_ms(now_ms());
+        if age < FEED_SOFT_STALE_MS {
+            return;
+        }
+        if !self.feed_halted {
+            warn!("MULTILEG feed stale {}s — blocking new entries", age / 1000);
+        }
+        self.feed_halted = true;
+        self.feed_recovery_started_ms = None;
+        if age >= FEED_HARD_STALE_MS && self.has_active_positions() {
+            error!(
+                "🚨 MULTILEG feed stale {}s with an active combo — flattening via MARKET",
+                age / 1000
+            );
+            self.close_all_active(ExitReason::FeedStale).await;
+        }
     }
 
     async fn on_event_at(&mut self, now_ms: u64) {
@@ -1961,7 +2053,12 @@ impl MultiLegEngine {
                     leg.market = m.clone();
                 }
             }
-            if let Err(e) = self.flatten_live_legs(&live_active.legs, qty, "exit").await {
+            let label = if reason == ExitReason::FeedStale {
+                "feed-stale"
+            } else {
+                "exit"
+            };
+            if let Err(e) = self.flatten_live_legs(&live_active.legs, qty, label).await {
                 warn!("MULTILEG live exit failed; keeping lock/active position: {}", e);
                 return;
             }
@@ -2033,8 +2130,8 @@ impl MultiLegEngine {
         for fill in seq {
             let side = close_side(fill.leg.plan.side);
             let tag = self.next_tag(if label == "exit" { "MLX" } else { "MLF" });
-            let limit = marketable_limit(side, fill.leg.market.bid, fill.leg.market.ask);
-            self.send_order(&tag, &fill.leg, side, fill.qty, Some(limit))?;
+            let limit = flatten_limit(label, side, fill.leg.market.bid, fill.leg.market.ask);
+            self.send_order(&tag, &fill.leg, side, fill.qty, limit)?;
             match self.wait_complete(&tag, fill.qty, LIVE_ORDER_TIMEOUT_SECS).await {
                 Ok(_) => {}
                 Err(e) => {
@@ -2558,6 +2655,12 @@ mod tests {
         assert!((marketable_limit(OrderSide::Buy, 12.0, 12.1) - 12.6).abs() < 1e-9);
         assert!((marketable_limit(OrderSide::Sell, 29.0, 29.1) - 28.5).abs() < 1e-9);
         assert_eq!(marketable_limit(OrderSide::Sell, 0.3, 0.4), 0.05); // tick floor
+    }
+
+    #[test]
+    fn feed_stale_exit_uses_market_orders() {
+        assert_eq!(flatten_limit("feed-stale", OrderSide::Buy, 12.0, 12.1), None);
+        assert!(flatten_limit("exit", OrderSide::Buy, 12.0, 12.1).is_some());
     }
 
     #[test]

@@ -188,6 +188,21 @@ fn parse_ts_ms_fallback(s: &str) -> Option<u64> {
     Some(dt.and_utc().timestamp_millis() as u64)
 }
 
+/// Feed-gap threshold for data-quality flagging — matches the live engine's FEED_HARD_STALE_MS
+/// (60s). The binary can't reproduce the live flatten, but it flags days whose recorded data is
+/// too gappy/truncated for the P&L to be trusted (e.g. a WiFi outage), instead of silently
+/// reporting a partial-data result as if it were a clean session.
+const FEED_STALE_GAP_MS: u64 = 60_000;
+
+/// IST clock string from a UTC-epoch millisecond (recv_ts is parsed as IST → UTC above).
+fn ist_hhmm(ms: u64) -> String {
+    let s = (ms / 1000 + 19_800) % 86_400;
+    format!("{:02}:{:02}", s / 3600, (s % 3600) / 60)
+}
+fn ist_mins_of_day(ms: u64) -> u64 {
+    ((ms / 1000 + 19_800) % 86_400) / 60
+}
+
 fn col_idx(headers: &StringRecord, name: &str) -> Result<usize, Box<dyn Error>> {
     headers
         .iter()
@@ -595,6 +610,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut last_ts_ms: u64 = 0;
     let mut replay_clock_ms: u64 = 0;
     let mut clock_regressions: u64 = 0;
+    let mut first_tick_ms: u64 = 0;
+    let mut max_gap_ms: u64 = 0;
+    let mut blind_gap_ms: u64 = 0;
+    let mut feed_gap_count: u64 = 0;
     let started = Instant::now();
 
     for rec in rdr.records() {
@@ -620,6 +639,31 @@ fn main() -> Result<(), Box<dyn Error>> {
                 Some(v) => v,
                 None => continue,
             };
+            // Data-quality: gap since the previous distinct tick, counted only within market
+            // hours (09:15–15:30 IST). Post-close quiet on an untrimmed file is not an outage.
+            if last_ts_ms == 0 {
+                first_tick_ms = parsed;
+            } else {
+                let last_ist_min = ((last_ts_ms / 1000 + 19_800) % 86_400) / 60;
+                if last_ist_min < 930 {
+                    // Cap at 15:30 so a gap straddling the close doesn't over-count.
+                    let close_ms = last_ts_ms + (930 - last_ist_min) * 60_000;
+                    let market_gap = parsed.min(close_ms).saturating_sub(last_ts_ms);
+                    if market_gap > max_gap_ms {
+                        max_gap_ms = market_gap;
+                    }
+                    if market_gap > FEED_STALE_GAP_MS {
+                        feed_gap_count += 1;
+                        blind_gap_ms += market_gap;
+                        eprintln!(
+                            "  ⚠ FEED GAP {}s: {} -> {} IST",
+                            market_gap / 1000,
+                            ist_hhmm(last_ts_ms),
+                            ist_hhmm(parsed)
+                        );
+                    }
+                }
+            }
             last_ts_raw.clear();
             last_ts_raw.push_str(ts_raw);
             last_ts_ms = parsed;
@@ -684,6 +728,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         0.0
     };
 
+    // Data-quality verdict: live would halt/flatten on a stale feed; the backtest can't, so it
+    // flags a day whose data is truncated (ends well before ~15:15 IST) or heavily gapped, rather
+    // than presenting a partial-data P&L as a trustworthy result.
+    let last_mins = if last_ts_ms > 0 { ist_mins_of_day(last_ts_ms) } else { 0 };
+    let blind_min = blind_gap_ms / 60_000;
+    let data_reliable = last_mins >= 900 && blind_gap_ms <= 30 * 60_000;
+    let reliability = if data_reliable {
+        "OK — full session".to_string()
+    } else if last_mins < 900 {
+        format!("PARTIAL DATA — session ends {} IST (truncated); P&L UNRELIABLE", ist_hhmm(last_ts_ms))
+    } else {
+        format!("GAPPY FEED — {} blind min in market hours; P&L UNRELIABLE", blind_min)
+    };
+    let cover_from = if first_tick_ms > 0 { ist_hhmm(first_tick_ms) } else { "--:--".to_string() };
+    let cover_to = if last_ts_ms > 0 { ist_hhmm(last_ts_ms) } else { "--:--".to_string() };
+
     let report = format!(
         "==============================================================\n\
          SATAVAHANA — INDIAN OPTIONS BACKTEST (CURRENT LIVE CODE)\n\
@@ -695,6 +755,9 @@ fn main() -> Result<(), Box<dyn Error>> {
          Exec buy/sell adj   : +₹{:.2} / -₹{:.2}\n\
          Rows seen/replayed  : {} / {}\n\
          Clock regressions    : {}\n\
+         Data coverage        : {} -> {} IST\n\
+         Feed gaps (>60s)     : {} (max {}s, blind {}m)\n\
+         Data reliability     : {}\n\
          Elapsed             : {:.2}s\n\
          \n\
          Signals generated   : {}\n\
@@ -720,6 +783,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         rows_seen,
         rows_replayed,
         clock_regressions,
+        cover_from,
+        cover_to,
+        feed_gap_count,
+        max_gap_ms / 1000,
+        blind_min,
+        reliability,
         started.elapsed().as_secs_f64(),
         signals,
         entry_attempts,

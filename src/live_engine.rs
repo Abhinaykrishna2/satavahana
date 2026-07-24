@@ -387,7 +387,8 @@ pub fn spawn_quant_engine(
         info!("  Quant engine: ACTIVE (OFI/OIV/CD/SOA, simulated execution, ₹{:.0})", capital);
         loop {
             match rx.recv().await {
-                Ok(_ev) => engine.on_tick(now_ms()),
+                Ok(ev) if !ev.feed_stale => engine.on_tick(now_ms()),
+                Ok(_) => continue,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => {
                     engine.finalize("shutdown");
