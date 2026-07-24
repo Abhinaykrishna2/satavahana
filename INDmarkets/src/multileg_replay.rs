@@ -4,15 +4,17 @@
 use crate::execution::OrderSide;
 use crate::models::OptionType;
 use crate::multileg::{
-    atm_straddle, combo_close_cost, combo_credit, credit_edge_direction, credit_edge_er_admits,
-    credit_edge_late_net_exit, dte_allows, efficiency_ratio, entry_balance_admits,
+    atm_straddle, combo_close_cost, combo_credit, credit_edge_direction,
+    credit_edge_directional_efficiency_admits, credit_edge_er_admits, credit_edge_late_net_exit,
+    dte_allows, efficiency_ratio, entry_balance_admits,
     entry_balance_edge_cap, entry_drift_admits, entry_drift_zone_cap, exit_min_for,
     hard_stop_frac_cap, max_loss_per_lot, move_stop_enabled, move_trims, option_order_cost,
-    pick_best_structure, profit_zone, select_credit_spread_legs, select_legs, sell_regime_skip,
-    size_lots,
+    opening_directional_efficiency, pick_best_structure, profit_zone, select_credit_spread_legs,
+    select_legs, sell_regime_skip, size_lots,
     stop_frac_ml, structure_regime_score, target_frac, trail_enabled, trail_exits,
     OpeningRegime, PlannedLeg, SellStructure, StrikeQuote, CREDIT_EDGE_ALLOC_FRAC,
-    CREDIT_EDGE_DELTA, CREDIT_EDGE_MAX_DTE_DAYS, CREDIT_EDGE_MAX_ER, CREDIT_EDGE_MAX_LOTS,
+    CREDIT_EDGE_DELTA, CREDIT_EDGE_FAR_DTE_MIN_DIRECTIONAL_EFFICIENCY,
+    CREDIT_EDGE_MAX_DTE_DAYS, CREDIT_EDGE_MAX_ER, CREDIT_EDGE_MAX_LOTS,
     CREDIT_EDGE_MAX_RANGE_PCT, CREDIT_EDGE_THRESHOLD, MOVE_WINDOW_MIN,
 };
 use crate::websocket::FEED_SOFT_STALE_MS;
@@ -239,6 +241,7 @@ fn try_plan(
     spot: f64,
     opening: ReplayOpening,
     regime: OpeningRegime,
+    dte: i64,
     capital: f64,
     no_gate: bool,
 ) -> Result<Plan, String> {
@@ -254,6 +257,18 @@ fn try_plan(
                 "CRED range {:.2}% > {:.2}%",
                 opening.range_pts / spot * 100.0,
                 CREDIT_EDGE_MAX_RANGE_PCT * 100.0
+            ));
+        }
+        if !no_gate
+            && !credit_edge_directional_efficiency_admits(
+                dte,
+                regime.directional_efficiency,
+            )
+        {
+            return Err(format!(
+                "CRED directional efficiency {:.2} < {:.2}",
+                regime.directional_efficiency,
+                CREDIT_EDGE_FAR_DTE_MIN_DIRECTIONAL_EFFICIENCY
             ));
         }
         let direction = credit_edge_direction(opening.edge_pos, CREDIT_EDGE_THRESHOLD)
@@ -619,6 +634,7 @@ pub(crate) fn replay_day(
             er,
             range_pts,
             straddle,
+            directional_efficiency: opening_directional_efficiency(&closes).unwrap_or(0.0),
             edge_frac: opening.edge_frac,
         };
         if structure != SellStructure::CreditEdge {
@@ -629,14 +645,11 @@ pub(crate) fn replay_day(
         }
 
         if std::env::var("SATA_ML_LATENTS").is_ok() {
-            let drift = match (closes.first(), closes.last()) {
-                (Some(&f), Some(&l)) if spot > 0.0 => (l - f).abs() / spot * 100.0,
-                _ => 0.0,
-            };
+            let drift = regime.directional_efficiency * range_pts / spot * 100.0;
             eprintln!(
-                "LATENT {} | {:?} {}DTE {} | ER {:.2} | edge {:.0}% | range {:.2}% | drift {:.2}% | straddle {:.0} | range/straddle {:.2}",
+                "LATENT {} | {:?} {}DTE {} | ER {:.2} | edge {:.0}% | range {:.4}% | drift {:.4}% | drift/range {:.4} | straddle {:.0} | range/straddle {:.4}",
                 day, structure, dte, if near_expiry { "near" } else { "far" }, er, opening.edge_frac * 100.0,
-                range_pts / spot * 100.0, drift, straddle, range_pts / straddle,
+                range_pts / spot * 100.0, drift, drift / (range_pts / spot * 100.0), straddle, range_pts / straddle,
             );
         }
 
@@ -647,6 +660,7 @@ pub(crate) fn replay_day(
             spot,
             opening,
             regime,
+            dte,
             capital,
             no_gate,
         ) {

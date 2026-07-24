@@ -3682,7 +3682,7 @@ impl OptionsEngine {
             );
             return signals;
         }
-        if dominant_signals.len() > 1 && snap.days_to_expiry > FAR_DTE_COMPOSITE_MIN_DTE {
+        if snap.days_to_expiry > FAR_DTE_COMPOSITE_MIN_DTE {
             if let Some(rsi) = self
                 .spot_series
                 .get(&snap.underlying)
@@ -3932,7 +3932,12 @@ impl OptionsEngine {
         // Reject trades without sufficient risk-reward edge.
         // Short-dated high-confidence trades often model with lower static R:R because
         // gamma compresses both target and stop; keep the standard 1.3 floor elsewhere.
-        let min_risk_reward = if snap.days_to_expiry <= 3.5 && composite_score >= 62.0 {
+        let min_risk_reward = if snap.days_to_expiry < 0.5
+            && compressive
+            && !dominant_has_spot_reversal
+        {
+            1.30
+        } else if snap.days_to_expiry <= 3.5 && composite_score >= 62.0 {
             0.95
         } else {
             1.30
@@ -5476,7 +5481,17 @@ impl OptionsEngine {
         //   • trail_arm_pct gain: peak-giveback trail ratchets the stop upward.
         let now_ms = self.current_time_ms();
         for i in 0..self.positions.len() {
-            let (is_open, option_token, entry_price, entry_time_ms, days_to_expiry, strategy, session) = {
+            let (
+                is_open,
+                option_token,
+                entry_price,
+                entry_time_ms,
+                days_to_expiry,
+                strategy,
+                session,
+                lots,
+                lot_size,
+            ) = {
                 let pos = &self.positions[i];
                 (
                     pos.is_open,
@@ -5486,6 +5501,8 @@ impl OptionsEngine {
                     pos.entry_ctx.days_to_expiry,
                     pos.strategy,
                     pos.entry_ctx.session.clone(),
+                    pos.lots,
+                    pos.lot_size,
                 )
             };
             if !is_open { continue; }
@@ -5511,7 +5528,23 @@ impl OptionsEngine {
             let profit_lock_gain_pct = if runner_exit {
                 self.profit_lock_gain_pct
             } else {
-                RIGID_PROFIT_LOCK_GAIN_PCT
+                let qty = (lots * lot_size) as f64;
+                let assumed_exit =
+                    entry_price * (1.0 + RIGID_PROFIT_LOCK_GAIN_PCT / 100.0);
+                let friction_pct = if qty > 0.0 {
+                    (round_trip_order_cost(
+                        entry_price,
+                        assumed_exit,
+                        lot_size,
+                        lots,
+                        now_ms,
+                    ) + self.execution_sell_offset_inr * qty)
+                        / (entry_price * qty)
+                        * 100.0
+                } else {
+                    0.0
+                };
+                RIGID_PROFIT_LOCK_GAIN_PCT + friction_pct
             };
             let trail_arm_pct = if runner_exit {
                 self.trail_arm_pct
@@ -6367,11 +6400,15 @@ mod tests {
         pos.target_price = 140.0;
         engine.positions.push(pos);
 
-        // +13% (≥3 min), never reached +15%: one-shot lock to entry+2% (102); trail NOT armed.
+        // +13% (>=3 min), never reached +15%: lock +2% net after modeled fees.
         store.update(Tick { token: 101, ltp: 113.0, mode: TickMode::Ltp, ..Tick::default() });
         engine.set_clock_override_ms(4 * 60_000);
         engine.check_open_positions();
-        assert!((engine.positions[0].stop_price - 102.0).abs() < 1e-9, "+13% arms the entry+2% lock");
+        assert!(
+            engine.positions[0].stop_price > 102.0
+                && engine.positions[0].stop_price < 104.0,
+            "+13% arms a fee-adjusted lock above the old gross +2% level"
+        );
         assert!(engine.positions[0].breakeven_stop_set);
         assert!(engine.positions[0].is_open);
     }
