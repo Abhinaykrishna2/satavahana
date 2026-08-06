@@ -23,11 +23,17 @@ pub struct TickEvent {
 
 impl TickEvent {
     fn market_data(ticks: Vec<Tick>) -> Self {
-        Self { ticks, feed_stale: false }
+        Self {
+            ticks,
+            feed_stale: false,
+        }
     }
 
     fn stale() -> Self {
-        Self { ticks: Vec::new(), feed_stale: true }
+        Self {
+            ticks: Vec::new(),
+            feed_stale: true,
+        }
     }
 }
 
@@ -37,8 +43,10 @@ pub fn market_data_expected(timestamp_ms: u64) -> bool {
         .unwrap_or_else(Utc::now)
         .with_timezone(&ist);
     let mins = now.hour() * 60 + now.minute();
-    matches!(now.weekday(), Weekday::Mon | Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri)
-        && (555..930).contains(&mins)
+    matches!(
+        now.weekday(),
+        Weekday::Mon | Weekday::Tue | Weekday::Wed | Weekday::Thu | Weekday::Fri
+    ) && (555..930).contains(&mins)
 }
 
 pub struct WsConnection {
@@ -59,7 +67,10 @@ impl WsConnection {
                         warn!("[{}] WebSocket closed cleanly, reconnecting...", conn.name);
                     }
                     Err(e) => {
-                        error!("[{}] WebSocket error: {}, reconnecting in 5s...", conn.name, e);
+                        error!(
+                            "[{}] WebSocket error: {}, reconnecting in 5s...",
+                            conn.name, e
+                        );
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     }
                 }
@@ -78,7 +89,11 @@ impl WsConnection {
         let (ws_stream, _) = connect_async(&self.ws_url).await?;
         let (mut write, mut read) = ws_stream.split();
 
-        info!("[{}] Connected! Subscribing to {} tokens...", self.name, self.tokens.len());
+        info!(
+            "[{}] Connected! Subscribing to {} tokens...",
+            self.name,
+            self.tokens.len()
+        );
 
         // Kite allows max 3000 tokens; chunk subscribe + mode messages to stay safe
         for chunk in self.tokens.chunks(500) {
@@ -94,7 +109,9 @@ impl WsConnection {
                 "a": "mode",
                 "v": [&self.mode, chunk]
             });
-            write.send(Message::Text(mode_msg.to_string().into())).await?;
+            write
+                .send(Message::Text(mode_msg.to_string().into()))
+                .await?;
         }
 
         info!("[{}] Subscribed and mode set. Streaming...", self.name);
@@ -143,8 +160,8 @@ impl WsConnection {
                     match parse_binary_message(&data) {
                         Ok(ticks) => {
                             if !ticks.is_empty() {
-                                quote_deadline = Instant::now()
-                                    + Duration::from_secs(FEED_SILENCE_TIMEOUT_SECS);
+                                quote_deadline =
+                                    Instant::now() + Duration::from_secs(FEED_SILENCE_TIMEOUT_SECS);
                                 let _ = self.tx.send(TickEvent::market_data(ticks));
                             }
                         }
@@ -208,7 +225,10 @@ pub fn parse_binary_message(
         let packet_len_raw = BigEndian::read_i16(&data[offset..offset + 2]);
         offset += 2;
         if packet_len_raw < 0 {
-            warn!("Malformed packet length {} (negative); stopping parse", packet_len_raw);
+            warn!(
+                "Malformed packet length {} (negative); stopping parse",
+                packet_len_raw
+            );
             break;
         }
         let packet_len = packet_len_raw as usize;
@@ -241,11 +261,11 @@ fn parse_packet(packet: &[u8]) -> Option<Tick> {
     }
 
     let token = BigEndian::read_u32(&packet[0..4]);
-
+    let divisor = price_divisor(token);
 
     match len {
         8 => {
-            let ltp = BigEndian::read_i32(&packet[4..8]) as f64 / 100.0;
+            let ltp = BigEndian::read_i32(&packet[4..8]) as f64 / divisor;
             Some(Tick {
                 token,
                 ltp,
@@ -255,11 +275,11 @@ fn parse_packet(packet: &[u8]) -> Option<Tick> {
         }
 
         28 => {
-            let ltp = BigEndian::read_i32(&packet[4..8]) as f64 / 100.0;
-            let high = BigEndian::read_i32(&packet[8..12]) as f64 / 100.0;
-            let low = BigEndian::read_i32(&packet[12..16]) as f64 / 100.0;
-            let open = BigEndian::read_i32(&packet[16..20]) as f64 / 100.0;
-            let close = BigEndian::read_i32(&packet[20..24]) as f64 / 100.0;
+            let ltp = BigEndian::read_i32(&packet[4..8]) as f64 / divisor;
+            let high = BigEndian::read_i32(&packet[8..12]) as f64 / divisor;
+            let low = BigEndian::read_i32(&packet[12..16]) as f64 / divisor;
+            let open = BigEndian::read_i32(&packet[16..20]) as f64 / divisor;
+            let close = BigEndian::read_i32(&packet[20..24]) as f64 / divisor;
 
             Some(Tick {
                 token,
@@ -276,11 +296,11 @@ fn parse_packet(packet: &[u8]) -> Option<Tick> {
         }
 
         32 => {
-            let ltp = BigEndian::read_i32(&packet[4..8]) as f64 / 100.0;
-            let high = BigEndian::read_i32(&packet[8..12]) as f64 / 100.0;
-            let low = BigEndian::read_i32(&packet[12..16]) as f64 / 100.0;
-            let open = BigEndian::read_i32(&packet[16..20]) as f64 / 100.0;
-            let close = BigEndian::read_i32(&packet[20..24]) as f64 / 100.0;
+            let ltp = BigEndian::read_i32(&packet[4..8]) as f64 / divisor;
+            let high = BigEndian::read_i32(&packet[8..12]) as f64 / divisor;
+            let low = BigEndian::read_i32(&packet[12..16]) as f64 / divisor;
+            let open = BigEndian::read_i32(&packet[16..20]) as f64 / divisor;
+            let close = BigEndian::read_i32(&packet[20..24]) as f64 / divisor;
             let exchange_ts = BigEndian::read_u32(&packet[28..32]);
 
             Some(Tick {
@@ -299,16 +319,16 @@ fn parse_packet(packet: &[u8]) -> Option<Tick> {
         }
 
         44 => {
-            let ltp = BigEndian::read_i32(&packet[4..8]) as f64 / 100.0;
+            let ltp = BigEndian::read_i32(&packet[4..8]) as f64 / divisor;
             let last_qty = BigEndian::read_u32(&packet[8..12]);
-            let avg_price = BigEndian::read_i32(&packet[12..16]) as f64 / 100.0;
+            let avg_price = BigEndian::read_i32(&packet[12..16]) as f64 / divisor;
             let volume = BigEndian::read_u32(&packet[16..20]);
             let buy_qty = BigEndian::read_u32(&packet[20..24]);
             let sell_qty = BigEndian::read_u32(&packet[24..28]);
-            let open = BigEndian::read_i32(&packet[28..32]) as f64 / 100.0;
-            let high = BigEndian::read_i32(&packet[32..36]) as f64 / 100.0;
-            let low = BigEndian::read_i32(&packet[36..40]) as f64 / 100.0;
-            let close = BigEndian::read_i32(&packet[40..44]) as f64 / 100.0;
+            let open = BigEndian::read_i32(&packet[28..32]) as f64 / divisor;
+            let high = BigEndian::read_i32(&packet[32..36]) as f64 / divisor;
+            let low = BigEndian::read_i32(&packet[36..40]) as f64 / divisor;
+            let close = BigEndian::read_i32(&packet[40..44]) as f64 / divisor;
 
             Some(Tick {
                 token,
@@ -330,16 +350,16 @@ fn parse_packet(packet: &[u8]) -> Option<Tick> {
         }
 
         56 => {
-            let ltp = BigEndian::read_i32(&packet[4..8]) as f64 / 100.0;
+            let ltp = BigEndian::read_i32(&packet[4..8]) as f64 / divisor;
             let last_qty = BigEndian::read_u32(&packet[8..12]);
-            let avg_price = BigEndian::read_i32(&packet[12..16]) as f64 / 100.0;
+            let avg_price = BigEndian::read_i32(&packet[12..16]) as f64 / divisor;
             let volume = BigEndian::read_u32(&packet[16..20]);
             let buy_qty = BigEndian::read_u32(&packet[20..24]);
             let sell_qty = BigEndian::read_u32(&packet[24..28]);
-            let open = BigEndian::read_i32(&packet[28..32]) as f64 / 100.0;
-            let high = BigEndian::read_i32(&packet[32..36]) as f64 / 100.0;
-            let low = BigEndian::read_i32(&packet[36..40]) as f64 / 100.0;
-            let close = BigEndian::read_i32(&packet[40..44]) as f64 / 100.0;
+            let open = BigEndian::read_i32(&packet[28..32]) as f64 / divisor;
+            let high = BigEndian::read_i32(&packet[32..36]) as f64 / divisor;
+            let low = BigEndian::read_i32(&packet[36..40]) as f64 / divisor;
+            let close = BigEndian::read_i32(&packet[40..44]) as f64 / divisor;
             let last_trade_ts = BigEndian::read_u32(&packet[44..48]);
             let oi = BigEndian::read_u32(&packet[48..52]);
             let oi_day_high = BigEndian::read_u32(&packet[52..56]);
@@ -367,16 +387,16 @@ fn parse_packet(packet: &[u8]) -> Option<Tick> {
         }
 
         184 => {
-            let ltp = BigEndian::read_i32(&packet[4..8]) as f64 / 100.0;
+            let ltp = BigEndian::read_i32(&packet[4..8]) as f64 / divisor;
             let last_qty = BigEndian::read_u32(&packet[8..12]);
-            let avg_price = BigEndian::read_i32(&packet[12..16]) as f64 / 100.0;
+            let avg_price = BigEndian::read_i32(&packet[12..16]) as f64 / divisor;
             let volume = BigEndian::read_u32(&packet[16..20]);
             let buy_qty = BigEndian::read_u32(&packet[20..24]);
             let sell_qty = BigEndian::read_u32(&packet[24..28]);
-            let open = BigEndian::read_i32(&packet[28..32]) as f64 / 100.0;
-            let high = BigEndian::read_i32(&packet[32..36]) as f64 / 100.0;
-            let low = BigEndian::read_i32(&packet[36..40]) as f64 / 100.0;
-            let close = BigEndian::read_i32(&packet[40..44]) as f64 / 100.0;
+            let open = BigEndian::read_i32(&packet[28..32]) as f64 / divisor;
+            let high = BigEndian::read_i32(&packet[32..36]) as f64 / divisor;
+            let low = BigEndian::read_i32(&packet[36..40]) as f64 / divisor;
+            let close = BigEndian::read_i32(&packet[40..44]) as f64 / divisor;
 
             let last_trade_ts = BigEndian::read_u32(&packet[44..48]);
             let oi = BigEndian::read_u32(&packet[48..52]);
@@ -384,7 +404,7 @@ fn parse_packet(packet: &[u8]) -> Option<Tick> {
             let oi_day_low = BigEndian::read_u32(&packet[56..60]);
             let exchange_ts = BigEndian::read_u32(&packet[60..64]);
 
-            let depth = parse_market_depth(&packet[64..184]);
+            let depth = parse_market_depth(&packet[64..184], divisor);
 
             Some(Tick {
                 token,
@@ -412,7 +432,7 @@ fn parse_packet(packet: &[u8]) -> Option<Tick> {
 
         _ => {
             if len >= 8 {
-                let ltp = BigEndian::read_i32(&packet[4..8]) as f64 / 100.0;
+                let ltp = BigEndian::read_i32(&packet[4..8]) as f64 / divisor;
                 Some(Tick {
                     token,
                     ltp,
@@ -426,14 +446,22 @@ fn parse_packet(packet: &[u8]) -> Option<Tick> {
     }
 }
 
-fn parse_market_depth(data: &[u8]) -> MarketDepth {
+fn price_divisor(token: u32) -> f64 {
+    match token & 0xff {
+        3 => 10_000_000.0, // CDS
+        6 => 10_000.0,     // BCD
+        _ => 100.0,
+    }
+}
+
+fn parse_market_depth(data: &[u8], divisor: f64) -> MarketDepth {
     let mut depth = MarketDepth::default();
 
     for i in 0..5 {
         let base = i * 12;
         depth.bids[i] = DepthEntry {
             quantity: BigEndian::read_u32(&data[base..base + 4]),
-            price: BigEndian::read_i32(&data[base + 4..base + 8]) as f64 / 100.0,
+            price: BigEndian::read_i32(&data[base + 4..base + 8]) as f64 / divisor,
             orders: BigEndian::read_u16(&data[base + 8..base + 10]),
         };
     }
@@ -442,7 +470,7 @@ fn parse_market_depth(data: &[u8]) -> MarketDepth {
         let base = 60 + i * 12;
         depth.asks[i] = DepthEntry {
             quantity: BigEndian::read_u32(&data[base..base + 4]),
-            price: BigEndian::read_i32(&data[base + 4..base + 8]) as f64 / 100.0,
+            price: BigEndian::read_i32(&data[base + 4..base + 8]) as f64 / divisor,
             orders: BigEndian::read_u16(&data[base + 8..base + 10]),
         };
     }
@@ -479,6 +507,15 @@ mod tests {
         assert_eq!(tick.token, 408065);
         assert!((tick.ltp - 1412.95).abs() < 0.01);
         assert_eq!(tick.mode, TickMode::Ltp);
+    }
+
+    #[test]
+    fn currency_packets_use_segment_price_divisors() {
+        let cds_token = (1234 << 8) | 3;
+        let tick = parse_packet(&make_ltp_packet(cds_token, 838_350_000)).unwrap();
+        assert!((tick.ltp - 83.835).abs() < 1e-9);
+        assert_eq!(price_divisor((1234 << 8) | 6), 10_000.0);
+        assert_eq!(price_divisor(408065), 100.0);
     }
 
     #[test]
@@ -585,7 +622,10 @@ mod tests {
                 other => panic!("unexpected stream result: {:?}", other),
             }
         }
-        assert!(received > 1, "heartbeats arrived but did not keep the quote deadline alive");
+        assert!(
+            received > 1,
+            "heartbeats arrived but did not keep the quote deadline alive"
+        );
     }
 
     #[test]

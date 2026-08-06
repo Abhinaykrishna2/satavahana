@@ -108,7 +108,9 @@ impl TickStore {
 
     #[inline(always)]
     pub fn get(&self, token: u32) -> Option<Tick> {
-        self.cold_path.get(&token).map(|entry| entry.value().clone())
+        self.cold_path
+            .get(&token)
+            .map(|entry| entry.value().clone())
     }
 
     #[inline]

@@ -39,7 +39,6 @@ pub struct Config {
     /// daily kill switch, 3:15 flatten, hourly capital sync schedule).
     #[serde(default)]
     pub risk: RiskConfig,
-
 }
 
 fn default_options_engine_config() -> OptionsEngineConfig {
@@ -503,20 +502,48 @@ pub struct OptionsEngineConfig {
     pub max_daily_trades: u32,
 }
 
-fn default_engine_enabled()   -> bool  { true }
-fn default_initial_capital() -> f64 { 10_000.0 }
-fn default_max_daily_loss()   -> f64 { 15.0 }
-fn default_max_daily_profit()  -> f64 { 25.0 }
-fn default_profit_target()    -> f64 { 55.0 }
-fn default_stop_loss()        -> f64 { 35.0 }
-fn default_profit_lock_arm_pct() -> f64 { 12.0 }
-fn default_profit_lock_gain_pct() -> f64 { 2.0 }
-fn default_trail_arm_pct() -> f64 { 20.0 }
-fn default_trail_giveback_pct() -> f64 { 60.0 }
-fn default_min_confidence()   -> f64 { 60.0 }
-fn default_expiry_day_min_confidence() -> f64 { 60.0 }
-fn default_scan_interval()    -> u64 { 30 }
-fn default_max_daily_trades() -> u32 { 3 }
+fn default_engine_enabled() -> bool {
+    true
+}
+fn default_initial_capital() -> f64 {
+    10_000.0
+}
+fn default_max_daily_loss() -> f64 {
+    15.0
+}
+fn default_max_daily_profit() -> f64 {
+    25.0
+}
+fn default_profit_target() -> f64 {
+    55.0
+}
+fn default_stop_loss() -> f64 {
+    35.0
+}
+fn default_profit_lock_arm_pct() -> f64 {
+    12.0
+}
+fn default_profit_lock_gain_pct() -> f64 {
+    2.0
+}
+fn default_trail_arm_pct() -> f64 {
+    20.0
+}
+fn default_trail_giveback_pct() -> f64 {
+    60.0
+}
+fn default_min_confidence() -> f64 {
+    60.0
+}
+fn default_expiry_day_min_confidence() -> f64 {
+    60.0
+}
+fn default_scan_interval() -> u64 {
+    30
+}
+fn default_max_daily_trades() -> u32 {
+    3
+}
 
 impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
@@ -569,7 +596,10 @@ greeks_log_interval = 1
         assert!((config.risk.daily_profit_circuit_pct - 25.0).abs() < 1e-9);
         assert_eq!(config.risk.flatten_time, "15:15");
         assert_eq!(config.execution.equity_exchange, "NSE");
-        assert_eq!(config.options_engine.max_daily_trades, default_max_daily_trades());
+        assert_eq!(
+            config.options_engine.max_daily_trades,
+            default_max_daily_trades()
+        );
     }
 
     #[test]

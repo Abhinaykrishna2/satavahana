@@ -135,7 +135,10 @@ mod tests {
         // 1 NIFTY lot (65) at ₹100 premium.
         let c = options_roundtrip_at(100.0, 100.0, 65, 1, 1_774_981_800_000);
         // ≈ ₹40 brokerage + STT(0.15% of 6500≈9.75) + txn + gst.
-        assert!(c > 55.0 && c < 70.0, "unexpected options round-trip cost {c}");
+        assert!(
+            c > 55.0 && c < 70.0,
+            "unexpected options round-trip cost {c}"
+        );
     }
 
     #[test]

@@ -74,10 +74,7 @@ pub fn parse_instruments_csv(
     Ok(instruments)
 }
 
-pub fn build_equity_pairs(
-    instruments: &[Instrument],
-    config: &EquitiesConfig,
-) -> Vec<EquityPair> {
+pub fn build_equity_pairs(instruments: &[Instrument], config: &EquitiesConfig) -> Vec<EquityPair> {
     let mut nse_map: HashMap<String, &Instrument> = HashMap::new();
     let mut bse_map: HashMap<String, &Instrument> = HashMap::new();
 
@@ -120,8 +117,7 @@ pub fn build_equity_pairs(
 
         if !config.symbols.is_empty() {
             let in_watchlist = config.symbols.iter().any(|s| {
-                s.eq_ignore_ascii_case(&inst.tradingsymbol)
-                    || s.eq_ignore_ascii_case(&inst.name)
+                s.eq_ignore_ascii_case(&inst.tradingsymbol) || s.eq_ignore_ascii_case(&inst.name)
             });
             if !in_watchlist {
                 continue;
@@ -156,10 +152,7 @@ pub fn build_equity_pairs(
                 nse_inst.name, nse_inst.instrument_token, bse_inst.instrument_token
             );
         } else {
-            warn!(
-                "No BSE match for NSE:{} ({})",
-                symbol, nse_inst.name
-            );
+            warn!("No BSE match for NSE:{} ({})", symbol, nse_inst.name);
         }
     }
 
@@ -171,10 +164,18 @@ fn option_underlying_aliases(underlying: &str) -> Vec<String> {
     let u = underlying.trim().to_ascii_uppercase();
     match u.as_str() {
         "NIFTY" | "NIFTY50" | "NIFTY 50" => {
-            vec!["NIFTY".to_string(), "NIFTY50".to_string(), "NIFTY 50".to_string()]
+            vec![
+                "NIFTY".to_string(),
+                "NIFTY50".to_string(),
+                "NIFTY 50".to_string(),
+            ]
         }
         "NIFTYNXT50" | "NIFTY NEXT 50" | "NIFTYNEXT50" => {
-            vec!["NIFTYNXT50".to_string(), "NIFTY NEXT 50".to_string(), "NIFTYNEXT50".to_string()]
+            vec![
+                "NIFTYNXT50".to_string(),
+                "NIFTY NEXT 50".to_string(),
+                "NIFTYNEXT50".to_string(),
+            ]
         }
         _ => vec![u],
     }
@@ -337,20 +338,22 @@ pub async fn build_options_chain(
     let any_filtering = config.underlyings.iter().any(|u| config.strikes_for(u) > 0);
     if any_filtering {
         // Estimate ATM per underlying from index instrument last_price
-        let mut spot_estimate: HashMap<String, f64> = quote_fetcher::fetch_live_quotes(auth, instruments, &config.underlyings).await;
-        
+        let mut spot_estimate: HashMap<String, f64> =
+            quote_fetcher::fetch_live_quotes(auth, instruments, &config.underlyings).await;
+
         for underlying in &config.underlyings {
             if spot_estimate.contains_key(underlying) {
                 continue;
             }
-            
+
             // Try index instrument last_price (use same aliases as main.rs)
             let index_aliases: &[&str] = match underlying.as_str() {
-                "NIFTY"      => &["NIFTY 50", "NIFTY50", "NIFTY"],
+                "NIFTY" => &["NIFTY 50", "NIFTY50", "NIFTY"],
                 "NIFTYNXT50" => &["NIFTY NEXT 50", "NIFTYNXT50"],
                 _ => &[underlying.as_str()],
             };
-            let index_spot = instruments.iter()
+            let index_spot = instruments
+                .iter()
                 .find(|inst| {
                     inst.exchange == "NSE"
                         && inst.segment == "INDICES"
@@ -364,21 +367,34 @@ pub async fn build_options_chain(
 
             if let Some(sp) = index_spot {
                 spot_estimate.insert(underlying.clone(), sp);
-                info!("  {} spot estimate from index master (last_price): {:.0}", underlying, sp);
+                info!(
+                    "  {} spot estimate from index master (last_price): {:.0}",
+                    underlying, sp
+                );
             } else {
                 // Estimate ATM from put-call parity: the strike where |CE_price - PE_price| is smallest.
                 // Both CE and PE must have last_price > 0 in the instruments CSV.
                 let mut ce_prices: HashMap<u64, f64> = HashMap::new();
                 let mut pe_prices: HashMap<u64, f64> = HashMap::new();
                 for inst in instruments.iter() {
-                    if inst.segment != "NFO-OPT" { continue; }
-                    if !instrument_matches_underlying(inst, underlying) { continue; }
+                    if inst.segment != "NFO-OPT" {
+                        continue;
+                    }
+                    if !instrument_matches_underlying(inst, underlying) {
+                        continue;
+                    }
                     if let (Some(strike), lp) = (inst.strike, inst.last_price) {
-                        if lp <= 0.0 { continue; }
+                        if lp <= 0.0 {
+                            continue;
+                        }
                         let key = (strike * 100.0) as u64;
                         match inst.instrument_type.as_str() {
-                            "CE" => { ce_prices.insert(key, lp); }
-                            "PE" => { pe_prices.insert(key, lp); }
+                            "CE" => {
+                                ce_prices.insert(key, lp);
+                            }
+                            "PE" => {
+                                pe_prices.insert(key, lp);
+                            }
                             _ => {}
                         }
                     }
@@ -396,10 +412,14 @@ pub async fn build_options_chain(
                 }
                 if let Some((atm, _)) = best_strike {
                     spot_estimate.insert(underlying.clone(), atm);
-                    info!("  {} spot estimate from put-call parity: {:.0}", underlying, atm);
+                    info!(
+                        "  {} spot estimate from put-call parity: {:.0}",
+                        underlying, atm
+                    );
                 } else {
                     // Last resort: median strike
-                    let mut strikes: Vec<f64> = contracts.iter()
+                    let mut strikes: Vec<f64> = contracts
+                        .iter()
                         .filter(|c| c.underlying == *underlying)
                         .map(|c| c.strike)
                         .collect();
@@ -408,7 +428,10 @@ pub async fn build_options_chain(
                     if !strikes.is_empty() {
                         let mid = strikes[strikes.len() / 2];
                         spot_estimate.insert(underlying.clone(), mid);
-                        info!("  {} spot estimate from median strike: {:.0}", underlying, mid);
+                        info!(
+                            "  {} spot estimate from median strike: {:.0}",
+                            underlying, mid
+                        );
                     }
                 }
             }
@@ -420,7 +443,12 @@ pub async fn build_options_chain(
 
             // nearest_strikes = 0 for this underlying → keep all in range
             if per_underlying_n == 0 {
-                filtered.extend(contracts.iter().filter(|c| c.underlying == *underlying).cloned());
+                filtered.extend(
+                    contracts
+                        .iter()
+                        .filter(|c| c.underlying == *underlying)
+                        .cloned(),
+                );
                 continue;
             }
 
@@ -428,14 +456,20 @@ pub async fn build_options_chain(
                 Some(s) => *s,
                 None => {
                     // Keep all contracts if we can't estimate spot
-                    filtered.extend(contracts.iter().filter(|c| c.underlying == *underlying).cloned());
+                    filtered.extend(
+                        contracts
+                            .iter()
+                            .filter(|c| c.underlying == *underlying)
+                            .cloned(),
+                    );
                     continue;
                 }
             };
 
             // Strike selection keeps both CE and PE for the ATM strike plus the nearest
             // N strikes above and below ATM. Strategy code later decides direction.
-            let mut strikes: Vec<f64> = contracts.iter()
+            let mut strikes: Vec<f64> = contracts
+                .iter()
                 .filter(|c| c.underlying == *underlying)
                 .map(|c| c.strike)
                 .collect();
@@ -443,7 +477,8 @@ pub async fn build_options_chain(
             strikes.dedup();
 
             // ATM = strike with smallest distance to spot
-            let atm_strike = strikes.iter()
+            let atm_strike = strikes
+                .iter()
                 .cloned()
                 .min_by(|a, b| (a - spot).abs().partial_cmp(&(b - spot).abs()).unwrap())
                 .unwrap_or(spot);
@@ -451,35 +486,53 @@ pub async fn build_options_chain(
 
             // Keep both CE and PE for the ATM strike plus the nearest N strikes above
             // and below ATM.
-            let above_strikes: std::collections::HashSet<u64> = strikes.iter()
+            let above_strikes: std::collections::HashSet<u64> = strikes
+                .iter()
                 .filter(|&&s| s > atm_strike)
                 .take(per_underlying_n as usize)
                 .map(|s| (*s * 100.0) as u64)
                 .collect();
 
-            let below_strikes: std::collections::HashSet<u64> = strikes.iter()
+            let below_strikes: std::collections::HashSet<u64> = strikes
+                .iter()
                 .rev()
                 .filter(|&&s| s < atm_strike)
                 .take(per_underlying_n as usize)
                 .map(|s| (*s * 100.0) as u64)
                 .collect();
 
-            let before = contracts.iter().filter(|c| c.underlying == *underlying).count();
+            let before = contracts
+                .iter()
+                .filter(|c| c.underlying == *underlying)
+                .count();
             filtered.extend(
-                contracts.iter()
+                contracts
+                    .iter()
                     .filter(|c| {
-                        if c.underlying != *underlying { return false; }
+                        if c.underlying != *underlying {
+                            return false;
+                        }
                         let sk = (c.strike * 100.0) as u64;
-                        if sk == atm_key { return true; }
+                        if sk == atm_key {
+                            return true;
+                        }
                         above_strikes.contains(&sk) || below_strikes.contains(&sk)
                     })
-                    .cloned()
+                    .cloned(),
             );
-            let after = filtered.iter().filter(|c| c.underlying == *underlying).count();
+            let after = filtered
+                .iter()
+                .filter(|c| c.underlying == *underlying)
+                .count();
             info!(
                 "  {} nearest={}: {} -> {} contracts (ATM {:.0}, up {}, down {})",
-                underlying, per_underlying_n, before, after, atm_strike,
-                above_strikes.len(), below_strikes.len()
+                underlying,
+                per_underlying_n,
+                before,
+                after,
+                atm_strike,
+                above_strikes.len(),
+                below_strikes.len()
             );
         }
         contracts = filtered;
@@ -487,7 +540,9 @@ pub async fn build_options_chain(
         // Rebuild counts
         contract_count_by_underlying.clear();
         for c in &contracts {
-            *contract_count_by_underlying.entry(c.underlying.clone()).or_insert(0) += 1;
+            *contract_count_by_underlying
+                .entry(c.underlying.clone())
+                .or_insert(0) += 1;
         }
     }
 
@@ -529,13 +584,26 @@ pub fn build_options_chain_sync(
 
     let mut available_expiries: HashMap<String, Vec<String>> = HashMap::new();
     for inst in instruments {
-        if inst.segment != "NFO-OPT" { continue; }
-        if !matches!(inst.instrument_type.as_str(), "CE" | "PE") { continue; }
-        let Some(expiry) = inst.expiry.as_ref() else { continue; };
-        let Some(underlying) = config.underlyings.iter()
+        if inst.segment != "NFO-OPT" {
+            continue;
+        }
+        if !matches!(inst.instrument_type.as_str(), "CE" | "PE") {
+            continue;
+        }
+        let Some(expiry) = inst.expiry.as_ref() else {
+            continue;
+        };
+        let Some(underlying) = config
+            .underlyings
+            .iter()
             .find(|u| instrument_matches_underlying(inst, u))
-        else { continue; };
-        available_expiries.entry(underlying.clone()).or_default().push(expiry.clone());
+        else {
+            continue;
+        };
+        available_expiries
+            .entry(underlying.clone())
+            .or_default()
+            .push(expiry.clone());
     }
 
     let mut selected_expiry_by_underlying: HashMap<String, String> = HashMap::new();
@@ -543,9 +611,15 @@ pub fn build_options_chain_sync(
         let mut expiries = available_expiries.remove(underlying).unwrap_or_default();
         expiries.sort();
         expiries.dedup();
-        if expiries.is_empty() { continue; }
+        if expiries.is_empty() {
+            continue;
+        }
         let selected = if let Some(pref) = preferred_expiry {
-            if expiries.iter().any(|e| e == pref) { pref.to_string() } else { expiries[0].clone() }
+            if expiries.iter().any(|e| e == pref) {
+                pref.to_string()
+            } else {
+                expiries[0].clone()
+            }
         } else {
             expiries[0].clone()
         };
@@ -554,20 +628,34 @@ pub fn build_options_chain_sync(
 
     let mut contracts = Vec::new();
     for inst in instruments {
-        if inst.segment != "NFO-OPT" { continue; }
+        if inst.segment != "NFO-OPT" {
+            continue;
+        }
         let opt_type = match inst.instrument_type.as_str() {
             "CE" => OptionType::CE,
             "PE" => OptionType::PE,
             _ => continue,
         };
-        let Some(underlying) = config.underlyings.iter()
+        let Some(underlying) = config
+            .underlyings
+            .iter()
             .find(|u| instrument_matches_underlying(inst, u))
-        else { continue; };
-        let Some(expiry) = inst.expiry.as_ref() else { continue; };
-        let Some(selected) = selected_expiry_by_underlying.get(underlying) else { continue; };
-        if expiry != selected { continue; }
+        else {
+            continue;
+        };
+        let Some(expiry) = inst.expiry.as_ref() else {
+            continue;
+        };
+        let Some(selected) = selected_expiry_by_underlying.get(underlying) else {
+            continue;
+        };
+        if expiry != selected {
+            continue;
+        }
         if let Some(strike) = inst.strike {
-            if strike < config.strike_min || strike > config.strike_max { continue; }
+            if strike < config.strike_min || strike > config.strike_max {
+                continue;
+            }
             contracts.push(OptionContract {
                 instrument_token: inst.instrument_token,
                 tradingsymbol: inst.tradingsymbol.clone(),
@@ -653,8 +741,6 @@ mod tests {
         assert_eq!(nifty_contracts.len(), 3);
         assert!(nifty_contracts.iter().all(|c| c.expiry == "2026-02-26"));
         assert_eq!(nxt50_contracts.len(), 2);
-        assert!(nxt50_contracts
-            .iter()
-            .all(|c| c.expiry == "2026-03-05"));
+        assert!(nxt50_contracts.iter().all(|c| c.expiry == "2026-03-05"));
     }
 }

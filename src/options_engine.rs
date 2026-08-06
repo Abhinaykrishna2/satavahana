@@ -1,4 +1,3 @@
-
 use crate::config::OptionsEngineConfig;
 use crate::execution::{OrderCommand, OrderSide, OrderUpdate, PlaceOrderCmd};
 use crate::greeks::{compute_greeks, compute_time_to_expiry_at};
@@ -41,6 +40,86 @@ const RIGID_PROFIT_LOCK_GAIN_PCT: f64 = 2.0;
 const RIGID_TRAIL_ARM_PCT: f64 = 15.0;
 const RIGID_TRAIL_GIVEBACK_PCT: f64 = 50.0;
 const FEED_WATCHDOG_SECS: u64 = 15;
+
+// ── Robust risk-control layer (env-gated, master toggle SATA_ROBUST_RISK) ────────────
+// DEFAULT OFF: with SATA_ROBUST_RISK unset every mechanism below is inert and the engine
+// is byte-for-byte identical to production. When ON it makes "one loss erases many wins"
+// structurally impossible, INDEPENDENT of the entry signal, via four caps:
+//   1. Fixed-fractional sizing  — lots chosen so worst-case stop loss ≤ RISK_FRAC × capital.
+//   2. Premium deployment cap    — premium in ONE position ≤ PREMIUM_CAP_FRAC × capital
+//                                  (directly caps the 08-05 "~50% of capital in one option").
+//   3. Hard per-trade loss cap   — a position is flattened before its live net loss can
+//                                  exceed MAX_TRADE_LOSS_FRAC × capital. THIS is the invariant:
+//                                  no single trade can ever realise a loss worse than the cap.
+//   4. R:R floor at entry        — reject entries whose reward:risk < MIN_RR so wins are not
+//                                  structurally smaller than losses.
+// Each knob is an env override with a documented default; the whole layer is off unless the
+// master toggle is set, so live trading and the existing backtest are unchanged by default.
+const ROBUST_RISK_FRAC_DEFAULT: f64 = 0.02; // risk ≤ 2% of capital at the stop
+const ROBUST_PREMIUM_CAP_FRAC_DEFAULT: f64 = 0.33; // deploy ≤ 33% of capital per trade
+const ROBUST_MAX_TRADE_LOSS_FRAC_DEFAULT: f64 = 0.05; // hard flatten at 5% net loss
+const ROBUST_MIN_RR_DEFAULT: f64 = 1.2; // reward:risk floor at entry
+
+#[derive(Debug, Clone, Copy)]
+struct RobustRiskConfig {
+    enabled: bool,
+    /// Fraction of capital risked at the stop (mechanism 1). Env: SATA_RISK_FRAC.
+    risk_frac: f64,
+    /// Max fraction of capital deployed as premium in one position (mechanism 2). Env: SATA_PREMIUM_CAP_FRAC.
+    premium_cap_frac: f64,
+    /// Hard per-trade net-loss cap as a fraction of capital (mechanism 3). Env: SATA_MAX_TRADE_LOSS_FRAC.
+    max_trade_loss_frac: f64,
+    /// Minimum reward:risk accepted at entry (mechanism 4). Env: SATA_MIN_RR.
+    min_rr: f64,
+}
+
+impl RobustRiskConfig {
+    /// A fully-populated but DISABLED config (all defaults). Used by tests that want to inject
+    /// an explicit config; not referenced on the production path (constructors use `from_env`).
+    #[allow(dead_code)]
+    fn disabled() -> Self {
+        Self {
+            enabled: false,
+            risk_frac: ROBUST_RISK_FRAC_DEFAULT,
+            premium_cap_frac: ROBUST_PREMIUM_CAP_FRAC_DEFAULT,
+            max_trade_loss_frac: ROBUST_MAX_TRADE_LOSS_FRAC_DEFAULT,
+            min_rr: ROBUST_MIN_RR_DEFAULT,
+        }
+    }
+
+    /// Resolve the layer from the environment (read ONCE at engine construction, never on the
+    /// hot path). Master toggle `SATA_ROBUST_RISK` (1/true/on) enables it; each knob has an
+    /// individual override env var, clamped to a sane range.
+    fn from_env() -> Self {
+        let enabled = std::env::var("SATA_ROBUST_RISK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false);
+        let read = |key: &str, default: f64, lo: f64, hi: f64| -> f64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .unwrap_or(default)
+                .clamp(lo, hi)
+        };
+        Self {
+            enabled,
+            risk_frac: read("SATA_RISK_FRAC", ROBUST_RISK_FRAC_DEFAULT, 0.001, 0.50),
+            premium_cap_frac: read(
+                "SATA_PREMIUM_CAP_FRAC",
+                ROBUST_PREMIUM_CAP_FRAC_DEFAULT,
+                0.05,
+                1.0,
+            ),
+            max_trade_loss_frac: read(
+                "SATA_MAX_TRADE_LOSS_FRAC",
+                ROBUST_MAX_TRADE_LOSS_FRAC_DEFAULT,
+                0.005,
+                0.50,
+            ),
+            min_rr: read("SATA_MIN_RR", ROBUST_MIN_RR_DEFAULT, 0.0, 5.0),
+        }
+    }
+}
 
 /// Flat Zerodha options brokerage per EXECUTED ORDER (not per lot). Bug 5: this was
 /// baked into the per-lot cost and multiplied by lots, over-charging multi-lot orders
@@ -143,7 +222,8 @@ fn nearest_affordable_otm_idx(
     deployable_capital: f64,
     min_price: f64,
 ) -> (Option<usize>, usize) {
-    if prices.is_empty() || start_idx >= prices.len() || lot_size == 0 || deployable_capital <= 0.0 {
+    if prices.is_empty() || start_idx >= prices.len() || lot_size == 0 || deployable_capital <= 0.0
+    {
         return (None, 0);
     }
 
@@ -178,7 +258,6 @@ fn nearest_affordable_otm_idx(
     (None, checked)
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MarketRegime {
     StrongBullish,
@@ -194,13 +273,13 @@ pub enum MarketRegime {
 impl std::fmt::Display for MarketRegime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MarketRegime::StrongBullish     => write!(f, "STRONG BULL"),
-            MarketRegime::Bullish           => write!(f, "BULLISH"),
-            MarketRegime::Sideways          => write!(f, "SIDEWAYS"),
-            MarketRegime::Neutral           => write!(f, "NEUTRAL"),
-            MarketRegime::Bearish           => write!(f, "BEARISH"),
-            MarketRegime::StrongBearish     => write!(f, "STRONG BEAR"),
-            MarketRegime::PanicHighVol      => write!(f, "PANIC/HIGH-VOL"),
+            MarketRegime::StrongBullish => write!(f, "STRONG BULL"),
+            MarketRegime::Bullish => write!(f, "BULLISH"),
+            MarketRegime::Sideways => write!(f, "SIDEWAYS"),
+            MarketRegime::Neutral => write!(f, "NEUTRAL"),
+            MarketRegime::Bearish => write!(f, "BEARISH"),
+            MarketRegime::StrongBearish => write!(f, "STRONG BEAR"),
+            MarketRegime::PanicHighVol => write!(f, "PANIC/HIGH-VOL"),
             MarketRegime::ComplacencyLowVol => write!(f, "LOW-VOL"),
         }
     }
@@ -218,11 +297,11 @@ pub enum SignalAction {
 impl std::fmt::Display for SignalAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SignalAction::BuyCE       => write!(f, "BUY CE  📈"),
-            SignalAction::BuyPE       => write!(f, "BUY PE  📉"),
+            SignalAction::BuyCE => write!(f, "BUY CE  📈"),
+            SignalAction::BuyPE => write!(f, "BUY PE  📉"),
             SignalAction::BuyStraddle => write!(f, "BUY STRADDLE ⚡"),
             SignalAction::BuyStrangle => write!(f, "BUY STRANGLE 🎯"),
-            SignalAction::Hold        => write!(f, "HOLD    ⏸"),
+            SignalAction::Hold => write!(f, "HOLD    ⏸"),
         }
     }
 }
@@ -243,15 +322,15 @@ pub enum StrategyType {
 impl std::fmt::Display for StrategyType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StrategyType::GammaScalp        => write!(f, "Gamma Scalp (0-2 DTE)"),
-            StrategyType::IVExpansion       => write!(f, "IV Expansion (Event)"),
-            StrategyType::SpotReversal      => write!(f, "Spot Reversal Break"),
-            StrategyType::TrendFollow       => write!(f, "Trend Follow + OI"),
+            StrategyType::GammaScalp => write!(f, "Gamma Scalp (0-2 DTE)"),
+            StrategyType::IVExpansion => write!(f, "IV Expansion (Event)"),
+            StrategyType::SpotReversal => write!(f, "Spot Reversal Break"),
+            StrategyType::TrendFollow => write!(f, "Trend Follow + OI"),
             StrategyType::MaxPainConvergence => write!(f, "Max Pain Gravity"),
-            StrategyType::OIDivergence      => write!(f, "OI Divergence Flow"),
-            StrategyType::IVSkewReversion   => write!(f, "IV Skew Reversion"),
-            StrategyType::GEXPlay           => write!(f, "GEX Dealer Flow"),
-            StrategyType::Composite         => write!(f, "Composite Multi-Signal"),
+            StrategyType::OIDivergence => write!(f, "OI Divergence Flow"),
+            StrategyType::IVSkewReversion => write!(f, "IV Skew Reversion"),
+            StrategyType::GEXPlay => write!(f, "GEX Dealer Flow"),
+            StrategyType::Composite => write!(f, "Composite Multi-Signal"),
         }
     }
 }
@@ -273,8 +352,13 @@ fn should_block_zero_dte_flow(
 ) -> bool {
     let opening_range_conflicts = matches!(
         (desired, opening_range),
-        (crate::technicals::Direction::Bull, Some(crate::technicals::Direction::Bear))
-            | (crate::technicals::Direction::Bear, Some(crate::technicals::Direction::Bull))
+        (
+            crate::technicals::Direction::Bull,
+            Some(crate::technicals::Direction::Bear)
+        ) | (
+            crate::technicals::Direction::Bear,
+            Some(crate::technicals::Direction::Bull)
+        )
     );
     days_to_expiry < 0.5
         && (observed < 3
@@ -304,6 +388,25 @@ fn far_dte_composite_is_late_rsi_chase(action: SignalAction, rsi: f64) -> bool {
     }
 }
 
+fn far_dte_composite_stop_floor(
+    days_to_expiry: f64,
+    score: f64,
+    confidence_floor: f64,
+    strategy: StrategyType,
+    regime: MarketRegime,
+    regime_stop_pct: f64,
+) -> f64 {
+    if days_to_expiry > FAR_DTE_COMPOSITE_MIN_DTE
+        && score >= confidence_floor + 15.0
+        && strategy == StrategyType::Composite
+        && matches!(regime, MarketRegime::StrongBullish | MarketRegime::StrongBearish)
+    {
+        regime_stop_pct * 1.5
+    } else {
+        12.0
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SessionPhase {
     PreOpen,
@@ -318,13 +421,13 @@ pub enum SessionPhase {
 impl std::fmt::Display for SessionPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SessionPhase::PreOpen      => write!(f, "Pre-Open"),
-            SessionPhase::OpeningBell  => write!(f, "Opening Bell"),
-            SessionPhase::Morning      => write!(f, "Morning"),
-            SessionPhase::Midday       => write!(f, "Midday"),
-            SessionPhase::Afternoon    => write!(f, "Afternoon"),
-            SessionPhase::Closing      => write!(f, "CLOSING — EXIT ONLY"),
-            SessionPhase::AfterMarket  => write!(f, "After Market"),
+            SessionPhase::PreOpen => write!(f, "Pre-Open"),
+            SessionPhase::OpeningBell => write!(f, "Opening Bell"),
+            SessionPhase::Morning => write!(f, "Morning"),
+            SessionPhase::Midday => write!(f, "Midday"),
+            SessionPhase::Afternoon => write!(f, "Afternoon"),
+            SessionPhase::Closing => write!(f, "CLOSING — EXIT ONLY"),
+            SessionPhase::AfterMarket => write!(f, "After Market"),
         }
     }
 }
@@ -348,7 +451,11 @@ enum FeedAction {
 
 /// Decide what to do based on how long since the last live tick. Pure, so the policy can be
 /// tested without a socket. Outside market hours a quiet feed is expected and never an incident.
-fn feed_stale_action(feed_age_ms: u64, in_market_hours: bool, has_open_position: bool) -> FeedAction {
+fn feed_stale_action(
+    feed_age_ms: u64,
+    in_market_hours: bool,
+    has_open_position: bool,
+) -> FeedAction {
     if !in_market_hours {
         return FeedAction::Normal;
     }
@@ -534,7 +641,8 @@ struct PendingExitOrder {
 
 impl PendingExitOrder {
     fn remaining_quantity(&self) -> u32 {
-        self.total_quantity.saturating_sub(self.total_filled_quantity)
+        self.total_quantity
+            .saturating_sub(self.total_filled_quantity)
     }
 
     fn avg_fill_price(&self) -> Option<f64> {
@@ -603,11 +711,11 @@ enum CancelReasonKind {
 impl CancelReasonKind {
     fn as_str(self) -> &'static str {
         match self {
-            CancelReasonKind::Timeout           => "timeout",
-            CancelReasonKind::PriceReversal     => "price reversal",
+            CancelReasonKind::Timeout => "timeout",
+            CancelReasonKind::PriceReversal => "price reversal",
             CancelReasonKind::ScanDirectionFlip => "scan direction flip",
             CancelReasonKind::ScanScoreCollapse => "scan score collapse",
-            CancelReasonKind::FeedStale         => "feed stale",
+            CancelReasonKind::FeedStale => "feed stale",
         }
     }
 }
@@ -633,7 +741,6 @@ struct RollingSpotStats {
     sample_count: usize,
 }
 
-
 struct RiskEngine {
     capital: f64,
     initial_capital: f64,
@@ -646,10 +753,17 @@ struct RiskEngine {
     max_daily_loss_fraction: f64,
     max_daily_profit_fraction: f64,
     kelly_scale: f64,
+    /// Robust risk-control layer (env-gated; disabled by default). Governs fixed-fractional
+    /// sizing and the premium-deployment cap inside `size_lots`.
+    robust: RobustRiskConfig,
 }
 
 impl RiskEngine {
-    fn new(initial_capital: f64, max_daily_loss_fraction: f64, max_daily_profit_fraction: f64) -> Self {
+    fn new(
+        initial_capital: f64,
+        max_daily_loss_fraction: f64,
+        max_daily_profit_fraction: f64,
+    ) -> Self {
         Self {
             capital: initial_capital,
             initial_capital,
@@ -662,6 +776,7 @@ impl RiskEngine {
             max_daily_loss_fraction: max_daily_loss_fraction.clamp(0.01, 0.95),
             max_daily_profit_fraction: max_daily_profit_fraction.clamp(0.01, 5.0),
             kelly_scale: 0.5,
+            robust: RobustRiskConfig::from_env(),
         }
     }
 
@@ -685,16 +800,18 @@ impl RiskEngine {
             avg_win / avg_loss.max(0.01)
         };
         let full_kelly = ((p * b) - q) / b;
-        (full_kelly * self.kelly_scale)
-            .max(0.08)
-            .min(0.38)
+        (full_kelly * self.kelly_scale).max(0.08).min(0.38)
     }
 
     fn capital_tier(&self) -> u8 {
         let capital = self.available_capital();
-        if capital < 12_000.0 { 1 }
-        else if capital < 30_000.0 { 2 }
-        else { 3 }
+        if capital < 12_000.0 {
+            1
+        } else if capital < 30_000.0 {
+            2
+        } else {
+            3
+        }
     }
 
     fn size_lots(&self, option_price: f64, lot_size: u32, stop_loss_pct: f64) -> u32 {
@@ -705,26 +822,65 @@ impl RiskEngine {
         // against larger orders.
         let cost_per_lot = option_price * lot_size as f64
             + entry_cost_per_lot_excl_brokerage(option_price, lot_size);
-        if cost_per_lot <= 0.0 { return 0; }
+        if cost_per_lot <= 0.0 {
+            return 0;
+        }
         let deployable = (sizing_capital - options_brokerage_per_order()).max(0.0);
         let affordable = (deployable / cost_per_lot).floor() as u32;
-        if affordable == 0 { return 0; }
+        if affordable == 0 {
+            return 0;
+        }
 
         let kelly = self.kelly_fraction();
         let max_risk_capital = self.daily_start_capital * kelly;
         let risk_per_lot = (stop_loss_pct * option_price * lot_size as f64).max(1.0);
         let lots_from_risk = (max_risk_capital / risk_per_lot).floor() as u32;
 
-        let lots_from_exposure =
-            (deployable * (kelly * ENTRY_EXPOSURE_KELLY_MULT).min(0.95) / cost_per_lot)
-                .floor() as u32;
+        let lots_from_exposure = (deployable * (kelly * ENTRY_EXPOSURE_KELLY_MULT).min(0.95)
+            / cost_per_lot)
+            .floor() as u32;
 
         // STRICT half-Kelly: NO `.max(1)` floor. If one lot's stop-risk exceeds the
         // half-Kelly budget (`lots_from_risk == 0`), return 0 → the caller SKIPS the
         // trade rather than forcing an oversized bet. Consequence (by design): on
         // wide-stop / low-conviction days the options engine takes NO trade — a no-trade
         // day is correct behavior here, not a bug.
-        lots_from_risk.min(lots_from_exposure).min(4).min(affordable)
+        let base = lots_from_risk
+            .min(lots_from_exposure)
+            .min(4)
+            .min(affordable);
+
+        // DEFAULT-OFF: without the master toggle the result above is returned unchanged, so
+        // production sizing is byte-for-byte identical.
+        if !self.robust.enabled {
+            return base;
+        }
+
+        // ── ROBUST RISK LAYER ────────────────────────────────────────────────────────────
+        // Mechanism 1 — fixed-fractional sizing. Size so the worst-case stop loss (premium
+        // only) is at most RISK_FRAC × capital:
+        //   lots ≤ floor( RISK_FRAC × capital / ((entry − stop) × lot_size) )
+        // where (entry − stop) = stop_loss_pct × entry.
+        let risk_budget = self.robust.risk_frac * sizing_capital;
+        let risk_per_lot_premium = (stop_loss_pct * option_price * lot_size as f64).max(1.0);
+        let lots_from_frac_risk = (risk_budget / risk_per_lot_premium).floor() as u32;
+
+        // Mechanism 2 — premium deployment cap. Deploy at most PREMIUM_CAP_FRAC × capital of
+        // premium in one position: lots ≤ floor( PREMIUM_CAP_FRAC × capital / (entry × lot_size) ).
+        let premium_budget = self.robust.premium_cap_frac * sizing_capital;
+        let premium_per_lot = (option_price * lot_size as f64).max(1.0);
+        let lots_from_premium_cap = (premium_budget / premium_per_lot).floor() as u32;
+
+        let mut lots = base.min(lots_from_frac_risk).min(lots_from_premium_cap);
+
+        // If the fixed-fractional budget cannot fund even one lot, allow a SINGLE lot only if
+        // that one-lot premium still fits the deployment cap (the hard cap); otherwise SKIP.
+        // The mechanism-3 rupee cap (in check_open_positions) is the backstop that guarantees
+        // such a single lot can still never lose more than MAX_TRADE_LOSS_FRAC × capital.
+        if lots == 0 && affordable >= 1 && premium_per_lot <= premium_budget {
+            lots = 1;
+        }
+        lots
     }
 
     fn max_one_lot_entry_cost_by_exposure(&self) -> f64 {
@@ -788,7 +944,6 @@ impl RiskEngine {
     }
 }
 
-
 struct IVHistory {
     data: HashMap<String, VecDeque<(u64, f64)>>,
     max_samples: usize,
@@ -830,38 +985,44 @@ impl IVHistory {
     }
 }
 
-
 fn session_phase_ist_from_ms(timestamp_ms: u64) -> SessionPhase {
     let now_utc: DateTime<Utc> = Utc
         .timestamp_millis_opt(timestamp_ms as i64)
         .single()
         .unwrap_or_else(Utc::now);
-    let ist_offset = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60)
-        .expect("valid IST offset");
+    let ist_offset = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
     let now_ist = now_utc.with_timezone(&ist_offset);
     let h = now_ist.hour();
     let m = now_ist.minute();
     let mins = h * 60 + m;
 
     match mins {
-        0..=539          => SessionPhase::PreOpen,
-        540..=554        => SessionPhase::PreOpen,
-        555..=569        => SessionPhase::OpeningBell,
-        570..=719        => SessionPhase::Morning,
-        720..=839        => SessionPhase::Midday,
-        840..=914        => SessionPhase::Afternoon,
-        915..=929        => SessionPhase::Closing,
-        _                => SessionPhase::AfterMarket,
+        0..=539 => SessionPhase::PreOpen,
+        540..=554 => SessionPhase::PreOpen,
+        555..=569 => SessionPhase::OpeningBell,
+        570..=719 => SessionPhase::Morning,
+        720..=839 => SessionPhase::Midday,
+        840..=914 => SessionPhase::Afternoon,
+        915..=929 => SessionPhase::Closing,
+        _ => SessionPhase::AfterMarket,
     }
 }
 
 fn datetime_string_from_ms(timestamp_ms: u64) -> String {
-    let ist_offset = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60)
-        .expect("valid IST offset");
+    let ist_offset = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
     Utc.timestamp_millis_opt(timestamp_ms as i64)
         .single()
-        .map(|dt| dt.with_timezone(&ist_offset).format("%Y-%m-%d %H:%M:%S").to_string())
-        .unwrap_or_else(|| Utc::now().with_timezone(&ist_offset).format("%Y-%m-%d %H:%M:%S").to_string())
+        .map(|dt| {
+            dt.with_timezone(&ist_offset)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|| {
+            Utc::now()
+                .with_timezone(&ist_offset)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
 }
 
 fn now_ms() -> u64 {
@@ -871,18 +1032,20 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-
 fn compute_max_pain(strikes: &[StrikeLevel]) -> f64 {
     let candidate_strikes: Vec<f64> = strikes.iter().map(|s| s.strike).collect();
     let mut min_pain = f64::INFINITY;
     let mut max_pain_strike = candidate_strikes.first().cloned().unwrap_or(0.0);
 
     for &k in &candidate_strikes {
-        let pain: f64 = strikes.iter().map(|s| {
-            let ce_pain = (k - s.strike).max(0.0) * s.ce_oi as f64;
-            let pe_pain = (s.strike - k).max(0.0) * s.pe_oi as f64;
-            ce_pain + pe_pain
-        }).sum();
+        let pain: f64 = strikes
+            .iter()
+            .map(|s| {
+                let ce_pain = (k - s.strike).max(0.0) * s.ce_oi as f64;
+                let pe_pain = (s.strike - k).max(0.0) * s.pe_oi as f64;
+                ce_pain + pe_pain
+            })
+            .sum();
 
         if pain < min_pain {
             min_pain = pain;
@@ -893,13 +1056,15 @@ fn compute_max_pain(strikes: &[StrikeLevel]) -> f64 {
 }
 
 fn compute_gex(strikes: &[StrikeLevel], spot: f64, lot_size: u32) -> f64 {
-    strikes.iter().map(|s| {
-        let ce_gex = s.ce_gamma * s.ce_oi as f64;
-        let pe_gex = s.pe_gamma * s.pe_oi as f64;
-        (ce_gex - pe_gex) * spot * lot_size as f64
-    }).sum()
+    strikes
+        .iter()
+        .map(|s| {
+            let ce_gex = s.ce_gamma * s.ce_oi as f64;
+            let pe_gex = s.pe_gamma * s.pe_oi as f64;
+            (ce_gex - pe_gex) * spot * lot_size as f64
+        })
+        .sum()
 }
-
 
 pub struct OptionsEngine {
     contracts: Vec<OptionContract>,
@@ -995,6 +1160,26 @@ pub struct OptionsEngine {
     shared_circuit: Option<crate::portfolio::SharedCircuit>,
     /// Per-underlying spot price-action series → technical directional gate.
     spot_series: std::collections::HashMap<String, crate::technicals::SpotSeries>,
+
+    // ── Exit-on-thesis-reversal (env-gated, DEFAULT OFF) ────────────────────
+    // When enabled, an open position is closed at market once its ENTRY directional
+    // thesis (BuyCE=bullish / BuyPE=bearish) is CONTRADICTED by the current spot
+    // technical bias for `reversal_confirm_scans` consecutive scans at or above
+    // `reversal_min_strength`. Default OFF ⇒ live behaviour and all existing tests
+    // are byte-for-byte unchanged. Toggles: SATA_EXIT_ON_REVERSAL / _CONFIRM_SCANS /
+    // _MIN_STRENGTH.
+    exit_on_reversal: bool,
+    reversal_confirm_scans: u32,
+    reversal_min_strength: f64,
+    /// Per-position reversal confirmation tracker: pos-id → (last-evaluated scan, count).
+    /// The bias only refreshes on a scan, but check_open_positions runs every tick, so the
+    /// counter is advanced at most once per scan. Empty (and untouched) when the toggle is OFF.
+    reversal_state: HashMap<u64, (u64, u32)>,
+
+    // ── Robust risk-control layer (env-gated, master toggle SATA_ROBUST_RISK, DEFAULT OFF).
+    // Same instance the RiskEngine holds; used here for the entry R:R floor (mechanism 4) and
+    // the hard per-trade rupee-loss cap flatten (mechanism 3) in check_open_positions.
+    robust_risk: RobustRiskConfig,
 }
 
 impl OptionsEngine {
@@ -1033,12 +1218,44 @@ impl OptionsEngine {
         let option_tokens = contracts.iter().map(|c| c.instrument_token).collect();
         let max_daily_loss_fraction = (cfg.max_daily_loss_pct / 100.0).clamp(0.01, 0.95);
         let max_daily_profit_fraction = (cfg.max_daily_profit_pct / 100.0).clamp(0.01, 5.0);
-        let journal = OptionsJournal::new(log_dir, initial_capital, replay_date)
-            .unwrap_or_else(|e| {
+        let journal =
+            OptionsJournal::new(log_dir, initial_capital, replay_date).unwrap_or_else(|e| {
                 warn!("Failed to open options journal in '{}': {}", log_dir, e);
                 OptionsJournal::new(".", initial_capital, None)
                     .expect("Could not open options journal even in current directory")
             });
+        // Env-gated exit-on-thesis-reversal knobs (DEFAULT OFF — live/tests unchanged).
+        let exit_on_reversal = std::env::var("SATA_EXIT_ON_REVERSAL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false);
+        let reversal_confirm_scans = std::env::var("SATA_REVERSAL_CONFIRM_SCANS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(2)
+            .max(1);
+        let reversal_min_strength = std::env::var("SATA_REVERSAL_MIN_STRENGTH")
+            .ok()
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .unwrap_or(0.5)
+            .clamp(0.0, 1.0);
+        if exit_on_reversal {
+            info!(
+                "  Exit-on-reversal ENABLED: confirm {} scans, min bias strength {:.0}%",
+                reversal_confirm_scans,
+                reversal_min_strength * 100.0
+            );
+        }
+        // Robust risk-control layer (env-gated, DEFAULT OFF — live/tests unchanged unless set).
+        let robust_risk = RobustRiskConfig::from_env();
+        if robust_risk.enabled {
+            info!(
+                "  ROBUST RISK ENABLED: risk/trade {:.1}% of capital, premium cap {:.0}%, hard loss cap {:.1}%, min R:R {:.2}",
+                robust_risk.risk_frac * 100.0,
+                robust_risk.premium_cap_frac * 100.0,
+                robust_risk.max_trade_loss_frac * 100.0,
+                robust_risk.min_rr,
+            );
+        }
         Self {
             contracts,
             store,
@@ -1046,7 +1263,11 @@ impl OptionsEngine {
             iv_history: IVHistory::new(),
             spot_history: HashMap::new(),
             prev_oi: HashMap::new(),
-            risk: RiskEngine::new(initial_capital, max_daily_loss_fraction, max_daily_profit_fraction),
+            risk: RiskEngine::new(
+                initial_capital,
+                max_daily_loss_fraction,
+                max_daily_profit_fraction,
+            ),
             journal,
             positions: Vec::new(),
             next_pos_id: 1,
@@ -1067,7 +1288,11 @@ impl OptionsEngine {
             warmup_until_ms: None,
             scan_interval_secs: cfg.scan_interval_secs.max(1),
             // 0 = unlimited (rely on the daily P&L circuits instead of a count cap).
-            max_daily_trades: if cfg.max_daily_trades == 0 { u32::MAX } else { cfg.max_daily_trades.min(50) },
+            max_daily_trades: if cfg.max_daily_trades == 0 {
+                u32::MAX
+            } else {
+                cfg.max_daily_trades.min(50)
+            },
             execution_buy_offset_inr: 0.0,
             execution_sell_offset_inr: 0.0,
             signals_generated: 0,
@@ -1104,6 +1329,11 @@ impl OptionsEngine {
             log_dir: log_dir.to_string(),
             shared_circuit: None,
             spot_series: std::collections::HashMap::new(),
+            exit_on_reversal,
+            reversal_confirm_scans,
+            reversal_min_strength,
+            reversal_state: HashMap::new(),
+            robust_risk,
         }
     }
 
@@ -1121,8 +1351,7 @@ impl OptionsEngine {
     }
 
     fn current_day_ist(&self) -> String {
-        let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60)
-            .expect("valid IST offset");
+        let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
         Utc.timestamp_millis_opt(self.current_time_ms() as i64)
             .single()
             .unwrap_or_else(Utc::now)
@@ -1203,7 +1432,8 @@ impl OptionsEngine {
         }
 
         let scan_interval_ms = self.scan_interval_secs.saturating_mul(1_000);
-        let should_scan = self.replay_last_scan_ms
+        let should_scan = self
+            .replay_last_scan_ms
             .map(|last| timestamp_ms.saturating_sub(last) >= scan_interval_ms)
             .unwrap_or(true);
         if should_scan {
@@ -1437,11 +1667,19 @@ impl OptionsEngine {
     }
 
     fn handle_order_update(&mut self, update: OrderUpdate) {
-        if let Some(idx) = self.pending_entry_orders.iter().position(|p| p.tag == update.tag) {
+        if let Some(idx) = self
+            .pending_entry_orders
+            .iter()
+            .position(|p| p.tag == update.tag)
+        {
             self.handle_entry_order_update(idx, update);
             return;
         }
-        if let Some(idx) = self.pending_exit_orders.iter().position(|p| p.tag == update.tag) {
+        if let Some(idx) = self
+            .pending_exit_orders
+            .iter()
+            .position(|p| p.tag == update.tag)
+        {
             self.handle_exit_order_update(idx, update);
             return;
         }
@@ -1460,12 +1698,22 @@ impl OptionsEngine {
 
     /// Close a position whose exit order filled but whose pending record was already gone.
     fn reconcile_orphaned_exit_fill(&mut self, update: &OrderUpdate) {
-        let status = update.status.as_deref().unwrap_or_default().to_ascii_uppercase();
+        let status = update
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
         if status != "COMPLETE" || update.filled_quantity.unwrap_or(0) == 0 {
             return;
         }
-        let Some(pos_id) = self.pos_id_from_exit_tag(&update.tag) else { return; };
-        let Some(pos_idx) = self.positions.iter().position(|p| p.id == pos_id && p.is_open) else {
+        let Some(pos_id) = self.pos_id_from_exit_tag(&update.tag) else {
+            return;
+        };
+        let Some(pos_idx) = self
+            .positions
+            .iter()
+            .position(|p| p.id == pos_id && p.is_open)
+        else {
             return;
         };
         let avg_price = update
@@ -1476,7 +1724,11 @@ impl OptionsEngine {
             "Reconciled orphaned exit fill tag={} pos_id={} avg=₹{:.2} — closing position (pending record was gone)",
             update.tag, pos_id, avg_price
         );
-        self.finalize_position_close(pos_idx, avg_price, "EXIT (reconciled orphan fill)".to_string());
+        self.finalize_position_close(
+            pos_idx,
+            avg_price,
+            "EXIT (reconciled orphan fill)".to_string(),
+        );
     }
 
     fn handle_entry_order_update(&mut self, idx: usize, update: OrderUpdate) {
@@ -1545,7 +1797,8 @@ impl OptionsEngine {
                     self.pending_entry_orders[idx].cancel_reason.map(|r| r.as_str()).unwrap_or("?"),
                     update.tag, avg_price
                 );
-                if self.pending_entry_orders[idx].cancel_reason == Some(CancelReasonKind::FeedStale) {
+                if self.pending_entry_orders[idx].cancel_reason == Some(CancelReasonKind::FeedStale)
+                {
                     self.flatten_feed_stale_filled_entry(idx, avg_price);
                 } else {
                     self.flatten_stale_filled_entry(idx, avg_price);
@@ -1555,7 +1808,7 @@ impl OptionsEngine {
             }
         } else if is_terminal_reject {
             let filled_qty = update.filled_quantity.unwrap_or(0);
-            let avg_price  = update.average_price.unwrap_or(0.0);
+            let avg_price = update.average_price.unwrap_or(0.0);
 
             if filled_qty > 0 {
                 // Partial fill before cancel: we own `filled_qty` lots at the broker
@@ -1605,7 +1858,11 @@ impl OptionsEngine {
                 "Entry order {} — cancel reason: {}{}",
                 status_upper,
                 cancel_reason_str,
-                if filled_qty > 0 { " (partial fill — emergency exit placed)" } else { "" }
+                if filled_qty > 0 {
+                    " (partial fill — emergency exit placed)"
+                } else {
+                    ""
+                }
             );
             self.release_pending_entry(idx, true, &reason);
         }
@@ -1632,7 +1889,10 @@ impl OptionsEngine {
                     return;
                 }
                 "cancel_error" => {
-                    warn!("Exit order {} cancel failed (will retry): {}", update.tag, msg);
+                    warn!(
+                        "Exit order {} cancel failed (will retry): {}",
+                        update.tag, msg
+                    );
                     return;
                 }
                 "status_error" => {
@@ -1642,10 +1902,15 @@ impl OptionsEngine {
             }
         }
         let status = update.status.unwrap_or_default();
-        if status.is_empty() { return; }
+        if status.is_empty() {
+            return;
+        }
         let status_upper = status.to_ascii_uppercase();
         let is_complete = status_upper == "COMPLETE";
-        let is_terminal_reject = status_upper == "REJECTED" || status_upper == "CANCELLED" || status_upper == "CANCELED" || status_upper == "EXPIRED";
+        let is_terminal_reject = status_upper == "REJECTED"
+            || status_upper == "CANCELLED"
+            || status_upper == "CANCELED"
+            || status_upper == "EXPIRED";
 
         if is_complete {
             let Some(pending) = self.pending_exit_orders.get(idx).cloned() else {
@@ -1699,7 +1964,9 @@ impl OptionsEngine {
     }
 
     fn poll_pending_orders(&mut self) {
-        if !self.live_mode_enabled() || (self.pending_entry_orders.is_empty() && self.pending_exit_orders.is_empty()) {
+        if !self.live_mode_enabled()
+            || (self.pending_entry_orders.is_empty() && self.pending_exit_orders.is_empty())
+        {
             return;
         }
         // Give a limit exit a brief chance to cross naturally, then cancel it and
@@ -1723,7 +1990,10 @@ impl OptionsEngine {
                     status_tags.push(pending.tag.clone());
                     warn!(
                         "Cancel retry [{}] tag={} — awaiting broker confirmation",
-                        pending.cancel_reason.map(|r| r.as_str()).unwrap_or("unknown"),
+                        pending
+                            .cancel_reason
+                            .map(|r| r.as_str())
+                            .unwrap_or("unknown"),
                         pending.tag
                     );
                 }
@@ -1769,7 +2039,8 @@ impl OptionsEngine {
             }
 
             // 3. Regular status poll.
-            if now.saturating_sub(pending.last_status_poll_ms) >= self.order_status_poll_interval_ms {
+            if now.saturating_sub(pending.last_status_poll_ms) >= self.order_status_poll_interval_ms
+            {
                 pending.last_status_poll_ms = now;
                 status_tags.push(pending.tag.clone());
             }
@@ -1783,8 +2054,7 @@ impl OptionsEngine {
                     status_tags.push(pending.tag.clone());
                     warn!(
                         "Exit cancel retry [{}] tag={} — awaiting broker confirmation",
-                        pending.reason,
-                        pending.tag
+                        pending.reason, pending.tag
                     );
                 }
                 continue;
@@ -1805,7 +2075,8 @@ impl OptionsEngine {
                 continue;
             }
 
-            if now.saturating_sub(pending.last_status_poll_ms) >= self.order_status_poll_interval_ms {
+            if now.saturating_sub(pending.last_status_poll_ms) >= self.order_status_poll_interval_ms
+            {
                 pending.last_status_poll_ms = now;
                 status_tags.push(pending.tag.clone());
             }
@@ -1876,16 +2147,17 @@ impl OptionsEngine {
                     crate::portfolio::release(c, "options");
                 }
             }
-        } else if let Some(pos_idx) = self
-            .positions
-            .iter()
-            .position(|p| p.id == pending.pos_id)
-        {
+        } else if let Some(pos_idx) = self.positions.iter().position(|p| p.id == pending.pos_id) {
             self.finalize_position_close(pos_idx, avg_price, pending.reason);
         }
     }
 
-    fn handle_failed_exit(&mut self, pending: PendingExitOrder, status_upper: &str, reject_msg: Option<&str>) {
+    fn handle_failed_exit(
+        &mut self,
+        pending: PendingExitOrder,
+        status_upper: &str,
+        reject_msg: Option<&str>,
+    ) {
         let is_untracked = Self::is_untracked_exit_reason(&pending.reason);
 
         if pending.total_filled_quantity >= pending.total_quantity && pending.total_quantity > 0 {
@@ -2017,7 +2289,10 @@ impl OptionsEngine {
         if idx >= self.pending_entry_orders.len() {
             return;
         }
-        warn!("Stale entry filled late | avg={:.2} -> opening Position and initiating tracking exit", broker_avg_price);
+        warn!(
+            "Stale entry filled late | avg={:.2} -> opening Position and initiating tracking exit",
+            broker_avg_price
+        );
         if self.promote_filled_entry(idx, broker_avg_price) {
             let new_idx = self.positions.len().saturating_sub(1);
             self.close_position_at(new_idx, broker_avg_price, "STALE FLATTEN".to_string());
@@ -2042,7 +2317,11 @@ impl OptionsEngine {
             .map(|p| p.option_token)
             .collect();
         for tick in &event.ticks {
-            if self.underlying_tokens.values().any(|token| *token == tick.token) {
+            if self
+                .underlying_tokens
+                .values()
+                .any(|token| *token == tick.token)
+            {
                 self.last_underlying_tick_ms = now;
             }
             if self.option_tokens.contains(&tick.token) {
@@ -2107,7 +2386,10 @@ impl OptionsEngine {
             status_tags.push(pending.tag.clone());
         }
         for tag in cancel_tags {
-            warn!("Feed stale — cancelling pending limit exit {} before MARKET fallback", tag);
+            warn!(
+                "Feed stale — cancelling pending limit exit {} before MARKET fallback",
+                tag
+            );
             self.send_order_command(OrderCommand::CancelByTag { tag: tag.clone() });
         }
         for tag in status_tags {
@@ -2143,7 +2425,10 @@ impl OptionsEngine {
         }
 
         if !self.feed_halted {
-            warn!("Feed stale {}s — halting new entries until verified recovery", feed_age / 1000);
+            warn!(
+                "Feed stale {}s — halting new entries until verified recovery",
+                feed_age / 1000
+            );
         }
         self.feed_halted = true;
         self.feed_recovery_started_ms = None;
@@ -2176,10 +2461,7 @@ impl OptionsEngine {
         )
     }
 
-    pub fn spawn(
-        mut self,
-        mut rx: broadcast::Receiver<TickEvent>,
-    ) -> tokio::task::JoinHandle<()> {
+    pub fn spawn(mut self, mut rx: broadcast::Receiver<TickEvent>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
             info!("  OPTIONS SIGNAL ENGINE — ACTIVE");
@@ -2187,18 +2469,23 @@ impl OptionsEngine {
             info!("  Profit target: {:.0}% | Stop: {:.0}% | Min confidence: {:.0} | Expiry gamma floor: {:.0}",
                 self.profit_target_pct, self.stop_loss_pct, self.min_confidence, self.expiry_day_min_confidence);
             info!("  Scan interval: {}s", self.scan_interval_secs);
-            info!("  Max daily trades: {}", if self.max_daily_trades == u32::MAX { "unlimited (P&L circuits only)".to_string() } else { self.max_daily_trades.to_string() });
+            info!(
+                "  Max daily trades: {}",
+                if self.max_daily_trades == u32::MAX {
+                    "unlimited (P&L circuits only)".to_string()
+                } else {
+                    self.max_daily_trades.to_string()
+                }
+            );
             info!("  Strategies: GammaScalp | IVExpansion | TrendFollow | MaxPain | OIDivergence | GEX");
             info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
-            let mut scan_timer = tokio::time::interval(
-                tokio::time::Duration::from_secs(self.scan_interval_secs)
-            );
+            let mut scan_timer =
+                tokio::time::interval(tokio::time::Duration::from_secs(self.scan_interval_secs));
 
             // Wall-clock backstop for feed staleness; socket control events take the fast path.
-            let mut feed_watchdog = tokio::time::interval(
-                tokio::time::Duration::from_secs(FEED_WATCHDOG_SECS)
-            );
+            let mut feed_watchdog =
+                tokio::time::interval(tokio::time::Duration::from_secs(FEED_WATCHDOG_SECS));
             feed_watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             // Capital refresh: every hour + after every trade close.
@@ -2328,7 +2615,8 @@ impl OptionsEngine {
                 }
             };
             if snap.atm_iv > 0.01 {
-                self.iv_history.push(&snap.underlying.clone(), snap.timestamp_ms, snap.atm_iv);
+                self.iv_history
+                    .push(&snap.underlying.clone(), snap.timestamp_ms, snap.atm_iv);
             }
             if self.scan_count % 5 == 1 {
                 self.log_chain_analysis(&snap);
@@ -2354,7 +2642,8 @@ impl OptionsEngine {
         // Hard entry cutoff: no new position entries after 15:00 IST.
         // Afternoon phase runs until 15:14, so we must check IST time explicitly.
         let ist_mins = {
-            let now_utc = Utc.timestamp_millis_opt(self.current_time_ms() as i64)
+            let now_utc = Utc
+                .timestamp_millis_opt(self.current_time_ms() as i64)
                 .single()
                 .unwrap_or_else(Utc::now);
             let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
@@ -2362,15 +2651,23 @@ impl OptionsEngine {
             now_ist.hour() * 60 + now_ist.minute()
         };
         let past_entry_cutoff = ist_mins >= 900; // 15:00 IST = 900 mins from midnight
-        if past_entry_cutoff && !matches!(session, SessionPhase::Closing | SessionPhase::AfterMarket) {
-            warn!("Entry cutoff: no new signals after 15:00 IST (current IST {:02}:{:02})",
-                ist_mins / 60, ist_mins % 60);
+        if past_entry_cutoff
+            && !matches!(session, SessionPhase::Closing | SessionPhase::AfterMarket)
+        {
+            warn!(
+                "Entry cutoff: no new signals after 15:00 IST (current IST {:02}:{:02})",
+                ist_mins / 60,
+                ist_mins % 60
+            );
         }
 
         let mut pending_batch: Vec<(Signal, usize)> = Vec::new();
 
         let now_ms = self.current_time_ms();
-        if !circuit_broken && !past_entry_cutoff && !matches!(session, SessionPhase::OpeningBell | SessionPhase::Closing) {
+        if !circuit_broken
+            && !past_entry_cutoff
+            && !matches!(session, SessionPhase::OpeningBell | SessionPhase::Closing)
+        {
             for (snap_idx, snap) in snapshots.iter().enumerate() {
                 if past_entry_cutoff_ist(ist_mins, snap.days_to_expiry) {
                     let cutoff = entry_cutoff_ist_mins_for_dte(snap.days_to_expiry);
@@ -2383,11 +2680,14 @@ impl OptionsEngine {
                         ist_mins / 60,
                         ist_mins % 60
                     );
-                    self.last_scan_result.insert(snap.underlying.clone(), LastScanResult {
-                        action: SignalAction::Hold,
-                        best_score: 0.0,
-                        scanned_at_ms: now_ms,
-                    });
+                    self.last_scan_result.insert(
+                        snap.underlying.clone(),
+                        LastScanResult {
+                            action: SignalAction::Hold,
+                            best_score: 0.0,
+                            scanned_at_ms: now_ms,
+                        },
+                    );
                     continue;
                 }
 
@@ -2395,28 +2695,38 @@ impl OptionsEngine {
                 let best_score = signals.iter().map(|s| s.confidence).fold(0.0_f64, f64::max);
                 // Dominant action: take from the highest-scoring signal (all signals from one
                 // scan share the same dominant direction; Hold means no signal fired).
-                let dominant_action = signals.iter()
-                    .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap_or(std::cmp::Ordering::Equal))
+                let dominant_action = signals
+                    .iter()
+                    .max_by(|a, b| {
+                        a.confidence
+                            .partial_cmp(&b.confidence)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .map(|s| s.action)
                     .unwrap_or(SignalAction::Hold);
                 let regular_floor = self.min_confidence;
                 let admission_threshold_for = |signal: &Signal| {
                     let base = regular_floor;
                     if matches!(session, SessionPhase::Midday)
-                        && !(signal.strategy == StrategyType::GammaScalp && snap.days_to_expiry < 0.5)
+                        && !(signal.strategy == StrategyType::GammaScalp
+                            && snap.days_to_expiry < 0.5)
                     {
                         base.max(70.0)
                     } else {
                         base
                     }
                 };
-                self.last_scan_result.insert(snap.underlying.clone(), LastScanResult {
-                    action: dominant_action,
-                    best_score,
-                    scanned_at_ms: now_ms,
-                });
+                self.last_scan_result.insert(
+                    snap.underlying.clone(),
+                    LastScanResult {
+                        action: dominant_action,
+                        best_score,
+                        scanned_at_ms: now_ms,
+                    },
+                );
                 let best = best_score as i32;
-                let signals_above = signals.iter()
+                let signals_above = signals
+                    .iter()
                     .filter(|s| s.confidence >= admission_threshold_for(s))
                     .count();
                 warn!("Scan #{} {} {:?} spot={:.0} atm_iv={:.1}% iv_rank={:.0} pcr={:.2} best_score={} threshold={:.0} signals_above={}",
@@ -2460,11 +2770,13 @@ impl OptionsEngine {
 
         // Cross-underlying confirmation: if ≥2 underlyings signal the same direction,
         // boost all matching signals. Works for any combination (NIFTY+NIFTYNXT50).
-        let ce_underlyings: std::collections::HashSet<&str> = pending_batch.iter()
+        let ce_underlyings: std::collections::HashSet<&str> = pending_batch
+            .iter()
             .filter(|(s, _)| s.action == SignalAction::BuyCE)
             .map(|(s, _)| s.underlying.as_str())
             .collect();
-        let pe_underlyings: std::collections::HashSet<&str> = pending_batch.iter()
+        let pe_underlyings: std::collections::HashSet<&str> = pending_batch
+            .iter()
             .filter(|(s, _)| s.action == SignalAction::BuyPE)
             .map(|(s, _)| s.underlying.as_str())
             .collect();
@@ -2477,22 +2789,32 @@ impl OptionsEngine {
             if boosted {
                 let boost = 8.0_f64;
                 signal.confidence = (signal.confidence + boost).min(100.0);
-                signal.reasons.insert(0, (
-                    format!("Cross-underlying confirmation: ≥2 indices signal same direction"),
-                    boost,
-                ));
-                info!("  Cross-confirm: {} {} boosted to {:.0} confidence",
-                    signal.underlying, signal.action, signal.confidence);
+                signal.reasons.insert(
+                    0,
+                    (
+                        format!("Cross-underlying confirmation: ≥2 indices signal same direction"),
+                        boost,
+                    ),
+                );
+                info!(
+                    "  Cross-confirm: {} {} boosted to {:.0} confidence",
+                    signal.underlying, signal.action, signal.confidence
+                );
             }
             if let Some(snap) = snapshots.get(*snap_idx) {
                 self.log_signal(signal, snap);
             }
         }
 
-        let in_warmup = self.warmup_until_ms
+        let in_warmup = self
+            .warmup_until_ms
             .map_or(false, |wu| self.current_time_ms() < wu);
         if in_warmup {
-            info!("Warmup active: {} signal(s) suppressed (clock {} ms)", pending_batch.len(), self.current_time_ms());
+            info!(
+                "Warmup active: {} signal(s) suppressed (clock {} ms)",
+                pending_batch.len(),
+                self.current_time_ms()
+            );
         } else {
             let mut immediate_expiry_gamma = false;
             for (signal, _) in pending_batch {
@@ -2562,7 +2884,8 @@ impl OptionsEngine {
 
             let direction_flipped = matches!(
                 (pending.signal.action, result.action),
-                (SignalAction::BuyCE, SignalAction::BuyPE) | (SignalAction::BuyPE, SignalAction::BuyCE)
+                (SignalAction::BuyCE, SignalAction::BuyPE)
+                    | (SignalAction::BuyPE, SignalAction::BuyCE)
             );
             let score_collapsed = result.best_score < SCORE_COLLAPSE_THRESHOLD;
 
@@ -2573,8 +2896,10 @@ impl OptionsEngine {
                 cancel_tags.push((
                     pending.tag.clone(),
                     CancelReasonKind::ScanDirectionFlip,
-                    format!("pending={} new_scan={:?} score={:.0}",
-                        pending.signal.action, result.action, result.best_score),
+                    format!(
+                        "pending={} new_scan={:?} score={:.0}",
+                        pending.signal.action, result.action, result.best_score
+                    ),
                 ));
             } else if score_collapsed {
                 pending.cancel_requested = true;
@@ -2583,7 +2908,10 @@ impl OptionsEngine {
                 cancel_tags.push((
                     pending.tag.clone(),
                     CancelReasonKind::ScanScoreCollapse,
-                    format!("best_score={:.0} (below {SCORE_COLLAPSE_THRESHOLD})", result.best_score),
+                    format!(
+                        "best_score={:.0} (below {SCORE_COLLAPSE_THRESHOLD})",
+                        result.best_score
+                    ),
                 ));
             }
         }
@@ -2592,7 +2920,9 @@ impl OptionsEngine {
         for (tag, kind, detail) in cancel_tags {
             warn!(
                 "Entry order [{}] tag={} — {}; capital held until broker confirms",
-                kind.as_str(), tag, detail
+                kind.as_str(),
+                tag,
+                detail
             );
             self.send_order_command(OrderCommand::CancelByTag { tag: tag.clone() });
             self.send_order_command(OrderCommand::StatusByTag { tag });
@@ -2600,7 +2930,9 @@ impl OptionsEngine {
     }
 
     fn execute_pending_signals(&mut self) {
-        if self.pending_signals.is_empty() { return; }
+        if self.pending_signals.is_empty() {
+            return;
+        }
 
         let account_halt = self
             .shared_circuit
@@ -2623,7 +2955,10 @@ impl OptionsEngine {
             if crate::portfolio::is_locked(c) {
                 let n = self.pending_signals.len();
                 if n > 0 {
-                    warn!("Position open elsewhere: cancelling {} pending options signal(s)", n);
+                    warn!(
+                        "Position open elsewhere: cancelling {} pending options signal(s)",
+                        n
+                    );
                     self.pending_signals.clear();
                 }
                 return;
@@ -2631,7 +2966,10 @@ impl OptionsEngine {
         }
 
         let session = self.current_session();
-        if matches!(session, SessionPhase::Closing | SessionPhase::AfterMarket | SessionPhase::PreOpen) {
+        if matches!(
+            session,
+            SessionPhase::Closing | SessionPhase::AfterMarket | SessionPhase::PreOpen
+        ) {
             self.pending_signals.clear();
             return;
         }
@@ -2639,7 +2977,8 @@ impl OptionsEngine {
         // Enforce hard 15:00 entry cutoff: a signal queued at 14:59 would normally
         // execute 30s later at 15:00+. Discard any pending signals once IST >= 15:00.
         let exec_ist_mins = {
-            let now_utc = Utc.timestamp_millis_opt(self.current_time_ms() as i64)
+            let now_utc = Utc
+                .timestamp_millis_opt(self.current_time_ms() as i64)
                 .single()
                 .unwrap_or_else(Utc::now);
             let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
@@ -2649,7 +2988,10 @@ impl OptionsEngine {
         if exec_ist_mins >= 900 {
             let n = self.pending_signals.len();
             if n > 0 {
-                warn!("Entry cutoff: discarding {} queued signal(s) — past 15:00 IST", n);
+                warn!(
+                    "Entry cutoff: discarding {} queued signal(s) — past 15:00 IST",
+                    n
+                );
                 self.pending_signals.clear();
             }
             return;
@@ -2688,8 +3030,11 @@ impl OptionsEngine {
                 continue;
             }
             if age_ms > max_age_ms {
-                warn!("Pending signal #{}: stale ({:.0}s old), discarding",
-                    signal.id, age_ms as f64 / 1000.0);
+                warn!(
+                    "Pending signal #{}: stale ({:.0}s old), discarding",
+                    signal.id,
+                    age_ms as f64 / 1000.0
+                );
                 continue;
             }
 
@@ -2719,20 +3064,26 @@ impl OptionsEngine {
                 _ => 0,
             };
             if token == 0 {
-                warn!("Pending signal #{}: no contract found for {} {:?} strike={:.0}, discarding",
-                    signal.id, signal.underlying, signal.action, signal.strike);
+                warn!(
+                    "Pending signal #{}: no contract found for {} {:?} strike={:.0}, discarding",
+                    signal.id, signal.underlying, signal.action, signal.strike
+                );
                 continue;
             }
 
             let fresh_ltp = match self.store.get(token) {
                 Some(t) if t.ltp > 0.01 => t.ltp,
                 _ => {
-                    warn!("Pending signal #{}: no live price for token {}, discarding", signal.id, token);
+                    warn!(
+                        "Pending signal #{}: no live price for token {}, discarding",
+                        signal.id, token
+                    );
                     continue;
                 }
             };
 
-            let deviation = ((fresh_ltp - signal.option_price) / signal.option_price.max(0.01)).abs();
+            let deviation =
+                ((fresh_ltp - signal.option_price) / signal.option_price.max(0.01)).abs();
             if deviation > 0.25 {
                 warn!("Pending signal #{}: price moved {:.1}% (₹{:.2} → ₹{:.2}), discarding stale signal",
                     signal.id, deviation * 100.0, signal.option_price, fresh_ltp);
@@ -2763,7 +3114,6 @@ impl OptionsEngine {
             self.pending_signals.push_back(sig);
         }
     }
-
 
     fn estimate_synthetic_spot(
         &self,
@@ -2797,7 +3147,9 @@ impl OptionsEngine {
 
         let mut strike_map: BTreeMap<u64, StrikeLevel> = BTreeMap::new();
 
-        let expiry = self.contracts.iter()
+        let expiry = self
+            .contracts
+            .iter()
             .filter(|c| c.underlying == underlying)
             .map(|c| c.expiry.clone())
             .min()
@@ -2864,38 +3216,55 @@ impl OptionsEngine {
             return None;
         }
 
-        let min_strike = strike_map.values().map(|s| s.strike).fold(f64::INFINITY, f64::min);
-        let max_strike = strike_map.values().map(|s| s.strike).fold(f64::NEG_INFINITY, f64::max);
+        let min_strike = strike_map
+            .values()
+            .map(|s| s.strike)
+            .fold(f64::INFINITY, f64::min);
+        let max_strike = strike_map
+            .values()
+            .map(|s| s.strike)
+            .fold(f64::NEG_INFINITY, f64::max);
 
         // Compute chain center from liquid near-ATM strikes only (both CE and PE have ltp).
         // Using (min+max)/2 across all strikes is unreliable when a wide strike range is
         // configured — deep ITM PE options with no matching CE pull min_strike far below ATM,
         // biasing strike_mid and causing far_from_chain to falsely reject the index token.
         let liquid_center: Option<f64> = {
-            let mut liquid: Vec<f64> = strike_map.values()
+            let mut liquid: Vec<f64> = strike_map
+                .values()
                 .filter(|l| l.ce_ltp > 0.01 && l.pe_ltp > 0.01)
                 .map(|l| l.strike)
                 .collect();
             liquid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            if liquid.is_empty() { None } else { Some(liquid[liquid.len() / 2]) }
+            if liquid.is_empty() {
+                None
+            } else {
+                Some(liquid[liquid.len() / 2])
+            }
         };
         let strike_mid = liquid_center.unwrap_or_else(|| (min_strike + max_strike) / 2.0);
 
-        let underlying_raw = self.underlying_tokens.get(underlying)
+        let underlying_raw = self
+            .underlying_tokens
+            .get(underlying)
             .and_then(|tok| self.store.get(*tok));
         let spot_from_token = underlying_raw.as_ref().map(|t| t.ltp).filter(|v| *v > 0.0);
         // ohlc.close is the previous session's official closing price, broadcast in every
         // exchange tick. Used for overnight gap computation.
-        let prev_session_close = underlying_raw.as_ref()
+        let prev_session_close = underlying_raw
+            .as_ref()
             .map(|t| t.ohlc.close)
             .filter(|v| *v > 10.0);
         let synthetic_spot = self.estimate_synthetic_spot(&strike_map, t_years);
 
         let spot = match (spot_from_token, synthetic_spot) {
             (Some(token_spot), Some(synth_spot)) => {
-                let token_plausible = token_spot >= min_strike * 0.60 && token_spot <= max_strike * 1.40;
-                let far_from_chain = strike_mid > 0.0 && ((token_spot - strike_mid).abs() / strike_mid) > 0.35;
-                let token_vs_synth_large_gap = ((token_spot - synth_spot).abs() / synth_spot.max(1.0)) > 0.25;
+                let token_plausible =
+                    token_spot >= min_strike * 0.60 && token_spot <= max_strike * 1.40;
+                let far_from_chain =
+                    strike_mid > 0.0 && ((token_spot - strike_mid).abs() / strike_mid) > 0.35;
+                let token_vs_synth_large_gap =
+                    ((token_spot - synth_spot).abs() / synth_spot.max(1.0)) > 0.25;
 
                 if !token_plausible || far_from_chain || token_vs_synth_large_gap {
                     synth_spot
@@ -2916,7 +3285,11 @@ impl OptionsEngine {
             let now_ms = self.current_time_ms();
             let buf = self.spot_history.entry(underlying.to_string()).or_default();
             buf.push_back((now_ms, spot));
-            while buf.front().map(|(t, _)| now_ms.saturating_sub(*t) > 60 * 60 * 1_000).unwrap_or(false) {
+            while buf
+                .front()
+                .map(|(t, _)| now_ms.saturating_sub(*t) > 60 * 60 * 1_000)
+                .unwrap_or(false)
+            {
                 buf.pop_front();
             }
 
@@ -2927,10 +3300,10 @@ impl OptionsEngine {
                 let tail: Vec<(u64, f64)> = buf.iter().rev().take(4).cloned().collect();
                 let span_ms = tail[0].0.saturating_sub(tail[3].0);
                 if span_ms >= 3 * 60 * 1_000 {
-                    let (min_s, max_s) = tail.iter().fold(
-                        (f64::MAX, f64::MIN),
-                        |(mn, mx), (_, v)| (mn.min(*v), mx.max(*v)),
-                    );
+                    let (min_s, max_s) =
+                        tail.iter().fold((f64::MAX, f64::MIN), |(mn, mx), (_, v)| {
+                            (mn.min(*v), mx.max(*v))
+                        });
                     // A truly dead store returns the exact same stored value every scan.
                     // Use an absolute threshold (< 0.5 points = sub-tick movement) rather
                     // than a percentage: a percentage fires on quiet backtest afternoons where
@@ -3015,30 +3388,50 @@ impl OptionsEngine {
         let total_ce_vol: u64 = strikes.iter().map(|s| s.ce_volume).sum();
         let total_pe_vol: u64 = strikes.iter().map(|s| s.pe_volume).sum();
 
-        let pcr_oi = if total_ce_oi > 0 { total_pe_oi as f64 / total_ce_oi as f64 } else { 1.0 };
-        let pcr_vol = if total_ce_vol > 0 { total_pe_vol as f64 / total_ce_vol as f64 } else { 1.0 };
+        let pcr_oi = if total_ce_oi > 0 {
+            total_pe_oi as f64 / total_ce_oi as f64
+        } else {
+            1.0
+        };
+        let pcr_vol = if total_ce_vol > 0 {
+            total_pe_vol as f64 / total_ce_vol as f64
+        } else {
+            1.0
+        };
 
         let max_pain = compute_max_pain(&strikes);
 
-        let atm_level = strikes.iter()
-            .min_by(|a, b| (a.strike - spot).abs().partial_cmp(&(b.strike - spot).abs()).unwrap());
+        let atm_level = strikes.iter().min_by(|a, b| {
+            (a.strike - spot)
+                .abs()
+                .partial_cmp(&(b.strike - spot).abs())
+                .unwrap()
+        });
 
         let atm_strike = atm_level.map(|l| l.strike).unwrap_or(spot);
         // Average only valid IV sides; a failed Newton-Raphson solve leaves the field at 0.0
         // which would halve atm_iv and silently corrupt iv_rank, regime, and skew logic.
-        let atm_iv = atm_level.map(|l| {
-            match (l.ce_iv > 0.001, l.pe_iv > 0.001) {
-                (true, true)  => (l.ce_iv + l.pe_iv) / 2.0,
+        let atm_iv = atm_level
+            .map(|l| match (l.ce_iv > 0.001, l.pe_iv > 0.001) {
+                (true, true) => (l.ce_iv + l.pe_iv) / 2.0,
                 (true, false) => l.ce_iv,
                 (false, true) => l.pe_iv,
                 (false, false) => 0.0,
-            }
-        }).unwrap_or(0.0);
+            })
+            .unwrap_or(0.0);
 
-        let lot_size = match self.contracts.iter().find(|c| c.underlying == underlying).map(|c| c.lot_size) {
+        let lot_size = match self
+            .contracts
+            .iter()
+            .find(|c| c.underlying == underlying)
+            .map(|c| c.lot_size)
+        {
             Some(ls) => ls,
             None => {
-                warn!("{}: lot_size unknown (no contracts loaded from API) — skipping snapshot", underlying);
+                warn!(
+                    "{}: lot_size unknown (no contracts loaded from API) — skipping snapshot",
+                    underlying
+                );
                 return None;
             }
         };
@@ -3049,7 +3442,9 @@ impl OptionsEngine {
         let mut strikes_mut = strikes;
         for level in &mut strikes_mut {
             level.gex_contribution = (level.ce_gamma * level.ce_oi as f64
-                - level.pe_gamma * level.pe_oi as f64) * spot * lot_size as f64;
+                - level.pe_gamma * level.pe_oi as f64)
+                * spot
+                * lot_size as f64;
         }
 
         let regime = self.detect_regime(pcr_oi, atm_iv, spot, &strikes_mut);
@@ -3063,19 +3458,40 @@ impl OptionsEngine {
             // Primary: index token close (works in live engine)
             let from_index = prev_session_close.map(|c| (spot - c) / c * 100.0);
             // Fallback: put-call parity from ATM options (works in backtest from CSV close field)
-            let from_parity = self.contracts.iter()
-                .find(|c| c.underlying == underlying && c.expiry == expiry
-                    && c.option_type == OptionType::CE
-                    && (c.strike - atm_strike).abs() < 1.0)
+            let from_parity = self
+                .contracts
+                .iter()
+                .find(|c| {
+                    c.underlying == underlying
+                        && c.expiry == expiry
+                        && c.option_type == OptionType::CE
+                        && (c.strike - atm_strike).abs() < 1.0
+                })
                 .and_then(|ce_c| {
-                    let pe_c = self.contracts.iter().find(|c|
-                        c.underlying == underlying && c.expiry == expiry
-                        && c.option_type == OptionType::PE
-                        && (c.strike - atm_strike).abs() < 1.0)?;
-                    let ce_close = self.store.get(ce_c.instrument_token).filter(|t| t.ohlc.close > 0.1)?.ohlc.close;
-                    let pe_close = self.store.get(pe_c.instrument_token).filter(|t| t.ohlc.close > 0.1)?.ohlc.close;
+                    let pe_c = self.contracts.iter().find(|c| {
+                        c.underlying == underlying
+                            && c.expiry == expiry
+                            && c.option_type == OptionType::PE
+                            && (c.strike - atm_strike).abs() < 1.0
+                    })?;
+                    let ce_close = self
+                        .store
+                        .get(ce_c.instrument_token)
+                        .filter(|t| t.ohlc.close > 0.1)?
+                        .ohlc
+                        .close;
+                    let pe_close = self
+                        .store
+                        .get(pe_c.instrument_token)
+                        .filter(|t| t.ohlc.close > 0.1)?
+                        .ohlc
+                        .close;
                     let synth_prev = atm_strike + ce_close - pe_close;
-                    if synth_prev > 5000.0 { Some((spot - synth_prev) / synth_prev * 100.0) } else { None }
+                    if synth_prev > 5000.0 {
+                        Some((spot - synth_prev) / synth_prev * 100.0)
+                    } else {
+                        None
+                    }
                 });
             from_index.or(from_parity).unwrap_or(0.0)
         };
@@ -3102,7 +3518,6 @@ impl OptionsEngine {
             overnight_gap_pct,
         })
     }
-
 
     fn sideways_window_mins(&self, session: SessionPhase, days_to_expiry: f64) -> u64 {
         let base = match session {
@@ -3219,8 +3634,7 @@ impl OptionsEngine {
             _ => 1.0,
         };
 
-        let threshold = (realized_component.max(iv_component) * session_mult)
-            .clamp(0.0015, 0.0075);
+        let threshold = (realized_component.max(iv_component) * session_mult).clamp(0.0015, 0.0075);
         Some((window_mins, threshold))
     }
 
@@ -3263,18 +3677,20 @@ impl OptionsEngine {
     /// 09:15-10:15 → 2 min | 10:15-11:15 → 4 min | 11:15-12:15 → 6 min
     /// 12:15-13:15 → 8 min | 13:15-14:15 → 10 min | 14:15-15:00 → 12 min
     fn progressive_cooldown_ms(&self) -> u64 {
-        let now_utc = Utc.timestamp_millis_opt(self.current_time_ms() as i64)
-            .single().unwrap_or_else(Utc::now);
+        let now_utc = Utc
+            .timestamp_millis_opt(self.current_time_ms() as i64)
+            .single()
+            .unwrap_or_else(Utc::now);
         let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
         let now_ist = now_utc.with_timezone(&ist);
         let ist_mins = now_ist.hour() * 60 + now_ist.minute();
         let mins: u64 = match ist_mins {
-            0..=614  => 2,  // 09:15–10:15
+            0..=614 => 2,    // 09:15–10:15
             615..=674 => 4,  // 10:15–11:15
             675..=734 => 6,  // 11:15–12:15
             735..=794 => 8,  // 12:15–13:15
             795..=854 => 10, // 13:15–14:15
-            _         => 12, // 14:15–15:00
+            _ => 12,         // 14:15–15:00
         };
         mins * 60 * 1_000
     }
@@ -3289,29 +3705,36 @@ impl OptionsEngine {
         // Skip IV-based regime gates when atm_iv is zero — that means both CE and PE
         // IV solves failed for the ATM strike; using 0.0 would wrongly fire ComplacencyLowVol.
         if atm_iv > 0.001 {
-            if atm_iv > 0.40 { return MarketRegime::PanicHighVol; }
-            if atm_iv < 0.11 { return MarketRegime::ComplacencyLowVol; }
+            if atm_iv > 0.40 {
+                return MarketRegime::PanicHighVol;
+            }
+            if atm_iv < 0.11 {
+                return MarketRegime::ComplacencyLowVol;
+            }
         }
 
         let avg_skew: f64 = {
-            let skews: Vec<f64> = strikes.iter()
+            let skews: Vec<f64> = strikes
+                .iter()
                 .filter(|s| s.iv_skew.is_finite())
                 .map(|s| s.iv_skew)
                 .collect();
-            if skews.is_empty() { 0.0 }
-            else { skews.iter().sum::<f64>() / skews.len() as f64 }
+            if skews.is_empty() {
+                0.0
+            } else {
+                skews.iter().sum::<f64>() / skews.len() as f64
+            }
         };
 
         let _ = spot;
         match (pcr_oi, avg_skew) {
             (p, s) if p > 1.5 && s < -0.02 => MarketRegime::StrongBullish,
-            (p, _) if p > 1.2              => MarketRegime::Bullish,
-            (p, _) if p < 0.70             => MarketRegime::StrongBearish,
-            (p, _) if p < 0.90             => MarketRegime::Bearish,
-            _                               => MarketRegime::Neutral,
+            (p, _) if p > 1.2 => MarketRegime::Bullish,
+            (p, _) if p < 0.70 => MarketRegime::StrongBearish,
+            (p, _) if p < 0.90 => MarketRegime::Bearish,
+            _ => MarketRegime::Neutral,
         }
     }
-
 
     fn generate_signals(&mut self, snap: &ChainSnapshot) -> Vec<Signal> {
         let mut signals = Vec::new();
@@ -3327,7 +3750,12 @@ impl OptionsEngine {
                 .ingest(now, snap.spot);
         }
 
-        let lot_size = match self.contracts.iter().find(|c| c.underlying == snap.underlying).map(|c| c.lot_size) {
+        let lot_size = match self
+            .contracts
+            .iter()
+            .find(|c| c.underlying == snap.underlying)
+            .map(|c| c.lot_size)
+        {
             Some(ls) => ls,
             None => {
                 warn!("{}: lot_size unknown (no contracts loaded from API) — skipping signal generation", snap.underlying);
@@ -3335,7 +3763,11 @@ impl OptionsEngine {
             }
         };
 
-        if self.positions.iter().any(|p| p.is_open && p.underlying == snap.underlying) {
+        if self
+            .positions
+            .iter()
+            .any(|p| p.is_open && p.underlying == snap.underlying)
+        {
             return signals;
         }
 
@@ -3359,15 +3791,16 @@ impl OptionsEngine {
 
         let mut scored: Vec<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> = Vec::new();
 
-        let sideways_assessment = self.is_spot_sideways(
-            &snap.underlying,
-            snap.atm_iv,
-            snap.days_to_expiry,
-        );
-        let sideways = sideways_assessment.map(|(s, _, _, _, _)| s).unwrap_or(false);
+        let sideways_assessment =
+            self.is_spot_sideways(&snap.underlying, snap.atm_iv, snap.days_to_expiry);
+        let sideways = sideways_assessment
+            .map(|(s, _, _, _, _)| s)
+            .unwrap_or(false);
         let sideways_window_mins = sideways_assessment.map(|(_, w, _, _, _)| w).unwrap_or(30);
         let sideways_range_pct = sideways_assessment.map(|(_, _, r, _, _)| r).unwrap_or(0.0);
-        let sideways_threshold_pct = sideways_assessment.map(|(_, _, _, t, _)| t).unwrap_or(0.003);
+        let sideways_threshold_pct = sideways_assessment
+            .map(|(_, _, _, t, _)| t)
+            .unwrap_or(0.003);
         let compressive = sideways_range_pct <= sideways_threshold_pct * 1.35;
         let hard_sideways_block = sideways && sideways_range_pct <= sideways_threshold_pct * 0.55;
 
@@ -3440,28 +3873,42 @@ impl OptionsEngine {
             && snap.days_to_expiry >= 1.5
             && snap.days_to_expiry <= 5.0
         {
-            warn!("  {} Gate E: COMPRESSED range + StrongBearish PCR {:.3} + {:.2} DTE — \
+            warn!(
+                "  {} Gate E: COMPRESSED range + StrongBearish PCR {:.3} + {:.2} DTE — \
                  MM range-defense skew, not directional pressure; entry blocked",
-                snap.underlying, snap.pcr_oi, snap.days_to_expiry);
+                snap.underlying, snap.pcr_oi, snap.days_to_expiry
+            );
             return signals;
         }
 
-        if let Some(s) = self.strategy_gamma_scalp(snap)   { scored.push(s); }
+        if let Some(s) = self.strategy_gamma_scalp(snap) {
+            scored.push(s);
+        }
         // IVExpansion requires IV to expand — blocked in compressed regimes where
         // low volatility is likely to persist, directly contradicting the entry thesis.
         if !compressive {
-            if let Some(s) = self.strategy_iv_expansion(snap) { scored.push(s); }
+            if let Some(s) = self.strategy_iv_expansion(snap) {
+                scored.push(s);
+            }
         }
-        if let Some(s) = self.strategy_spot_reversal(snap) { scored.push(s); }
-        if let Some(s) = self.strategy_trend_follow(snap)  { scored.push(s); }
-        if let Some(s) = self.strategy_max_pain(snap)      { scored.push(s); }
+        if let Some(s) = self.strategy_spot_reversal(snap) {
+            scored.push(s);
+        }
+        if let Some(s) = self.strategy_trend_follow(snap) {
+            scored.push(s);
+        }
+        if let Some(s) = self.strategy_max_pain(snap) {
+            scored.push(s);
+        }
         if let Some(s) = self.strategy_oi_divergence(snap) {
             let min_sideways_score = (self.min_confidence + 12.0).min(95.0);
             if !compressive || s.1 >= min_sideways_score {
                 scored.push(s);
             }
         }
-        if let Some(s) = self.strategy_iv_skew(snap)       { scored.push(s); }
+        if let Some(s) = self.strategy_iv_skew(snap) {
+            scored.push(s);
+        }
         if let Some(s) = self.strategy_gex_play(snap) {
             let min_sideways_score = (self.min_confidence + 15.0).min(97.0);
             if !compressive || s.1 >= min_sideways_score {
@@ -3470,34 +3917,65 @@ impl OptionsEngine {
         }
 
         if scored.is_empty() {
-            warn!("  {} gen_signals: all strategies returned None", snap.underlying);
+            warn!(
+                "  {} gen_signals: all strategies returned None",
+                snap.underlying
+            );
             return signals;
         }
 
-        let ce_score: f64 = scored.iter().filter(|(a, _, _, _)| *a == SignalAction::BuyCE).map(|(_, s, _, _)| *s).sum();
-        let pe_score: f64 = scored.iter().filter(|(a, _, _, _)| *a == SignalAction::BuyPE).map(|(_, s, _, _)| *s).sum();
-        let ce_count = scored.iter().filter(|(a, _, _, _)| *a == SignalAction::BuyCE).count();
-        let pe_count = scored.iter().filter(|(a, _, _, _)| *a == SignalAction::BuyPE).count();
-        warn!("  {} gen_signals: strategies_fired={} CE={} (score={:.0}) PE={} (score={:.0})",
-            snap.underlying, scored.len(), ce_count, ce_score, pe_count, pe_score);
+        let ce_score: f64 = scored
+            .iter()
+            .filter(|(a, _, _, _)| *a == SignalAction::BuyCE)
+            .map(|(_, s, _, _)| *s)
+            .sum();
+        let pe_score: f64 = scored
+            .iter()
+            .filter(|(a, _, _, _)| *a == SignalAction::BuyPE)
+            .map(|(_, s, _, _)| *s)
+            .sum();
+        let ce_count = scored
+            .iter()
+            .filter(|(a, _, _, _)| *a == SignalAction::BuyCE)
+            .count();
+        let pe_count = scored
+            .iter()
+            .filter(|(a, _, _, _)| *a == SignalAction::BuyPE)
+            .count();
+        warn!(
+            "  {} gen_signals: strategies_fired={} CE={} (score={:.0}) PE={} (score={:.0})",
+            snap.underlying,
+            scored.len(),
+            ce_count,
+            ce_score,
+            pe_count,
+            pe_score
+        );
         for (action, score, strat, _) in &scored {
             warn!("    {:?} {:.0} -> {:?}", action, score, strat);
         }
 
         // Use total accumulated score to pick direction, not vote count.
         // Prevents 3 weak CE signals from overriding 2 strong PE signals.
-        let dominant_action = if ce_score > pe_score { SignalAction::BuyCE }
-                              else if pe_score > ce_score { SignalAction::BuyPE }
-                              else { SignalAction::Hold };
+        let dominant_action = if ce_score > pe_score {
+            SignalAction::BuyCE
+        } else if pe_score > ce_score {
+            SignalAction::BuyPE
+        } else {
+            SignalAction::Hold
+        };
 
         if dominant_action == SignalAction::Hold {
-            warn!("  {} gen_signals: CE/PE tied => Hold, no signal", snap.underlying);
+            warn!(
+                "  {} gen_signals: CE/PE tied => Hold, no signal",
+                snap.underlying
+            );
             return signals;
         }
 
-        let dominant_has_spot_reversal = scored.iter().any(|(a, _, strat, _)| {
-            *a == dominant_action && *strat == StrategyType::SpotReversal
-        });
+        let dominant_has_spot_reversal = scored
+            .iter()
+            .any(|(a, _, strat, _)| *a == dominant_action && *strat == StrategyType::SpotReversal);
 
         let mut technical_note: Option<String> = None;
 
@@ -3615,20 +4093,33 @@ impl OptionsEngine {
         //
         // For CE: PCR 1.23+ is enough to confirm bullish skew when trend/GEX/IV agree.
         //         The older 1.25 floor filtered out valid March expiry-week winners.
-        let pe_pcr_ceiling = if dominant_has_spot_reversal { 1.05 } else { 0.88 };
-        let ce_pcr_floor = if dominant_has_spot_reversal { 0.95 } else { 1.23 };
+        let pe_pcr_ceiling = if dominant_has_spot_reversal {
+            1.05
+        } else {
+            0.88
+        };
+        let ce_pcr_floor = if dominant_has_spot_reversal {
+            0.95
+        } else {
+            1.23
+        };
         if dominant_action == SignalAction::BuyPE && snap.pcr_oi > pe_pcr_ceiling {
-            warn!("  {} gen_signals: PE blocked — PCR {:.2} > {:.2} (weak bearish conviction)",
-                snap.underlying, snap.pcr_oi, pe_pcr_ceiling);
+            warn!(
+                "  {} gen_signals: PE blocked — PCR {:.2} > {:.2} (weak bearish conviction)",
+                snap.underlying, snap.pcr_oi, pe_pcr_ceiling
+            );
             return signals;
         }
         if dominant_action == SignalAction::BuyCE && snap.pcr_oi < ce_pcr_floor {
-            warn!("  {} gen_signals: CE blocked — PCR {:.2} < {:.2} (weak bullish conviction)",
-                snap.underlying, snap.pcr_oi, ce_pcr_floor);
+            warn!(
+                "  {} gen_signals: CE blocked — PCR {:.2} < {:.2} (weak bullish conviction)",
+                snap.underlying, snap.pcr_oi, ce_pcr_floor
+            );
             return signals;
         }
 
-        let dominant_signals: Vec<_> = scored.iter()
+        let dominant_signals: Vec<_> = scored
+            .iter()
             .filter(|(a, _, _, _)| *a == dominant_action)
             .collect();
         if dominant_signals.is_empty() {
@@ -3637,7 +4128,10 @@ impl OptionsEngine {
 
         let session_now = self.current_session();
         let dominant_has_flow_confirmation = dominant_signals.iter().any(|(_, _, strat, _)| {
-            matches!(strat, StrategyType::OIDivergence | StrategyType::TrendFollow)
+            matches!(
+                strat,
+                StrategyType::OIDivergence | StrategyType::TrendFollow
+            )
         });
         if dominant_signals.len() > 1 && !dominant_has_flow_confirmation {
             if !dominant_has_spot_reversal {
@@ -3673,7 +4167,8 @@ impl OptionsEngine {
                 }
             }
         }
-        if far_dte_composite_midday_block(dominant_signals.len(), snap.days_to_expiry, session_now) {
+        if far_dte_composite_midday_block(dominant_signals.len(), snap.days_to_expiry, session_now)
+        {
             warn!(
                 "  {} gen_signals: {:?} composite blocked — {:.1} DTE midday directional buy is treated as late score-stacking, not an opening/afternoon edge",
                 snap.underlying,
@@ -3704,8 +4199,10 @@ impl OptionsEngine {
         }
 
         let (composite_score, mut merged_reasons, primary_strategy) = {
-
-            let max_score = dominant_signals.iter().map(|(_, s, _, _)| *s).fold(0.0_f64, f64::max);
+            let max_score = dominant_signals
+                .iter()
+                .map(|(_, s, _, _)| *s)
+                .fold(0.0_f64, f64::max);
             let sum_all = dominant_signals.iter().map(|(_, s, _, _)| *s).sum::<f64>();
             let composite = (max_score + (sum_all - max_score) * 0.25).min(100.0);
 
@@ -3713,7 +4210,9 @@ impl OptionsEngine {
             let mut strategy = StrategyType::Composite;
             for (_, _, strat, r) in &dominant_signals {
                 reasons.extend(r.clone());
-                if dominant_signals.len() == 1 { strategy = *strat; }
+                if dominant_signals.len() == 1 {
+                    strategy = *strat;
+                }
             }
             reasons.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             reasons.dedup_by(|a, b| a.0 == b.0);
@@ -3725,9 +4224,13 @@ impl OptionsEngine {
 
         let n_dominant = dominant_signals.len();
         let confidence_floor = self.min_confidence_floor_for(snap, primary_strategy);
-        warn!("  {} gen_signals: dominant={:?} composite={:.1} threshold={:.0} strategies={}",
-            snap.underlying, dominant_action, composite_score, confidence_floor, n_dominant);
-        if composite_score < confidence_floor { return signals; }
+        warn!(
+            "  {} gen_signals: dominant={:?} composite={:.1} threshold={:.0} strategies={}",
+            snap.underlying, dominant_action, composite_score, confidence_floor, n_dominant
+        );
+        if composite_score < confidence_floor {
+            return signals;
+        }
 
         let direction = match dominant_action {
             SignalAction::BuyCE => crate::technicals::Direction::Bull,
@@ -3798,17 +4301,13 @@ impl OptionsEngine {
                 _ => false,
             };
             if weak_chain_confirmation {
-                if let Some(ext) = self
-                    .spot_series
-                    .get(&snap.underlying)
-                    .and_then(|series| {
-                        series.directional_extension_from_extreme(
-                            direction,
-                            LATE_0DTE_REVERSAL_LOOKBACK_BARS,
-                            snap.spot,
-                        )
-                    })
-                {
+                if let Some(ext) = self.spot_series.get(&snap.underlying).and_then(|series| {
+                    series.directional_extension_from_extreme(
+                        direction,
+                        LATE_0DTE_REVERSAL_LOOKBACK_BARS,
+                        snap.spot,
+                    )
+                }) {
                     if ext.points >= LATE_0DTE_REVERSAL_MIN_POINTS
                         && ext.pct >= LATE_0DTE_REVERSAL_MIN_PCT
                     {
@@ -3852,8 +4351,13 @@ impl OptionsEngine {
         };
 
         // Below this floor gamma/theta dominates and transaction costs become disproportionate.
-        warn!("  {} gen_signals: option_price={:.1} (floor={:.0})", snap.underlying, option_price, MIN_TRADEABLE_OPTION_PRICE);
-        if option_price < MIN_TRADEABLE_OPTION_PRICE { return signals; }
+        warn!(
+            "  {} gen_signals: option_price={:.1} (floor={:.0})",
+            snap.underlying, option_price, MIN_TRADEABLE_OPTION_PRICE
+        );
+        if option_price < MIN_TRADEABLE_OPTION_PRICE {
+            return signals;
+        }
 
         // Regime-adaptive exits: target and stop calibrated to market character,
         // not a single fixed config value. Confidence and DTE apply as scalars.
@@ -3870,18 +4374,34 @@ impl OptionsEngine {
             } else {
                 // Base target/stop by regime character.
                 let (regime_t, regime_s) = match snap.regime {
-                    MarketRegime::StrongBullish | MarketRegime::StrongBearish => (48.0_f64, 22.0_f64),
-                    MarketRegime::Bullish | MarketRegime::Bearish           => (38.0,     20.0),
-                    MarketRegime::PanicHighVol                              => (25.0,     17.0),
-                    MarketRegime::ComplacencyLowVol                         => (22.0,     15.0),
-                    MarketRegime::Neutral | MarketRegime::Sideways          => (30.0,     18.0),
+                    MarketRegime::StrongBullish | MarketRegime::StrongBearish => {
+                        (48.0_f64, 22.0_f64)
+                    }
+                    MarketRegime::Bullish | MarketRegime::Bearish => (38.0, 20.0),
+                    MarketRegime::PanicHighVol => (25.0, 17.0),
+                    MarketRegime::ComplacencyLowVol => (22.0, 15.0),
+                    MarketRegime::Neutral | MarketRegime::Sideways => (30.0, 18.0),
                 };
                 // Expiry day: gamma amplifies moves — allow up to 15% more room on target.
-                let dte_mult = if snap.days_to_expiry <= 1.0 { 1.15 } else { 1.0 };
+                let dte_mult = if snap.days_to_expiry <= 1.0 {
+                    1.15
+                } else {
+                    1.0
+                };
                 let target = (regime_t * conf_mult * dte_mult).min(self.profit_target_pct);
                 // Stop: wider for high-confidence (more conviction = tolerate more noise).
                 // Floor at 12% — never risk less, as bid-ask alone can span 5-8%.
-                let stop = (regime_s * (2.0 - conf_mult)).clamp(12.0, self.stop_loss_pct);
+                let stop_floor = far_dte_composite_stop_floor(
+                    snap.days_to_expiry,
+                    composite_score,
+                    confidence_floor,
+                    primary_strategy,
+                    snap.regime,
+                    regime_s,
+                );
+                let stop = (regime_s * (2.0 - conf_mult))
+                    .max(stop_floor)
+                    .min(self.stop_loss_pct);
                 (target, stop)
             }
         };
@@ -3889,9 +4409,12 @@ impl OptionsEngine {
         let effective_target_pct = {
             if matches!(session_now, SessionPhase::Afternoon) {
                 let ts_ms = self.current_time_ms();
-                let now_utc = Utc.timestamp_millis_opt(ts_ms as i64).single().unwrap_or_else(Utc::now);
-                let ist_offset = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60)
-                    .expect("valid IST offset");
+                let now_utc = Utc
+                    .timestamp_millis_opt(ts_ms as i64)
+                    .single()
+                    .unwrap_or_else(Utc::now);
+                let ist_offset =
+                    chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
                 let now_ist = now_utc.with_timezone(&ist_offset);
                 let mins = now_ist.hour() * 60 + now_ist.minute();
                 let elapsed = mins.saturating_sub(840) as f64;
@@ -3903,11 +4426,15 @@ impl OptionsEngine {
         };
 
         let strike_val = target_strike.map(|s| s.strike).unwrap_or(snap.atm_strike);
-        let mut lots = self.risk.size_lots(option_price, lot_size, effective_stop_pct / 100.0);
+        let mut lots = self
+            .risk
+            .size_lots(option_price, lot_size, effective_stop_pct / 100.0);
         if compressive {
             lots = lots.min(1);
         }
-        if lots == 0 { return signals; }
+        if lots == 0 {
+            return signals;
+        }
 
         // Flat brokerage is per order, not per lot (bug 5): premium scales with lots,
         // brokerage is added once via entry_order_cost.
@@ -3918,35 +4445,61 @@ impl OptionsEngine {
         }
 
         let target_price = option_price * (1.0 + effective_target_pct / 100.0);
-        let stop_price   = option_price * (1.0 - effective_stop_pct / 100.0);
+        let stop_price = option_price * (1.0 - effective_stop_pct / 100.0);
 
-        let straddle_prem = target_strike.map(|s| s.straddle_premium).unwrap_or(option_price * 2.0);
+        let straddle_prem = target_strike
+            .map(|s| s.straddle_premium)
+            .unwrap_or(option_price * 2.0);
         let breakeven_move_pct = (straddle_prem / snap.spot) * 100.0;
 
         let max_loss = (option_price - stop_price) * lot_size as f64 * lots as f64
-            + round_trip_order_cost(option_price, stop_price, lot_size, lots, self.current_time_ms());
+            + round_trip_order_cost(
+                option_price,
+                stop_price,
+                lot_size,
+                lots,
+                self.current_time_ms(),
+            );
         let max_profit = (target_price - option_price) * lot_size as f64 * lots as f64
-            - round_trip_order_cost(option_price, target_price, lot_size, lots, self.current_time_ms());
-        let risk_reward = if max_loss > 0.0 { max_profit / max_loss } else { 0.0 };
+            - round_trip_order_cost(
+                option_price,
+                target_price,
+                lot_size,
+                lots,
+                self.current_time_ms(),
+            );
+        let risk_reward = if max_loss > 0.0 {
+            max_profit / max_loss
+        } else {
+            0.0
+        };
 
         // Reject trades without sufficient risk-reward edge.
         // Short-dated high-confidence trades often model with lower static R:R because
         // gamma compresses both target and stop; keep the standard 1.3 floor elsewhere.
-        let min_risk_reward = if snap.days_to_expiry < 0.5
-            && compressive
-            && !dominant_has_spot_reversal
-        {
-            1.30
-        } else if snap.days_to_expiry <= 3.5 && composite_score >= 62.0 {
-            0.95
+        let min_risk_reward: f64 =
+            if snap.days_to_expiry < 0.5 && compressive && !dominant_has_spot_reversal {
+                1.30
+            } else if snap.days_to_expiry <= 3.5 && composite_score >= 62.0 {
+                0.95
+            } else {
+                1.30
+            };
+        // Robust mechanism 4 (env-gated): raise the floor to MIN_RR so no accepted trade can be
+        // structurally smaller in reward than in risk. Only ever tightens (existing floors that
+        // are already ≥ MIN_RR are untouched); DEFAULT OFF leaves the floor exactly as above.
+        let min_risk_reward = if self.robust_risk.enabled {
+            min_risk_reward.max(self.robust_risk.min_rr)
         } else {
-            1.30
+            min_risk_reward
         };
         if risk_reward < min_risk_reward {
-            warn!("  {} signal rejected: R:R {:.2}:1 below {:.2} floor", snap.underlying, risk_reward, min_risk_reward);
+            warn!(
+                "  {} signal rejected: R:R {:.2}:1 below {:.2} floor",
+                snap.underlying, risk_reward, min_risk_reward
+            );
             return signals;
         }
-
 
         let session = self.current_session();
         let option_type_str = match dominant_action {
@@ -3955,7 +4508,8 @@ impl OptionsEngine {
             _ => "XX",
         };
 
-        let reasons_str = merged_reasons.iter()
+        let reasons_str = merged_reasons
+            .iter()
             .map(|(r, s)| format!("[{:+.0}] {}", s, r))
             .collect::<Vec<_>>()
             .join(" | ");
@@ -3990,7 +4544,10 @@ impl OptionsEngine {
             signal_reasons: reasons_str,
         };
 
-        let sig_id = { self.next_sig_id += 1; self.next_sig_id - 1 };
+        let sig_id = {
+            self.next_sig_id += 1;
+            self.next_sig_id - 1
+        };
         let mut ctx = entry_ctx.clone();
         ctx.signal_id = sig_id;
 
@@ -4040,16 +4597,32 @@ impl OptionsEngine {
         signals
     }
 
-
-    fn pick_strike<'a>(&self, snap: &'a ChainSnapshot, action: &SignalAction, lot_size: u32) -> Option<&'a StrikeLevel> {
+    fn pick_strike<'a>(
+        &self,
+        snap: &'a ChainSnapshot,
+        action: &SignalAction,
+        lot_size: u32,
+    ) -> Option<&'a StrikeLevel> {
         let cash_capital = self.available_capital_for_new_orders();
         let sizing_capital = self.risk.max_one_lot_entry_cost_by_exposure();
-        let deployable_capital = cash_capital.min(sizing_capital);
+        let mut deployable_capital = cash_capital.min(sizing_capital);
+        // Robust mechanism 2 (env-gated): keep the one-lot premium within the deployment cap so
+        // the strike scan lands on a strike whose 1-lot cost fits PREMIUM_CAP_FRAC × capital,
+        // rather than skipping every trade whose ATM premium exceeds the cap. DEFAULT OFF.
+        if self.robust_risk.enabled {
+            let premium_cap = self.robust_risk.premium_cap_frac * self.risk.daily_start_capital;
+            deployable_capital = deployable_capital.min(premium_cap);
+        }
 
-        let atm_idx = snap.strikes.iter()
+        let atm_idx = snap
+            .strikes
+            .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
-                (a.strike - snap.spot).abs().partial_cmp(&(b.strike - snap.spot).abs()).unwrap()
+                (a.strike - snap.spot)
+                    .abs()
+                    .partial_cmp(&(b.strike - snap.spot).abs())
+                    .unwrap()
             })
             .map(|(i, _)| i)?;
 
@@ -4136,38 +4709,62 @@ impl OptionsEngine {
         } else {
             warn!(
                 "  pick_strike {} {:?} fallback: checked {} strikes, found=false",
-                snap.underlying,
-                action,
-                checked,
+                snap.underlying, action, checked,
             );
             None
         }
     }
 
-    fn strategy_gamma_scalp(&self, snap: &ChainSnapshot) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
-        if snap.days_to_expiry > 2.0 { return None; }
-        if snap.atm_iv > 0.55 { return None; }
+    fn strategy_gamma_scalp(
+        &self,
+        snap: &ChainSnapshot,
+    ) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
+        if snap.days_to_expiry > 2.0 {
+            return None;
+        }
+        if snap.atm_iv > 0.55 {
+            return None;
+        }
         // On 1-DTE (day before expiry), block if IV is at session minimum.
         // iv_rank=0 means IV was higher earlier in the session (crash peak) and is now
         // compressing — buying options into falling IV on expensive 1-DTE premium is
         // a double-whammy loss (spot bounce + IV crush). Not applicable on expiry day (DTE<0.5).
-        if snap.days_to_expiry >= 0.5 && snap.iv_rank < 5.0 { return None; }
+        if snap.days_to_expiry >= 0.5 && snap.iv_rank < 5.0 {
+            return None;
+        }
 
         let session = self.current_session();
-        if !matches!(session, SessionPhase::Morning | SessionPhase::Midday | SessionPhase::Afternoon) { return None; }
+        if !matches!(
+            session,
+            SessionPhase::Morning | SessionPhase::Midday | SessionPhase::Afternoon
+        ) {
+            return None;
+        }
 
         let mut score = 0.0_f64;
         let mut reasons = Vec::new();
 
         if snap.days_to_expiry < 0.5 {
             score += 25.0;
-            reasons.push((format!("Same-day expiry ({:.1} DTE): gamma at maximum", snap.days_to_expiry), 25.0));
+            reasons.push((
+                format!(
+                    "Same-day expiry ({:.1} DTE): gamma at maximum",
+                    snap.days_to_expiry
+                ),
+                25.0,
+            ));
         } else if snap.days_to_expiry < 1.5 {
             score += 18.0;
-            reasons.push((format!("{:.1} DTE: high gamma acceleration", snap.days_to_expiry), 18.0));
+            reasons.push((
+                format!("{:.1} DTE: high gamma acceleration", snap.days_to_expiry),
+                18.0,
+            ));
         } else {
             score += 10.0;
-            reasons.push((format!("{:.1} DTE: moderate gamma", snap.days_to_expiry), 10.0));
+            reasons.push((
+                format!("{:.1} DTE: moderate gamma", snap.days_to_expiry),
+                10.0,
+            ));
         }
 
         // On expiry day (DTE < 0.5), gamma dominates even moderate PCR bias.
@@ -4175,20 +4772,44 @@ impl OptionsEngine {
         // Score 18 (not 22) because conviction is lower than extreme PCR; composite still clears 62.
         let (action, pcr_score, pcr_reason) = if snap.days_to_expiry < 0.5 {
             if snap.pcr_oi > 1.15 {
-                (SignalAction::BuyCE, 18.0,
-                 format!("PCR {:.2} (mildly bullish): expiry-day put writing supports CE gamma play", snap.pcr_oi))
+                (
+                    SignalAction::BuyCE,
+                    18.0,
+                    format!(
+                        "PCR {:.2} (mildly bullish): expiry-day put writing supports CE gamma play",
+                        snap.pcr_oi
+                    ),
+                )
             } else if snap.pcr_oi < 0.75 {
-                (SignalAction::BuyPE, 18.0,
-                 format!("PCR {:.2} (bearish): expiry-day call writing supports PE gamma play", snap.pcr_oi))
+                (
+                    SignalAction::BuyPE,
+                    18.0,
+                    format!(
+                        "PCR {:.2} (bearish): expiry-day call writing supports PE gamma play",
+                        snap.pcr_oi
+                    ),
+                )
             } else {
                 return None;
             }
         } else if snap.pcr_oi > 1.3 {
-            (SignalAction::BuyCE, 22.0,
-             format!("PCR {:.2} (bullish): heavy put writing = market floor", snap.pcr_oi))
+            (
+                SignalAction::BuyCE,
+                22.0,
+                format!(
+                    "PCR {:.2} (bullish): heavy put writing = market floor",
+                    snap.pcr_oi
+                ),
+            )
         } else if snap.pcr_oi < 0.80 {
-            (SignalAction::BuyPE, 22.0,
-             format!("PCR {:.2} (bearish): heavy call writing = market ceiling", snap.pcr_oi))
+            (
+                SignalAction::BuyPE,
+                22.0,
+                format!(
+                    "PCR {:.2} (bearish): heavy call writing = market ceiling",
+                    snap.pcr_oi
+                ),
+            )
         } else {
             return None;
         };
@@ -4196,51 +4817,93 @@ impl OptionsEngine {
         reasons.push((pcr_reason, pcr_score));
 
         if (action == SignalAction::BuyCE && snap.pcr_vol > 1.1)
-        || (action == SignalAction::BuyPE && snap.pcr_vol < 0.9) {
+            || (action == SignalAction::BuyPE && snap.pcr_vol < 0.9)
+        {
             score += 12.0;
-            reasons.push((format!("Volume PCR {:.2} confirms OI signal", snap.pcr_vol), 12.0));
+            reasons.push((
+                format!("Volume PCR {:.2} confirms OI signal", snap.pcr_vol),
+                12.0,
+            ));
         }
 
         if snap.atm_iv > 0.12 {
             score += 8.0;
-            reasons.push((format!("ATM IV {:.1}% — sufficient for gamma moves", snap.atm_iv * 100.0), 8.0));
+            reasons.push((
+                format!(
+                    "ATM IV {:.1}% — sufficient for gamma moves",
+                    snap.atm_iv * 100.0
+                ),
+                8.0,
+            ));
         }
 
         // Individual strategies use a low floor; composite in generate_signals applies min_confidence.
-        if score < 25.0 { return None; }
+        if score < 25.0 {
+            return None;
+        }
         Some((action, score.min(100.0), StrategyType::GammaScalp, reasons))
     }
 
-    fn strategy_iv_expansion(&self, snap: &ChainSnapshot) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
-        if snap.iv_rank > 40.0 { return None; }
+    fn strategy_iv_expansion(
+        &self,
+        snap: &ChainSnapshot,
+    ) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
+        if snap.iv_rank > 40.0 {
+            return None;
+        }
         // iv_rank=0 means no IV history yet (session just started or data gap).
         // Scoring 30 pts as "historically cheap" on an empty baseline is a false signal.
-        if snap.iv_rank < 1.0 { return None; }
-        if snap.days_to_expiry < 1.0 { return None; }
+        if snap.iv_rank < 1.0 {
+            return None;
+        }
+        if snap.days_to_expiry < 1.0 {
+            return None;
+        }
 
         let mut score = 0.0_f64;
         let mut reasons = Vec::new();
 
         if snap.iv_rank < 15.0 {
             score += 30.0;
-            reasons.push((format!("IV Rank {:.0}%: historically cheap options (buy aggresively)", snap.iv_rank), 30.0));
+            reasons.push((
+                format!(
+                    "IV Rank {:.0}%: historically cheap options (buy aggresively)",
+                    snap.iv_rank
+                ),
+                30.0,
+            ));
         } else if snap.iv_rank < 25.0 {
             score += 22.0;
-            reasons.push((format!("IV Rank {:.0}%: below average IV (good buy zone)", snap.iv_rank), 22.0));
+            reasons.push((
+                format!(
+                    "IV Rank {:.0}%: below average IV (good buy zone)",
+                    snap.iv_rank
+                ),
+                22.0,
+            ));
         } else {
             score += 12.0;
-            reasons.push((format!("IV Rank {:.0}%: moderately cheap", snap.iv_rank), 12.0));
+            reasons.push((
+                format!("IV Rank {:.0}%: moderately cheap", snap.iv_rank),
+                12.0,
+            ));
         }
 
         let action = match snap.regime {
             MarketRegime::StrongBullish | MarketRegime::Bullish => {
                 score += 20.0;
-                reasons.push(("Bullish regime: buy CE for directional IV play".into(), 20.0));
+                reasons.push((
+                    "Bullish regime: buy CE for directional IV play".into(),
+                    20.0,
+                ));
                 SignalAction::BuyCE
             }
             MarketRegime::StrongBearish | MarketRegime::Bearish => {
                 score += 20.0;
-                reasons.push(("Bearish regime: buy PE for directional IV play".into(), 20.0));
+                reasons.push((
+                    "Bearish regime: buy PE for directional IV play".into(),
+                    20.0,
+                ));
                 SignalAction::BuyPE
             }
             // PANIC: IV is elevated but if iv_rank is low (IV hasn't expanded from session start),
@@ -4248,11 +4911,19 @@ impl OptionsEngine {
             MarketRegime::PanicHighVol => {
                 if snap.pcr_oi > 1.1 {
                     score += 10.0;
-                    reasons.push(("Panic + low IV rank: options cheap vs session range, PCR bullish → CE".into(), 10.0));
+                    reasons.push((
+                        "Panic + low IV rank: options cheap vs session range, PCR bullish → CE"
+                            .into(),
+                        10.0,
+                    ));
                     SignalAction::BuyCE
                 } else if snap.pcr_oi < 0.8 {
                     score += 10.0;
-                    reasons.push(("Panic + low IV rank: options cheap vs session range, PCR bearish → PE".into(), 10.0));
+                    reasons.push((
+                        "Panic + low IV rank: options cheap vs session range, PCR bearish → PE"
+                            .into(),
+                        10.0,
+                    ));
                     SignalAction::BuyPE
                 } else {
                     return None;
@@ -4261,7 +4932,10 @@ impl OptionsEngine {
             _ => {
                 if snap.pcr_oi > 1.1 {
                     score += 10.0;
-                    reasons.push(("PCR slightly bullish, CE preferred for IV expansion".into(), 10.0));
+                    reasons.push((
+                        "PCR slightly bullish, CE preferred for IV expansion".into(),
+                        10.0,
+                    ));
                     SignalAction::BuyCE
                 } else {
                     return None;
@@ -4271,21 +4945,44 @@ impl OptionsEngine {
 
         if snap.atm_iv < 0.13 {
             score += 15.0;
-            reasons.push((format!("ATM IV {:.1}%: below 13% — IV mean-reversion expected", snap.atm_iv * 100.0), 15.0));
+            reasons.push((
+                format!(
+                    "ATM IV {:.1}%: below 13% — IV mean-reversion expected",
+                    snap.atm_iv * 100.0
+                ),
+                15.0,
+            ));
         }
 
         if snap.days_to_expiry > 3.0 {
             score += 8.0;
-            reasons.push((format!("{:.0} DTE: time for IV to build before expiry", snap.days_to_expiry), 8.0));
+            reasons.push((
+                format!(
+                    "{:.0} DTE: time for IV to build before expiry",
+                    snap.days_to_expiry
+                ),
+                8.0,
+            ));
         }
 
-        if score < 25.0 { return None; }
+        if score < 25.0 {
+            return None;
+        }
         Some((action, score.min(100.0), StrategyType::IVExpansion, reasons))
     }
 
-    fn strategy_spot_reversal(&self, snap: &ChainSnapshot) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
+    fn strategy_spot_reversal(
+        &self,
+        snap: &ChainSnapshot,
+    ) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
         let session = self.current_session();
-        if matches!(session, SessionPhase::OpeningBell | SessionPhase::Closing | SessionPhase::AfterMarket | SessionPhase::PreOpen) {
+        if matches!(
+            session,
+            SessionPhase::OpeningBell
+                | SessionPhase::Closing
+                | SessionPhase::AfterMarket
+                | SessionPhase::PreOpen
+        ) {
             return None;
         }
 
@@ -4335,49 +5032,89 @@ impl OptionsEngine {
         let atr_score = (reversal.atr_multiple * 8.0).clamp(12.0, 24.0);
         score += atr_score;
         reasons.push((
-            format!("Price-action break strength {:.1} ATR", reversal.atr_multiple),
+            format!(
+                "Price-action break strength {:.1} ATR",
+                reversal.atr_multiple
+            ),
             atr_score,
         ));
 
         if snap.iv_rank >= 1.0 && snap.iv_rank < 65.0 {
             score += 10.0;
-            reasons.push((format!("IV Rank {:.0}%: options still affordable for reversal", snap.iv_rank), 10.0));
+            reasons.push((
+                format!(
+                    "IV Rank {:.0}%: options still affordable for reversal",
+                    snap.iv_rank
+                ),
+                10.0,
+            ));
         }
 
         if snap.atm_iv < 0.16 {
             score += 8.0;
-            reasons.push((format!("ATM IV {:.1}%: premium not structurally rich", snap.atm_iv * 100.0), 8.0));
+            reasons.push((
+                format!(
+                    "ATM IV {:.1}%: premium not structurally rich",
+                    snap.atm_iv * 100.0
+                ),
+                8.0,
+            ));
         }
 
         match action {
             SignalAction::BuyPE if snap.pcr_oi < 1.0 => {
                 score += 8.0;
-                reasons.push((format!("PCR {:.2}: not opposing bearish reversal", snap.pcr_oi), 8.0));
+                reasons.push((
+                    format!("PCR {:.2}: not opposing bearish reversal", snap.pcr_oi),
+                    8.0,
+                ));
             }
             SignalAction::BuyCE if snap.pcr_oi > 1.0 => {
                 score += 8.0;
-                reasons.push((format!("PCR {:.2}: not opposing bullish reversal", snap.pcr_oi), 8.0));
+                reasons.push((
+                    format!("PCR {:.2}: not opposing bullish reversal", snap.pcr_oi),
+                    8.0,
+                ));
             }
             _ => {
                 score += 4.0;
-                reasons.push((format!("PCR {:.2}: neutral enough for price-action reversal", snap.pcr_oi), 4.0));
+                reasons.push((
+                    format!(
+                        "PCR {:.2}: neutral enough for price-action reversal",
+                        snap.pcr_oi
+                    ),
+                    4.0,
+                ));
             }
         }
 
         if score < self.min_confidence {
             return None;
         }
-        Some((action, score.min(100.0), StrategyType::SpotReversal, reasons))
+        Some((
+            action,
+            score.min(100.0),
+            StrategyType::SpotReversal,
+            reasons,
+        ))
     }
 
-    fn strategy_trend_follow(&self, snap: &ChainSnapshot) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
+    fn strategy_trend_follow(
+        &self,
+        snap: &ChainSnapshot,
+    ) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
         let mut score = 0.0_f64;
         let mut reasons = Vec::new();
 
-        let atm_idx = snap.strikes.iter()
+        let atm_idx = snap
+            .strikes
+            .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
-                (a.strike - snap.spot).abs().partial_cmp(&(b.strike - snap.spot).abs()).unwrap()
+                (a.strike - snap.spot)
+                    .abs()
+                    .partial_cmp(&(b.strike - snap.spot).abs())
+                    .unwrap()
             })
             .map(|(i, _)| i)
             .unwrap_or(0);
@@ -4399,30 +5136,86 @@ impl OptionsEngine {
         //   PE OI DOWN + price UP  (Bullish)  = put shorts covering       → BuyCE  (confirms trend)
         // This is consistent with strategy_oi_divergence and the writer-dominance convention
         // in quant_engine (quant lacks regime so defaults to writer assumption for all cases).
-        let (action, oi_score, oi_reason) = if ce_oi_change > 0 && matches!(snap.regime, MarketRegime::Bullish | MarketRegime::StrongBullish) {
-            (SignalAction::BuyCE, 25.0,
-             format!("CE OI +{} with bullish regime: new long buildup", ce_oi_change))
-        } else if pe_oi_change > 0 && matches!(snap.regime, MarketRegime::Bearish | MarketRegime::StrongBearish) {
-            (SignalAction::BuyPE, 25.0,
-             format!("PE OI +{} with bearish regime: new short buildup", pe_oi_change))
-        } else if ce_oi_change < 0 && matches!(snap.regime, MarketRegime::Bearish | MarketRegime::StrongBearish) {
-            (SignalAction::BuyPE, 18.0,
-             format!("CE OI {} (unwinding) + bearish: longs exiting, further down", ce_oi_change))
-        } else if pe_oi_change < 0 && matches!(snap.regime, MarketRegime::Bullish | MarketRegime::StrongBullish) {
-            (SignalAction::BuyCE, 18.0,
-             format!("PE OI {} (unwinding) + bullish: bears exiting, further up", pe_oi_change))
+        let (action, oi_score, oi_reason) = if ce_oi_change > 0
+            && matches!(
+                snap.regime,
+                MarketRegime::Bullish | MarketRegime::StrongBullish
+            ) {
+            (
+                SignalAction::BuyCE,
+                25.0,
+                format!(
+                    "CE OI +{} with bullish regime: new long buildup",
+                    ce_oi_change
+                ),
+            )
+        } else if pe_oi_change > 0
+            && matches!(
+                snap.regime,
+                MarketRegime::Bearish | MarketRegime::StrongBearish
+            )
+        {
+            (
+                SignalAction::BuyPE,
+                25.0,
+                format!(
+                    "PE OI +{} with bearish regime: new short buildup",
+                    pe_oi_change
+                ),
+            )
+        } else if ce_oi_change < 0
+            && matches!(
+                snap.regime,
+                MarketRegime::Bearish | MarketRegime::StrongBearish
+            )
+        {
+            (
+                SignalAction::BuyPE,
+                18.0,
+                format!(
+                    "CE OI {} (unwinding) + bearish: longs exiting, further down",
+                    ce_oi_change
+                ),
+            )
+        } else if pe_oi_change < 0
+            && matches!(
+                snap.regime,
+                MarketRegime::Bullish | MarketRegime::StrongBullish
+            )
+        {
+            (
+                SignalAction::BuyCE,
+                18.0,
+                format!(
+                    "PE OI {} (unwinding) + bullish: bears exiting, further up",
+                    pe_oi_change
+                ),
+            )
         // PANIC: sustained fear → OI activity is directionally bearish regardless of which side builds.
         // CE OI up = call writers piling on; PE OI up = put buyers hedging; CE OI down = longs fleeing.
-        } else if matches!(snap.regime, MarketRegime::PanicHighVol) && (ce_oi_change > 0 || pe_oi_change > 0 || ce_oi_change < 0) {
+        } else if matches!(snap.regime, MarketRegime::PanicHighVol)
+            && (ce_oi_change > 0 || pe_oi_change > 0 || ce_oi_change < 0)
+        {
             let mag = pe_oi_change.abs().max(ce_oi_change.abs());
             let reason = if pe_oi_change > ce_oi_change.abs() as i64 {
-                format!("PE OI +{} in panic: institutional hedging confirms bearish", pe_oi_change)
+                format!(
+                    "PE OI +{} in panic: institutional hedging confirms bearish",
+                    pe_oi_change
+                )
             } else if ce_oi_change > 0 {
-                format!("CE OI +{} in panic: call writers aggressively positioning short", ce_oi_change)
+                format!(
+                    "CE OI +{} in panic: call writers aggressively positioning short",
+                    ce_oi_change
+                )
             } else {
-                format!("CE OI {} in panic: longs unwinding, further downside", ce_oi_change)
+                format!(
+                    "CE OI {} in panic: longs unwinding, further downside",
+                    ce_oi_change
+                )
             };
-            if mag < 5000 { return None; }
+            if mag < 5000 {
+                return None;
+            }
             (SignalAction::BuyPE, 22.0, reason)
         } else {
             return None;
@@ -4435,21 +5228,48 @@ impl OptionsEngine {
         // Two-tier volume confirmation: strong (>2x) or moderate (>1.3x)
         if action == SignalAction::BuyCE && ce_vol_surge > pe_vol_surge * 2 {
             score += 15.0;
-            reasons.push((format!("CE volume ({}) >> PE volume ({}): strong buying pressure", ce_vol_surge, pe_vol_surge), 15.0));
+            reasons.push((
+                format!(
+                    "CE volume ({}) >> PE volume ({}): strong buying pressure",
+                    ce_vol_surge, pe_vol_surge
+                ),
+                15.0,
+            ));
         } else if action == SignalAction::BuyCE && ce_vol_surge * 10 > pe_vol_surge * 13 {
             score += 8.0;
-            reasons.push((format!("CE volume ({}) > PE volume ({}): moderate buying pressure", ce_vol_surge, pe_vol_surge), 8.0));
+            reasons.push((
+                format!(
+                    "CE volume ({}) > PE volume ({}): moderate buying pressure",
+                    ce_vol_surge, pe_vol_surge
+                ),
+                8.0,
+            ));
         } else if action == SignalAction::BuyPE && pe_vol_surge > ce_vol_surge * 2 {
             score += 15.0;
-            reasons.push((format!("PE volume ({}) >> CE volume ({}): strong selling pressure", pe_vol_surge, ce_vol_surge), 15.0));
+            reasons.push((
+                format!(
+                    "PE volume ({}) >> CE volume ({}): strong selling pressure",
+                    pe_vol_surge, ce_vol_surge
+                ),
+                15.0,
+            ));
         } else if action == SignalAction::BuyPE && pe_vol_surge * 10 > ce_vol_surge * 13 {
             score += 8.0;
-            reasons.push((format!("PE volume ({}) > CE volume ({}): moderate selling pressure", pe_vol_surge, ce_vol_surge), 8.0));
+            reasons.push((
+                format!(
+                    "PE volume ({}) > CE volume ({}): moderate selling pressure",
+                    pe_vol_surge, ce_vol_surge
+                ),
+                8.0,
+            ));
         }
 
         if snap.iv_rank < 60.0 {
             score += 10.0;
-            reasons.push((format!("IV Rank {:.0}%: options not overpriced", snap.iv_rank), 10.0));
+            reasons.push((
+                format!("IV Rank {:.0}%: options not overpriced", snap.iv_rank),
+                10.0,
+            ));
         }
 
         match (&action, &snap.regime) {
@@ -4476,27 +5296,37 @@ impl OptionsEngine {
             _ => {}
         }
 
-        if score < 25.0 { return None; }
+        if score < 25.0 {
+            return None;
+        }
         Some((action, score.min(100.0), StrategyType::TrendFollow, reasons))
     }
 
-    fn strategy_max_pain(&self, snap: &ChainSnapshot) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
-        if snap.days_to_expiry > 3.5 { return None; }
+    fn strategy_max_pain(
+        &self,
+        snap: &ChainSnapshot,
+    ) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
+        if snap.days_to_expiry > 3.5 {
+            return None;
+        }
 
         let deviation = snap.spot - snap.max_pain;
         let deviation_pct = deviation.abs() / snap.spot * 100.0;
 
-        let min_dev_pct = self.dynamic_max_pain_min_dev_pct(
-            &snap.underlying,
-            snap.atm_iv,
-            snap.days_to_expiry,
-        );
-        if deviation_pct < min_dev_pct { return None; }
+        let min_dev_pct =
+            self.dynamic_max_pain_min_dev_pct(&snap.underlying, snap.atm_iv, snap.days_to_expiry);
+        if deviation_pct < min_dev_pct {
+            return None;
+        }
 
         let mut score = 0.0_f64;
         let mut reasons = Vec::new();
 
-        let action = if deviation > 0.0 { SignalAction::BuyPE } else { SignalAction::BuyCE };
+        let action = if deviation > 0.0 {
+            SignalAction::BuyPE
+        } else {
+            SignalAction::BuyCE
+        };
         let direction_text = if deviation > 0.0 {
             format!(
                 "Spot ₹{:.0} is {:.1}% ABOVE max pain ₹{:.0} (> {:.2}% dyn threshold) → downside gravity",
@@ -4515,44 +5345,85 @@ impl OptionsEngine {
 
         if snap.days_to_expiry < 1.0 {
             score += 20.0;
-            reasons.push((format!("{:.1} DTE: max pain effect strongest on expiry day", snap.days_to_expiry), 20.0));
+            reasons.push((
+                format!(
+                    "{:.1} DTE: max pain effect strongest on expiry day",
+                    snap.days_to_expiry
+                ),
+                20.0,
+            ));
         } else if snap.days_to_expiry < 2.0 {
             score += 12.0;
-            reasons.push((format!("{:.1} DTE: max pain pull building", snap.days_to_expiry), 12.0));
+            reasons.push((
+                format!("{:.1} DTE: max pain pull building", snap.days_to_expiry),
+                12.0,
+            ));
         } else {
             score += 5.0;
-            reasons.push((format!("{:.1} DTE: early max pain signal", snap.days_to_expiry), 5.0));
+            reasons.push((
+                format!("{:.1} DTE: early max pain signal", snap.days_to_expiry),
+                5.0,
+            ));
         }
 
         if snap.net_gex < 0.0 {
             score += 15.0;
-            reasons.push((format!("GEX {:.2e} negative: dealer short gamma amplifies max pain pull", snap.net_gex), 15.0));
+            reasons.push((
+                format!(
+                    "GEX {:.2e} negative: dealer short gamma amplifies max pain pull",
+                    snap.net_gex
+                ),
+                15.0,
+            ));
         }
 
         if (action == SignalAction::BuyPE && snap.pcr_oi < 1.0)
-        || (action == SignalAction::BuyCE && snap.pcr_oi > 1.0) {
+            || (action == SignalAction::BuyCE && snap.pcr_oi > 1.0)
+        {
             score += 10.0;
-            reasons.push((format!("PCR {:.2} aligns with max pain direction", snap.pcr_oi), 10.0));
+            reasons.push((
+                format!("PCR {:.2} aligns with max pain direction", snap.pcr_oi),
+                10.0,
+            ));
         }
 
-        if score < 25.0 { return None; }
-        Some((action, score.min(100.0), StrategyType::MaxPainConvergence, reasons))
+        if score < 25.0 {
+            return None;
+        }
+        Some((
+            action,
+            score.min(100.0),
+            StrategyType::MaxPainConvergence,
+            reasons,
+        ))
     }
 
-    fn strategy_oi_divergence(&self, snap: &ChainSnapshot) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
+    fn strategy_oi_divergence(
+        &self,
+        snap: &ChainSnapshot,
+    ) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
         // OI buildup signals play out over hours-to-days; on expiry day the positioning
         // is dominated by MM hedging/unwinds, not genuine directional bets.
-        if snap.days_to_expiry < 1.0 { return None; }
+        if snap.days_to_expiry < 1.0 {
+            return None;
+        }
 
         // In neutral regime there is no directional bias — large OI builds are
         // typically market-maker activity (delta hedging) not speculator positioning.
         // Without a directional regime the OI signal has no edge.
-        if matches!(snap.regime, MarketRegime::Neutral) { return None; }
+        if matches!(snap.regime, MarketRegime::Neutral) {
+            return None;
+        }
 
-        let atm_idx = snap.strikes.iter()
+        let atm_idx = snap
+            .strikes
+            .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
-                (a.strike - snap.spot).abs().partial_cmp(&(b.strike - snap.spot).abs()).unwrap()
+                (a.strike - snap.spot)
+                    .abs()
+                    .partial_cmp(&(b.strike - snap.spot).abs())
+                    .unwrap()
             })
             .map(|(i, _)| i)
             .unwrap_or(0);
@@ -4565,7 +5436,9 @@ impl OptionsEngine {
         let net_pe_oi_change: i64 = nearby.iter().map(|s| s.pe_oi_change).sum();
 
         let nearby_volume: u64 = nearby.iter().map(|s| s.ce_volume + s.pe_volume).sum();
-        if nearby_volume < 10_000u64 { return None; }
+        if nearby_volume < 10_000u64 {
+            return None;
+        }
 
         // Price/OI quadrant: raw OI direction alone is ambiguous — a CE OI increase could
         // be call BUYERS (bullish) or call WRITERS (bearish), depending on whether price is
@@ -4575,26 +5448,44 @@ impl OptionsEngine {
         //   PE dominant + downtrend → put buyers entering         → BuyPE
         //   PE dominant + uptrend  → put writers (income)        → BuyCE
         let is_ce_dominant = net_ce_oi_change.abs() > net_pe_oi_change.abs();
-        let dominant_magnitude = if is_ce_dominant { net_ce_oi_change.abs() } else { net_pe_oi_change.abs() };
+        let dominant_magnitude = if is_ce_dominant {
+            net_ce_oi_change.abs()
+        } else {
+            net_pe_oi_change.abs()
+        };
 
-        if dominant_magnitude < 1000i64 { return None; }
+        if dominant_magnitude < 1000i64 {
+            return None;
+        }
 
         let (action, quadrant_desc) = match (is_ce_dominant, &snap.regime) {
-            (true, MarketRegime::Bullish | MarketRegime::StrongBullish) =>
-                (SignalAction::BuyCE, "CE OI buildup in uptrend: call buyers positioning long"),
-            (true, MarketRegime::Bearish | MarketRegime::StrongBearish) =>
-                (SignalAction::BuyPE, "CE OI buildup in downtrend: call writers signaling downside"),
-            (false, MarketRegime::Bearish | MarketRegime::StrongBearish) =>
-                (SignalAction::BuyPE, "PE OI buildup in downtrend: put buyers positioning short"),
-            (false, MarketRegime::Bullish | MarketRegime::StrongBullish) =>
-                (SignalAction::BuyCE, "PE OI buildup in uptrend: put writers signaling further upside"),
+            (true, MarketRegime::Bullish | MarketRegime::StrongBullish) => (
+                SignalAction::BuyCE,
+                "CE OI buildup in uptrend: call buyers positioning long",
+            ),
+            (true, MarketRegime::Bearish | MarketRegime::StrongBearish) => (
+                SignalAction::BuyPE,
+                "CE OI buildup in downtrend: call writers signaling downside",
+            ),
+            (false, MarketRegime::Bearish | MarketRegime::StrongBearish) => (
+                SignalAction::BuyPE,
+                "PE OI buildup in downtrend: put buyers positioning short",
+            ),
+            (false, MarketRegime::Bullish | MarketRegime::StrongBullish) => (
+                SignalAction::BuyCE,
+                "PE OI buildup in uptrend: put writers signaling further upside",
+            ),
             // In PANIC, massive PE OI buildup = institutional panic hedging = confirmed bearish.
             // CE OI buildup in PANIC = call writers aggressively piling on the downside.
             // Both unambiguously bearish; DTE constraint is applied at the caller level.
-            (false, MarketRegime::PanicHighVol) =>
-                (SignalAction::BuyPE, "PE OI buildup in panic: institutional hedgers piling short"),
-            (true, MarketRegime::PanicHighVol) =>
-                (SignalAction::BuyPE, "CE OI buildup in panic: call writers aggressively hedging downside"),
+            (false, MarketRegime::PanicHighVol) => (
+                SignalAction::BuyPE,
+                "PE OI buildup in panic: institutional hedgers piling short",
+            ),
+            (true, MarketRegime::PanicHighVol) => (
+                SignalAction::BuyPE,
+                "CE OI buildup in panic: call writers aggressively hedging downside",
+            ),
             _ => return None,
         };
 
@@ -4606,8 +5497,7 @@ impl OptionsEngine {
             if dominant_magnitude < 1_000_000i64 {
                 return None;
             }
-            let pcr_extreme_ok =
-                (action == SignalAction::BuyCE && snap.pcr_oi >= 1.05)
+            let pcr_extreme_ok = (action == SignalAction::BuyCE && snap.pcr_oi >= 1.05)
                 || (action == SignalAction::BuyPE && snap.pcr_oi <= 0.95);
             if !pcr_extreme_ok {
                 return None;
@@ -4621,27 +5511,48 @@ impl OptionsEngine {
         let oi_score = (dominant_magnitude as f64 / oi_divisor).min(30.0);
         score += oi_score;
         reasons.push((
-            format!("{} (OI Δ {}): {}", if is_ce_dominant { "CE dominant" } else { "PE dominant" },
-                dominant_magnitude, quadrant_desc),
+            format!(
+                "{} (OI Δ {}): {}",
+                if is_ce_dominant {
+                    "CE dominant"
+                } else {
+                    "PE dominant"
+                },
+                dominant_magnitude,
+                quadrant_desc
+            ),
             oi_score,
         ));
 
         // Regime alignment is already baked into the quadrant action above; give a small
         // confirmation bonus when the regime is strong.
-        if matches!(snap.regime, MarketRegime::StrongBullish | MarketRegime::StrongBearish) {
+        if matches!(
+            snap.regime,
+            MarketRegime::StrongBullish | MarketRegime::StrongBearish
+        ) {
             score += 10.0;
-            reasons.push((format!("Strong {} regime confirms OI quadrant", snap.regime), 10.0));
+            reasons.push((
+                format!("Strong {} regime confirms OI quadrant", snap.regime),
+                10.0,
+            ));
         }
 
         if (action == SignalAction::BuyCE && snap.pcr_oi > 1.1)
-        || (action == SignalAction::BuyPE && snap.pcr_oi < 0.9) {
+            || (action == SignalAction::BuyPE && snap.pcr_oi < 0.9)
+        {
             score += 15.0;
-            reasons.push((format!("PCR {:.2} confirms OI divergence direction", snap.pcr_oi), 15.0));
+            reasons.push((
+                format!("PCR {:.2} confirms OI divergence direction", snap.pcr_oi),
+                15.0,
+            ));
         }
 
         if snap.iv_rank < 55.0 {
             score += 10.0;
-            reasons.push((format!("IV Rank {:.0}%: options still affordable", snap.iv_rank), 10.0));
+            reasons.push((
+                format!("IV Rank {:.0}%: options still affordable", snap.iv_rank),
+                10.0,
+            ));
         }
 
         let nearby_ce_oi: u64 = nearby.iter().map(|s| s.ce_oi).sum();
@@ -4652,20 +5563,38 @@ impl OptionsEngine {
             let vol_score = (vol_oi_ratio * 20.0).min(12.0);
             score += vol_score;
             reasons.push((
-                format!("Volume/OI ratio {:.2}: strong real activity behind OI change", vol_oi_ratio),
+                format!(
+                    "Volume/OI ratio {:.2}: strong real activity behind OI change",
+                    vol_oi_ratio
+                ),
                 vol_score,
             ));
         }
 
-        if score < 25.0 { return None; }
-        Some((action, score.min(100.0), StrategyType::OIDivergence, reasons))
+        if score < 25.0 {
+            return None;
+        }
+        Some((
+            action,
+            score.min(100.0),
+            StrategyType::OIDivergence,
+            reasons,
+        ))
     }
 
-    fn strategy_iv_skew(&self, snap: &ChainSnapshot) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
-        let atm_idx = snap.strikes.iter()
+    fn strategy_iv_skew(
+        &self,
+        snap: &ChainSnapshot,
+    ) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
+        let atm_idx = snap
+            .strikes
+            .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
-                (a.strike - snap.spot).abs().partial_cmp(&(b.strike - snap.spot).abs()).unwrap()
+                (a.strike - snap.spot)
+                    .abs()
+                    .partial_cmp(&(b.strike - snap.spot).abs())
+                    .unwrap()
             })
             .map(|(i, _)| i)
             .unwrap_or(0);
@@ -4678,7 +5607,9 @@ impl OptionsEngine {
             .map(|s| s.iv_skew)
             .collect();
 
-        if atm_skews.is_empty() { return None; }
+        if atm_skews.is_empty() {
+            return None;
+        }
         let avg_skew = atm_skews.iter().sum::<f64>() / atm_skews.len() as f64;
 
         let mut score = 0.0_f64;
@@ -4697,8 +5628,10 @@ impl OptionsEngine {
             let skew_score = (avg_skew * 200.0).min(35.0);
             score += skew_score;
             reasons.push((
-                format!("IV skew +{:.1}%: call IV >> put IV — extreme greed/squeeze, PE opportunity",
-                    avg_skew * 100.0),
+                format!(
+                    "IV skew +{:.1}%: call IV >> put IV — extreme greed/squeeze, PE opportunity",
+                    avg_skew * 100.0
+                ),
                 skew_score,
             ));
             SignalAction::BuyPE
@@ -4707,26 +5640,48 @@ impl OptionsEngine {
         };
 
         if (action == SignalAction::BuyCE && snap.pcr_oi > 1.2)
-        || (action == SignalAction::BuyPE && snap.pcr_oi < 0.8) {
+            || (action == SignalAction::BuyPE && snap.pcr_oi < 0.8)
+        {
             score += 20.0;
-            reasons.push((format!("PCR {:.2} confirms skew reversion direction", snap.pcr_oi), 20.0));
+            reasons.push((
+                format!("PCR {:.2} confirms skew reversion direction", snap.pcr_oi),
+                20.0,
+            ));
         }
 
         if snap.days_to_expiry > 2.0 {
             score += 8.0;
-            reasons.push((format!("{:.0} DTE: sufficient time for skew to revert", snap.days_to_expiry), 8.0));
+            reasons.push((
+                format!(
+                    "{:.0} DTE: sufficient time for skew to revert",
+                    snap.days_to_expiry
+                ),
+                8.0,
+            ));
         }
 
-        if score < 25.0 { return None; }
-        Some((action, score.min(100.0), StrategyType::IVSkewReversion, reasons))
+        if score < 25.0 {
+            return None;
+        }
+        Some((
+            action,
+            score.min(100.0),
+            StrategyType::IVSkewReversion,
+            reasons,
+        ))
     }
 
-    fn strategy_gex_play(&self, snap: &ChainSnapshot) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
+    fn strategy_gex_play(
+        &self,
+        snap: &ChainSnapshot,
+    ) -> Option<(SignalAction, f64, StrategyType, Vec<(String, f64)>)> {
         // GEX sign (positive vs negative) cannot be reliably determined from OI + Black-Scholes
         // gamma alone — it would require knowing whether dealers are long or short each strike,
         // which is not observable from public OI data. Use magnitude only; direction from regime.
         let gex_magnitude = snap.net_gex.abs();
-        if gex_magnitude < 1e6 { return None; }
+        if gex_magnitude < 1e6 {
+            return None;
+        }
 
         let mut score = 0.0_f64;
         let mut reasons = Vec::new();
@@ -4735,35 +5690,54 @@ impl OptionsEngine {
         let clamped = gex_score.min(30.0);
         score += clamped;
         reasons.push((
-            format!("Net GEX magnitude {:.2e}: high gamma environment, amplified moves likely", gex_magnitude),
+            format!(
+                "Net GEX magnitude {:.2e}: high gamma environment, amplified moves likely",
+                gex_magnitude
+            ),
             clamped,
         ));
 
         let action = match snap.regime {
             MarketRegime::StrongBullish | MarketRegime::Bullish => {
                 score += 20.0;
-                reasons.push(("Bullish regime in high-gamma environment: explosive upside possible".into(), 20.0));
+                reasons.push((
+                    "Bullish regime in high-gamma environment: explosive upside possible".into(),
+                    20.0,
+                ));
                 SignalAction::BuyCE
             }
             MarketRegime::StrongBearish | MarketRegime::Bearish => {
                 score += 20.0;
-                reasons.push(("Bearish regime in high-gamma environment: explosive downside possible".into(), 20.0));
+                reasons.push((
+                    "Bearish regime in high-gamma environment: explosive downside possible".into(),
+                    20.0,
+                ));
                 SignalAction::BuyPE
             }
             // PANIC: sustained fear + high gamma = explosive downside. Direction is clear (bearish).
             MarketRegime::PanicHighVol => {
                 score += 15.0;
-                reasons.push(("Panic regime in high-gamma environment: explosive downside continuation".into(), 15.0));
+                reasons.push((
+                    "Panic regime in high-gamma environment: explosive downside continuation"
+                        .into(),
+                    15.0,
+                ));
                 SignalAction::BuyPE
             }
             _ => {
                 if snap.pcr_oi > 1.2 {
                     score += 10.0;
-                    reasons.push((format!("PCR {:.2}: CE direction for GEX play", snap.pcr_oi), 10.0));
+                    reasons.push((
+                        format!("PCR {:.2}: CE direction for GEX play", snap.pcr_oi),
+                        10.0,
+                    ));
                     SignalAction::BuyCE
                 } else if snap.pcr_oi < 0.8 {
                     score += 10.0;
-                    reasons.push((format!("PCR {:.2}: PE direction for GEX play", snap.pcr_oi), 10.0));
+                    reasons.push((
+                        format!("PCR {:.2}: PE direction for GEX play", snap.pcr_oi),
+                        10.0,
+                    ));
                     SignalAction::BuyPE
                 } else {
                     return None;
@@ -4773,17 +5747,29 @@ impl OptionsEngine {
 
         if snap.iv_rank >= 1.0 && snap.iv_rank < 65.0 {
             score += 10.0;
-            reasons.push((format!("IV Rank {:.0}%: options still reasonably priced for GEX play", snap.iv_rank), 10.0));
+            reasons.push((
+                format!(
+                    "IV Rank {:.0}%: options still reasonably priced for GEX play",
+                    snap.iv_rank
+                ),
+                10.0,
+            ));
         }
 
         // PCR confirmation lifts GEX signal above min_confidence threshold in directional regimes
         if (action == SignalAction::BuyCE && snap.pcr_oi > 1.1)
-        || (action == SignalAction::BuyPE && snap.pcr_oi < 0.9) {
+            || (action == SignalAction::BuyPE && snap.pcr_oi < 0.9)
+        {
             score += 8.0;
-            reasons.push((format!("PCR {:.2} confirms GEX play direction", snap.pcr_oi), 8.0));
+            reasons.push((
+                format!("PCR {:.2} confirms GEX play direction", snap.pcr_oi),
+                8.0,
+            ));
         }
 
-        if score < 25.0 { return None; }
+        if score < 25.0 {
+            return None;
+        }
         Some((action, score.min(100.0), StrategyType::GEXPlay, reasons))
     }
 
@@ -4827,7 +5813,6 @@ impl OptionsEngine {
         cap.clamp(2, 18)
     }
 
-
     fn open_simulated_position(&mut self, signal: &Signal) {
         self.entry_attempts += 1;
         self.reset_daily_state_if_needed();
@@ -4841,38 +5826,34 @@ impl OptionsEngine {
             self.entry_rejections += 1;
             warn!(
                 "Position rejected (daily trade cap): used {} / {} (dynamic={}, config_max={})",
-                used_slots, effective_cap,
-                dynamic_cap,
-                self.max_daily_trades
+                used_slots, effective_cap, dynamic_cap, self.max_daily_trades
             );
             return;
         }
 
         let (token, tradingsymbol) = match signal.action {
-            SignalAction::BuyCE => {
-                self.contracts
-                    .iter()
-                    .find(|c| {
-                        c.underlying == signal.underlying
-                            && c.expiry == signal.expiry
-                            && c.strike == signal.strike
-                            && c.option_type == OptionType::CE
-                    })
-                    .map(|c| (c.instrument_token, c.tradingsymbol.clone()))
-                    .unwrap_or((0, String::new()))
-            }
-            SignalAction::BuyPE => {
-                self.contracts
-                    .iter()
-                    .find(|c| {
-                        c.underlying == signal.underlying
-                            && c.expiry == signal.expiry
-                            && c.strike == signal.strike
-                            && c.option_type == OptionType::PE
-                    })
-                    .map(|c| (c.instrument_token, c.tradingsymbol.clone()))
-                    .unwrap_or((0, String::new()))
-            }
+            SignalAction::BuyCE => self
+                .contracts
+                .iter()
+                .find(|c| {
+                    c.underlying == signal.underlying
+                        && c.expiry == signal.expiry
+                        && c.strike == signal.strike
+                        && c.option_type == OptionType::CE
+                })
+                .map(|c| (c.instrument_token, c.tradingsymbol.clone()))
+                .unwrap_or((0, String::new())),
+            SignalAction::BuyPE => self
+                .contracts
+                .iter()
+                .find(|c| {
+                    c.underlying == signal.underlying
+                        && c.expiry == signal.expiry
+                        && c.strike == signal.strike
+                        && c.option_type == OptionType::PE
+                })
+                .map(|c| (c.instrument_token, c.tradingsymbol.clone()))
+                .unwrap_or((0, String::new())),
             _ => (0, String::new()),
         };
 
@@ -4891,7 +5872,11 @@ impl OptionsEngine {
             return;
         }
 
-        if self.positions.iter().any(|p| p.is_open && p.underlying == signal.underlying) {
+        if self
+            .positions
+            .iter()
+            .any(|p| p.is_open && p.underlying == signal.underlying)
+        {
             self.entry_rejections += 1;
             return;
         }
@@ -4904,7 +5889,11 @@ impl OptionsEngine {
             return;
         }
 
-        if self.positions.iter().any(|p| p.is_open && p.option_token == token) {
+        if self
+            .positions
+            .iter()
+            .any(|p| p.is_open && p.option_token == token)
+        {
             self.entry_rejections += 1;
             return;
         }
@@ -4923,8 +5912,8 @@ impl OptionsEngine {
             (signal.option_price + self.execution_buy_offset_inr).max(0.05)
         };
         let entry_costs = entry_order_cost(entry_fill_price, signal.lot_size, signal.lots);
-        let capital_deployed = entry_fill_price * signal.lot_size as f64 * signal.lots as f64
-            + entry_costs;
+        let capital_deployed =
+            entry_fill_price * signal.lot_size as f64 * signal.lots as f64 + entry_costs;
 
         if self.live_mode_enabled() {
             if capital_deployed > self.available_capital_for_new_orders() {
@@ -4971,15 +5960,19 @@ impl OptionsEngine {
             }
         }
 
-        self.last_signal_ms.insert(signal.underlying.clone(), self.current_time_ms());
+        self.last_signal_ms
+            .insert(signal.underlying.clone(), self.current_time_ms());
 
         let orig_entry = signal.option_price.max(0.01);
         let target_pct = (signal.target_price / orig_entry - 1.0).max(0.0);
-        let stop_pct   = (1.0 - signal.stop_price / orig_entry).clamp(0.01, 0.95);
+        let stop_pct = (1.0 - signal.stop_price / orig_entry).clamp(0.01, 0.95);
         let adjusted_target = entry_fill_price * (1.0 + target_pct);
-        let adjusted_stop   = entry_fill_price * (1.0 - stop_pct);
+        let adjusted_stop = entry_fill_price * (1.0 - stop_pct);
 
-        let pos_id = { self.next_pos_id += 1; self.next_pos_id - 1 };
+        let pos_id = {
+            self.next_pos_id += 1;
+            self.next_pos_id - 1
+        };
         let pos = Position {
             id: pos_id,
             underlying: signal.underlying.clone(),
@@ -5013,11 +6006,14 @@ impl OptionsEngine {
             pos.id, pos.underlying, signal.action, pos.strike, pos.expiry,
             pos.lots, pos.lot_size, pos.entry_price, capital_deployed);
         let actual_target_pct = (pos.target_price / pos.entry_price - 1.0) * 100.0;
-        info!("   Target: ₹{:.2} (+{:.0}%) | Stop: ₹{:.2} (-{:.0}%)",
-            pos.target_price, actual_target_pct,
-            pos.stop_price, self.stop_loss_pct);
-        info!("   Ledger: signals log updated (signal #{}, strategy: {})",
-            signal.id, signal.strategy);
+        info!(
+            "   Target: ₹{:.2} (+{:.0}%) | Stop: ₹{:.2} (-{:.0}%)",
+            pos.target_price, actual_target_pct, pos.stop_price, self.stop_loss_pct
+        );
+        info!(
+            "   Ledger: signals log updated (signal #{}, strategy: {})",
+            signal.id, signal.strategy
+        );
 
         self.positions.push(pos);
         self.last_position_tick_ms = self.current_time_ms();
@@ -5051,7 +6047,10 @@ impl OptionsEngine {
             }
         }
 
-        let pos_id = { self.next_pos_id += 1; self.next_pos_id - 1 };
+        let pos_id = {
+            self.next_pos_id += 1;
+            self.next_pos_id - 1
+        };
         let tag = self.build_order_tag("ENTRY", pos_id);
         let now = self.current_time_ms();
         self.pending_capital_reserved += estimated_capital;
@@ -5115,8 +6114,8 @@ impl OptionsEngine {
         };
         let entry_datetime = datetime_string_from_ms(self.current_time_ms());
         let entry_costs = entry_order_cost(entry_fill_price, signal.lot_size, signal.lots);
-        let capital_deployed = entry_fill_price * signal.lot_size as f64 * signal.lots as f64
-            + entry_costs;
+        let capital_deployed =
+            entry_fill_price * signal.lot_size as f64 * signal.lots as f64 + entry_costs;
         if !self.risk.reserve_capital(capital_deployed) {
             self.entry_rejections += 1;
             // This path should be rare with Issue 1 fixed (capital held until
@@ -5203,18 +6202,15 @@ impl OptionsEngine {
             checkpoints_evaluated: 0,
         };
 
-        self.last_signal_ms.insert(signal.underlying.clone(), self.current_time_ms());
+        self.last_signal_ms
+            .insert(signal.underlying.clone(), self.current_time_ms());
         self.positions.push(pos);
         self.last_position_tick_ms = self.current_time_ms();
         self.positions_opened += 1;
         self.daily_trades_opened += 1;
         info!(
             "✅ BUY FILLED -> POSITION OPEN #{} | {} {} {:.0} | Entry ₹{:.2}",
-            pending.pos_id,
-            signal.underlying,
-            signal.action,
-            signal.strike,
-            entry_fill_price
+            pending.pos_id, signal.underlying, signal.action, signal.strike, entry_fill_price
         );
         true
     }
@@ -5296,8 +6292,12 @@ impl OptionsEngine {
     fn close_position_at(&mut self, idx: usize, current_price: f64, reason: String) {
         let live_mode = self.live_mode_enabled();
         let (quantity, tradingsymbol, pos_id) = {
-            let Some(pos) = self.positions.get_mut(idx) else { return; };
-            if !pos.is_open || pos.exit_pending { return; }
+            let Some(pos) = self.positions.get_mut(idx) else {
+                return;
+            };
+            if !pos.is_open || pos.exit_pending {
+                return;
+            }
             if live_mode {
                 pos.exit_pending = true;
                 pos.exit_reason = reason.clone();
@@ -5318,8 +6318,10 @@ impl OptionsEngine {
                     side: OrderSide::Sell,
                     limit_price: Some(current_price),
                 }));
-                self.send_order_command(OrderCommand::StatusByTag { tag: exit_tag.clone() });
-                
+                self.send_order_command(OrderCommand::StatusByTag {
+                    tag: exit_tag.clone(),
+                });
+
                 self.pending_exit_orders.push(PendingExitOrder {
                     pos_id,
                     tag: exit_tag,
@@ -5372,8 +6374,12 @@ impl OptionsEngine {
             pnl_pct,
             holding_mins,
         ) = {
-            let Some(pos) = self.positions.get_mut(idx) else { return; };
-            if !pos.is_open { return; }
+            let Some(pos) = self.positions.get_mut(idx) else {
+                return;
+            };
+            if !pos.is_open {
+                return;
+            }
 
             pos.is_open = false;
             pos.exit_pending = false;
@@ -5382,7 +6388,8 @@ impl OptionsEngine {
             pos.exit_reason = reason.clone();
             self.capital_sync_needed = should_sync_capital;
 
-            let gross_pnl = (exit_fill_price - pos.entry_price) * pos.lot_size as f64 * pos.lots as f64;
+            let gross_pnl =
+                (exit_fill_price - pos.entry_price) * pos.lot_size as f64 * pos.lots as f64;
             let entry_costs = entry_order_cost(pos.entry_price, pos.lot_size, pos.lots);
             let exit_costs = exit_order_cost(exit_fill_price, pos.lot_size, pos.lots, exit_time_ms);
             let costs = entry_costs + exit_costs;
@@ -5393,7 +6400,8 @@ impl OptionsEngine {
                 0.0
             };
 
-            let holding_mins = (pos.exit_time_ms.saturating_sub(pos.entry_time_ms)) as f64 / 60_000.0;
+            let holding_mins =
+                (pos.exit_time_ms.saturating_sub(pos.entry_time_ms)) as f64 / 60_000.0;
             let option_type_str = match pos.action {
                 SignalAction::BuyCE => "CE".to_string(),
                 SignalAction::BuyPE => "PE".to_string(),
@@ -5401,11 +6409,27 @@ impl OptionsEngine {
             };
 
             (
-                pos.id, pos.entry_ctx.clone(), pos.underlying.clone(), pos.tradingsymbol.clone(),
-                option_type_str, pos.strike, pos.expiry.clone(), pos.entry_datetime.clone(),
-                datetime_string_from_ms(pos.exit_time_ms), pos.entry_price, pos.exit_price,
-                pos.lots, pos.lot_size, pos.capital_deployed, pos.target_price, pos.stop_price,
-                gross_pnl, costs, pos.pnl, pos.pnl_pct, holding_mins,
+                pos.id,
+                pos.entry_ctx.clone(),
+                pos.underlying.clone(),
+                pos.tradingsymbol.clone(),
+                option_type_str,
+                pos.strike,
+                pos.expiry.clone(),
+                pos.entry_datetime.clone(),
+                datetime_string_from_ms(pos.exit_time_ms),
+                pos.entry_price,
+                pos.exit_price,
+                pos.lots,
+                pos.lot_size,
+                pos.capital_deployed,
+                pos.target_price,
+                pos.stop_price,
+                gross_pnl,
+                costs,
+                pos.pnl,
+                pos.pnl_pct,
+                holding_mins,
             )
         };
 
@@ -5424,8 +6448,14 @@ impl OptionsEngine {
         self.positions_closed += 1;
 
         if is_stop {
-            let next = self.stop_streak_by_underlying.get(&underlying).copied().unwrap_or(0).saturating_add(1);
-            self.stop_streak_by_underlying.insert(underlying.clone(), next);
+            let next = self
+                .stop_streak_by_underlying
+                .get(&underlying)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            self.stop_streak_by_underlying
+                .insert(underlying.clone(), next);
         } else if is_target {
             self.stop_streak_by_underlying.insert(underlying.clone(), 0);
         }
@@ -5463,10 +6493,73 @@ impl OptionsEngine {
         );
     }
 
+    /// Env-gated (`SATA_EXIT_ON_REVERSAL`) exit rule. Returns `Some(reason)` when the open
+    /// position at index `i` should be closed because its ENTRY directional thesis has been
+    /// contradicted by the current spot technical bias for a confirmed stretch of scans.
+    ///
+    /// Reuses the exact same technical machinery the entry gate uses (`SpotSeries::bias()`,
+    /// the EMA/BB/RSI/Fib panel). Confirmation is scan-gated: the counter advances at most
+    /// once per scan (the bias is frozen between scans), needs the opposing bias to persist
+    /// for `reversal_confirm_scans` consecutive scans, and only counts a bias whose strength
+    /// is at least `reversal_min_strength` — both guards suppress single-tick whipsaw.
+    ///
+    /// DEFAULT OFF: with the toggle disabled this returns `None` immediately and never touches
+    /// `reversal_state`, so live behaviour and every existing test are unchanged.
+    fn thesis_reversal_exit(&mut self, i: usize) -> Option<String> {
+        if !self.exit_on_reversal {
+            return None;
+        }
+        let (id, action, underlying) = {
+            let p = &self.positions[i];
+            (p.id, p.action, p.underlying.clone())
+        };
+        let thesis = match action {
+            SignalAction::BuyCE => crate::technicals::Direction::Bull,
+            SignalAction::BuyPE => crate::technicals::Direction::Bear,
+            _ => return None,
+        };
+        let opposite = match thesis {
+            crate::technicals::Direction::Bull => crate::technicals::Direction::Bear,
+            crate::technicals::Direction::Bear => crate::technicals::Direction::Bull,
+            crate::technicals::Direction::Neutral => return None,
+        };
+
+        // Advance the confirmation counter at most once per scan. Between scans the spot bias
+        // is frozen (spot_series only ingests inside run_full_scan), so re-counting on every
+        // tick would just inflate the streak spuriously.
+        let scan = self.scan_count;
+        let (last_scan, count) = self.reversal_state.get(&id).copied().unwrap_or((0, 0));
+        if last_scan == scan {
+            return None;
+        }
+
+        let bias = match self.spot_series.get(&underlying) {
+            Some(s) => s.bias(),
+            None => return None,
+        };
+        let contradicted =
+            bias.direction == opposite && bias.strength >= self.reversal_min_strength;
+        let new_count = if contradicted { count + 1 } else { 0 };
+        self.reversal_state.insert(id, (scan, new_count));
+
+        if new_count >= self.reversal_confirm_scans {
+            Some(format!(
+                "Thesis reversal: entry {:?} contradicted by spot bias {:?} (strength {:.0}%) for {} consecutive scans",
+                thesis,
+                bias.direction,
+                bias.strength * 100.0,
+                new_count
+            ))
+        } else {
+            None
+        }
+    }
+
     fn check_open_positions(&mut self) {
         // Compute IST minutes once for dynamic closing window logic.
         let close_ist_mins = {
-            let now_utc = Utc.timestamp_millis_opt(self.current_time_ms() as i64)
+            let now_utc = Utc
+                .timestamp_millis_opt(self.current_time_ms() as i64)
                 .single()
                 .unwrap_or_else(Utc::now);
             let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
@@ -5505,13 +6598,17 @@ impl OptionsEngine {
                     pos.lot_size,
                 )
             };
-            if !is_open { continue; }
+            if !is_open {
+                continue;
+            }
 
             let current_price = match self.store.get(option_token) {
                 Some(t) if t.ltp > 0.0 => t.ltp,
                 _ => continue,
             };
-            if entry_price <= 0.0 { continue; }
+            if entry_price <= 0.0 {
+                continue;
+            }
 
             // One-shot profit lock: below the arm threshold the original stop stays in place;
             // after the lock, the hold cap is extended so eligible runners have room to target.
@@ -5529,16 +6626,10 @@ impl OptionsEngine {
                 self.profit_lock_gain_pct
             } else {
                 let qty = (lots * lot_size) as f64;
-                let assumed_exit =
-                    entry_price * (1.0 + RIGID_PROFIT_LOCK_GAIN_PCT / 100.0);
+                let assumed_exit = entry_price * (1.0 + RIGID_PROFIT_LOCK_GAIN_PCT / 100.0);
                 let friction_pct = if qty > 0.0 {
-                    (round_trip_order_cost(
-                        entry_price,
-                        assumed_exit,
-                        lot_size,
-                        lots,
-                        now_ms,
-                    ) + self.execution_sell_offset_inr * qty)
+                    (round_trip_order_cost(entry_price, assumed_exit, lot_size, lots, now_ms)
+                        + self.execution_sell_offset_inr * qty)
                         / (entry_price * qty)
                         * 100.0
                 } else {
@@ -5599,17 +6690,43 @@ impl OptionsEngine {
                 if trail_stop > pos.stop_price {
                     pos.stop_price = trail_stop;
                     pos.checkpoints_evaluated = pos.checkpoints_evaluated.max(3);
-                    info!("  Trail +{:.1}% ({:.0}% giveback): pos #{} {} stop → ₹{:.2} (ltp ₹{:.2})",
-                        abs_gain_pct, trail_giveback_pct, pos.id, pos.underlying, pos.stop_price, current_price);
+                    info!(
+                        "  Trail +{:.1}% ({:.0}% giveback): pos #{} {} stop → ₹{:.2} (ltp ₹{:.2})",
+                        abs_gain_pct,
+                        trail_giveback_pct,
+                        pos.id,
+                        pos.underlying,
+                        pos.stop_price,
+                        current_price
+                    );
                 }
             }
         }
 
         for i in 0..self.positions.len() {
-            let (is_open, option_token, target_price, stop_price, confidence, entry_time_ms) = {
+            let (
+                is_open,
+                option_token,
+                target_price,
+                stop_price,
+                confidence,
+                entry_time_ms,
+                entry_price,
+                lots,
+                lot_size,
+            ) = {
                 let pos = &self.positions[i];
-                (pos.is_open, pos.option_token, pos.target_price, pos.stop_price,
-                 pos.entry_ctx.confidence, pos.entry_time_ms)
+                (
+                    pos.is_open,
+                    pos.option_token,
+                    pos.target_price,
+                    pos.stop_price,
+                    pos.entry_ctx.confidence,
+                    pos.entry_time_ms,
+                    pos.entry_price,
+                    pos.lots,
+                    pos.lot_size,
+                )
             };
             if !is_open {
                 continue;
@@ -5651,17 +6768,61 @@ impl OptionsEngine {
                 false
             };
 
-            let exit_reason = if max_hold_expired {
-                Some(format!("Time stop: {}-min max hold ({:.0} min held)", max_hold_mins, holding_ms as f64 / 60_000.0))
+            // Env-gated thesis-reversal check (default OFF). Evaluated every tick but the
+            // confirmation counter self-gates to once per scan. Placed below the definitive
+            // price/time exits: if the trade already hit its stop/target/time it exits on
+            // those; the reversal rule only bites while the price sits between stop and target.
+            let reversal_reason = self.thesis_reversal_exit(i);
+
+            // Robust mechanism 3 (env-gated, DEFAULT OFF) — HARD per-trade rupee-loss cap, the
+            // key invariant: a position can NEVER realise a net loss worse than
+            // MAX_TRADE_LOSS_FRAC × capital. This is INDEPENDENT of the % stop: it flattens as
+            // soon as the LIVE net loss (post-cost, at the current book price) reaches the cap,
+            // which for an over-deployed trade happens BEFORE the wider % stop price is touched.
+            // Reference capital is the day-start capital (a fixed rupee cap for the whole day,
+            // consistent with the daily circuit). Checked FIRST so it wins over every other exit.
+            let hard_cap_reason = if self.robust_risk.enabled {
+                let gross = (current_price - entry_price) * lot_size as f64 * lots as f64;
+                let costs =
+                    round_trip_order_cost(entry_price, current_price, lot_size, lots, now_ms);
+                let net = gross - costs;
+                let cap = self.robust_risk.max_trade_loss_frac * self.risk.daily_start_capital;
+                if cap > 0.0 && net <= -cap {
+                    Some(format!(
+                        "HARD LOSS CAP: net ₹{:.0} ≤ -₹{:.0} ({:.0}% of capital) @ ₹{:.2}",
+                        net,
+                        cap,
+                        self.robust_risk.max_trade_loss_frac * 100.0,
+                        current_price
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let exit_reason = if let Some(reason) = hard_cap_reason {
+                Some(reason)
+            } else if max_hold_expired {
+                Some(format!(
+                    "Time stop: {}-min max hold ({:.0} min held)",
+                    max_hold_mins,
+                    holding_ms as f64 / 60_000.0
+                ))
             } else if time_force_exit {
-                Some(format!("Time stop: market closing ({:02}:{:02} IST, conf {:.0})",
-                    close_ist_mins / 60, close_ist_mins % 60, confidence))
+                Some(format!(
+                    "Time stop: market closing ({:02}:{:02} IST, conf {:.0})",
+                    close_ist_mins / 60,
+                    close_ist_mins % 60,
+                    confidence
+                ))
             } else if current_price >= target_price {
                 Some(format!("TARGET HIT ₹{:.2}", current_price))
             } else if current_price <= stop_price {
                 Some(format!("STOP HIT ₹{:.2}", current_price))
             } else {
-                None
+                reversal_reason
             };
 
             if let Some(reason) = exit_reason {
@@ -5670,28 +6831,50 @@ impl OptionsEngine {
         }
     }
 
-
     fn log_chain_analysis(&self, snap: &ChainSnapshot) {
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-        info!("📊 CHAIN ANALYSIS | {} | Spot: ₹{:.2} | {}",
-            snap.underlying, snap.spot, snap.regime);
-        info!("   Expiry: {} ({:.1} DTE) | Session: {}",
-            snap.expiry, snap.days_to_expiry, self.current_session());
-        info!("   PCR(OI): {:.2} | PCR(Vol): {:.2} | IV Rank: {:.0}% | ATM IV: {:.1}%",
-            snap.pcr_oi, snap.pcr_vol, snap.iv_rank, snap.atm_iv * 100.0);
-        info!("   Max Pain: ₹{:.0} | Spot vs MaxPain: {:+.0} pts | GEX: {:.2e}",
+        info!(
+            "📊 CHAIN ANALYSIS | {} | Spot: ₹{:.2} | {}",
+            snap.underlying, snap.spot, snap.regime
+        );
+        info!(
+            "   Expiry: {} ({:.1} DTE) | Session: {}",
+            snap.expiry,
+            snap.days_to_expiry,
+            self.current_session()
+        );
+        info!(
+            "   PCR(OI): {:.2} | PCR(Vol): {:.2} | IV Rank: {:.0}% | ATM IV: {:.1}%",
+            snap.pcr_oi,
+            snap.pcr_vol,
+            snap.iv_rank,
+            snap.atm_iv * 100.0
+        );
+        info!(
+            "   Max Pain: ₹{:.0} | Spot vs MaxPain: {:+.0} pts | GEX: {:.2e}",
             snap.max_pain,
             snap.spot - snap.max_pain,
-            snap.net_gex);
-        info!("   Total CE OI: {} | Total PE OI: {} | CE Vol: {} | PE Vol: {}",
-            snap.total_ce_oi, snap.total_pe_oi, snap.total_ce_vol, snap.total_pe_vol);
-        info!("   Kelly fraction: {:.1}% | Available capital: ₹{:.2}",
-            self.risk.kelly_fraction() * 100.0, self.risk.available_capital());
+            snap.net_gex
+        );
+        info!(
+            "   Total CE OI: {} | Total PE OI: {} | CE Vol: {} | PE Vol: {}",
+            snap.total_ce_oi, snap.total_pe_oi, snap.total_ce_vol, snap.total_pe_vol
+        );
+        info!(
+            "   Kelly fraction: {:.1}% | Available capital: ₹{:.2}",
+            self.risk.kelly_fraction() * 100.0,
+            self.risk.available_capital()
+        );
 
-        let atm_idx = snap.strikes.iter()
+        let atm_idx = snap
+            .strikes
+            .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
-                (a.strike - snap.spot).abs().partial_cmp(&(b.strike - snap.spot).abs()).unwrap()
+                (a.strike - snap.spot)
+                    .abs()
+                    .partial_cmp(&(b.strike - snap.spot).abs())
+                    .unwrap()
             })
             .map(|(i, _)| i)
             .unwrap_or(0);
@@ -5699,54 +6882,105 @@ impl OptionsEngine {
         let lo = atm_idx.saturating_sub(3);
         let hi = (atm_idx + 4).min(snap.strikes.len());
 
-        info!("   {:<8} {:>8} {:>8} {:>10} {:>10} {:>8} {:>8} {:>8} {:>8}",
-            "STRIKE", "CE LTP", "PE LTP", "CE OI", "PE OI", "CE IV%", "PE IV%", "IV SKEW", "STRADDLE");
+        info!(
+            "   {:<8} {:>8} {:>8} {:>10} {:>10} {:>8} {:>8} {:>8} {:>8}",
+            "STRIKE",
+            "CE LTP",
+            "PE LTP",
+            "CE OI",
+            "PE OI",
+            "CE IV%",
+            "PE IV%",
+            "IV SKEW",
+            "STRADDLE"
+        );
         for s in &snap.strikes[lo..hi] {
-            let atm_marker = if (s.strike - snap.atm_strike).abs() < 0.1 { " ← ATM" } else { "" };
-            info!("   {:<8.0} {:>8.2} {:>8.2} {:>10} {:>10} {:>8.1} {:>8.1} {:>8.1}% {:>8.2}{}",
-                s.strike, s.ce_ltp, s.pe_ltp,
-                s.ce_oi, s.pe_oi,
-                s.ce_iv * 100.0, s.pe_iv * 100.0,
+            let atm_marker = if (s.strike - snap.atm_strike).abs() < 0.1 {
+                " ← ATM"
+            } else {
+                ""
+            };
+            info!(
+                "   {:<8.0} {:>8.2} {:>8.2} {:>10} {:>10} {:>8.1} {:>8.1} {:>8.1}% {:>8.2}{}",
+                s.strike,
+                s.ce_ltp,
+                s.pe_ltp,
+                s.ce_oi,
+                s.pe_oi,
+                s.ce_iv * 100.0,
+                s.pe_iv * 100.0,
                 s.iv_skew * 100.0,
                 s.straddle_premium,
-                atm_marker);
+                atm_marker
+            );
         }
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     }
 
     fn log_signal(&self, sig: &Signal, snap: &ChainSnapshot) {
         info!("╔═══════════════════════════════════════════════════════════╗");
-        info!("║  🎯 TRADE SIGNAL #{} — CONFIDENCE: {:.0}/100             ║", sig.id, sig.confidence);
+        info!(
+            "║  🎯 TRADE SIGNAL #{} — CONFIDENCE: {:.0}/100             ║",
+            sig.id, sig.confidence
+        );
         info!("╚═══════════════════════════════════════════════════════════╝");
-        info!("  Action    : {} {} {:.0} {} ({})",
-            sig.action, sig.underlying, sig.strike, sig.expiry, sig.strategy);
+        info!(
+            "  Action    : {} {} {:.0} {} ({})",
+            sig.action, sig.underlying, sig.strike, sig.expiry, sig.strategy
+        );
         info!("  Session   : {} | Regime: {}", sig.session, snap.regime);
         info!("  ─────────────────────────────────────────────────────────");
-        info!("  Entry     : ₹{:.2} × {} lots × {} units = ₹{:.2} total outlay",
-            sig.option_price, sig.lots, sig.lot_size, sig.capital_required);
-        info!("  Target    : ₹{:.2} (+{:.0}%) → MAX PROFIT ₹{:.2}",
-            sig.target_price, self.profit_target_pct, sig.max_profit_target);
-        info!("  Stop Loss : ₹{:.2} (-{:.0}%) → MAX LOSS   ₹{:.2}",
-            sig.stop_price, self.stop_loss_pct, sig.max_loss);
-        info!("  R:R Ratio : {:.2}:1 | Breakeven move: {:.2}% of spot",
-            sig.risk_reward, sig.breakeven_move_pct);
+        info!(
+            "  Entry     : ₹{:.2} × {} lots × {} units = ₹{:.2} total outlay",
+            sig.option_price, sig.lots, sig.lot_size, sig.capital_required
+        );
+        info!(
+            "  Target    : ₹{:.2} (+{:.0}%) → MAX PROFIT ₹{:.2}",
+            sig.target_price, self.profit_target_pct, sig.max_profit_target
+        );
+        info!(
+            "  Stop Loss : ₹{:.2} (-{:.0}%) → MAX LOSS   ₹{:.2}",
+            sig.stop_price, self.stop_loss_pct, sig.max_loss
+        );
+        info!(
+            "  R:R Ratio : {:.2}:1 | Breakeven move: {:.2}% of spot",
+            sig.risk_reward, sig.breakeven_move_pct
+        );
         info!("  ─────────────────────────────────────────────────────────");
         info!("  RATIONALE (why this trade):");
         for (reason, contribution) in &sig.reasons {
             info!("    [{:+.0} pts] {}", contribution, reason);
         }
         info!("  ─────────────────────────────────────────────────────────");
-        info!("  Kelly fraction: {:.1}% | Capital after entry: ₹{:.2}",
+        info!(
+            "  Kelly fraction: {:.1}% | Capital after entry: ₹{:.2}",
             self.risk.kelly_fraction() * 100.0,
-            (self.risk.available_capital() - sig.capital_required).max(0.0));
-        info!("  Progress to ₹50,000: {:.1}%", (self.risk.capital / 50_000.0) * 100.0);
+            (self.risk.available_capital() - sig.capital_required).max(0.0)
+        );
+        info!(
+            "  Progress to ₹50,000: {:.1}%",
+            (self.risk.capital / 50_000.0) * 100.0
+        );
         info!("  ─────────────────────────────────────────────────────────");
-        info!("  ⚡ EXECUTE ON ZERODHA: {} NSE {} {:.0} {}",
-            if sig.action == SignalAction::BuyCE { "BUY" } else { "BUY" },
-            sig.underlying, sig.strike,
-            if sig.action == SignalAction::BuyCE { "CE" } else { "PE" });
-        info!("  ⚠️  SET SL AT: ₹{:.2} | SET TARGET AT: ₹{:.2}",
-            sig.stop_price, sig.target_price);
+        info!(
+            "  ⚡ EXECUTE ON ZERODHA: {} NSE {} {:.0} {}",
+            if sig.action == SignalAction::BuyCE {
+                "BUY"
+            } else {
+                "BUY"
+            },
+            sig.underlying,
+            sig.strike,
+            if sig.action == SignalAction::BuyCE {
+                "CE"
+            } else {
+                "PE"
+            }
+        );
+        info!(
+            "  ⚠️  SET SL AT: ₹{:.2} | SET TARGET AT: ₹{:.2}",
+            sig.stop_price, sig.target_price
+        );
         info!("═════════════════════════════════════════════════════════════");
     }
 
@@ -5760,22 +6994,57 @@ impl OptionsEngine {
         info!("┌─────────────────────────────────────────────────────────┐");
         info!("│  PORTFOLIO SUMMARY — SATAVAHANA OPTIONS ENGINE          │");
         info!("├─────────────────────────────────────────────────────────┤");
-        info!("│  Starting Capital : ₹{:<10.2}                          │", self.risk.initial_capital);
-        info!("│  Current Capital  : ₹{:<10.2}                          │", self.risk.capital);
-        info!("│  Available Cap.   : ₹{:<10.2}                          │", self.risk.available_capital());
-        info!("│  Progress         : {:.1}% → ₹50,000                   │", (self.risk.capital / 50_000.0) * 100.0);
-        info!("│  Total PnL        : ₹{:<+10.2}  ({:+.1}%)              │",
-            total_pnl, (total_pnl / self.risk.initial_capital) * 100.0);
-        info!("│  Open Positions   : {}                                   │", open_positions.len());
-        info!("│  Closed Trades    : {} wins / {} losses                 │", wins, losses);
-        info!("│  Trades Opened Day: {}                                   │", self.daily_trades_opened);
+        info!(
+            "│  Starting Capital : ₹{:<10.2}                          │",
+            self.risk.initial_capital
+        );
+        info!(
+            "│  Current Capital  : ₹{:<10.2}                          │",
+            self.risk.capital
+        );
+        info!(
+            "│  Available Cap.   : ₹{:<10.2}                          │",
+            self.risk.available_capital()
+        );
+        info!(
+            "│  Progress         : {:.1}% → ₹50,000                   │",
+            (self.risk.capital / 50_000.0) * 100.0
+        );
+        info!(
+            "│  Total PnL        : ₹{:<+10.2}  ({:+.1}%)              │",
+            total_pnl,
+            (total_pnl / self.risk.initial_capital) * 100.0
+        );
+        info!(
+            "│  Open Positions   : {}                                   │",
+            open_positions.len()
+        );
+        info!(
+            "│  Closed Trades    : {} wins / {} losses                 │",
+            wins, losses
+        );
+        info!(
+            "│  Trades Opened Day: {}                                   │",
+            self.daily_trades_opened
+        );
         if wins + losses > 0 {
-            info!("│  Win Rate         : {:.1}%                              │",
-                wins as f64 / (wins + losses) as f64 * 100.0);
+            info!(
+                "│  Win Rate         : {:.1}%                              │",
+                wins as f64 / (wins + losses) as f64 * 100.0
+            );
         }
-        info!("│  Kelly Fraction   : {:.1}% (half-Kelly adaptive)        │", self.risk.kelly_fraction() * 100.0);
-        info!("│  Circuit Breaker  : {}                                │",
-            if self.risk.circuit_breaker_triggered() { "TRIGGERED ⛔" } else { "OK ✅           " });
+        info!(
+            "│  Kelly Fraction   : {:.1}% (half-Kelly adaptive)        │",
+            self.risk.kelly_fraction() * 100.0
+        );
+        info!(
+            "│  Circuit Breaker  : {}                                │",
+            if self.risk.circuit_breaker_triggered() {
+                "TRIGGERED ⛔"
+            } else {
+                "OK ✅           "
+            }
+        );
         info!("└─────────────────────────────────────────────────────────┘");
     }
 }
@@ -5783,31 +7052,15 @@ impl OptionsEngine {
 #[cfg(test)]
 mod tests {
     use super::{
-        advance_replay_scan_anchor,
-        entry_cost_per_lot_excl_brokerage,
-        entry_cutoff_ist_mins_for_dte,
-        entry_order_cost,
-        ENTRY_SCAN_VALIDATION_GRACE_MS,
-        nearest_affordable_otm_idx,
-        options_brokerage_per_order,
-        past_entry_cutoff_ist,
-        composite_spot_reversal_passes_quality,
-        far_dte_composite_midday_block,
-        far_dte_composite_is_late_rsi_chase,
-        should_block_zero_dte_flow,
-        standalone_spot_reversal_is_late_rsi_chase,
-        OptionsEngine,
-        PendingEntryOrder,
-        PendingExitOrder,
-        Position,
-        RiskEngine,
-        SessionPhase,
-        Signal,
-        SignalAction,
-        StrikeScanDirection,
-        StrategyType,
-        FEED_SOFT_STALE_MS,
-        MIN_TRADEABLE_OPTION_PRICE,
+        advance_replay_scan_anchor, composite_spot_reversal_passes_quality,
+        entry_cost_per_lot_excl_brokerage, entry_cutoff_ist_mins_for_dte, entry_order_cost,
+        far_dte_composite_is_late_rsi_chase, far_dte_composite_midday_block,
+        nearest_affordable_otm_idx, options_brokerage_per_order, past_entry_cutoff_ist,
+        round_trip_order_cost, should_block_zero_dte_flow,
+        standalone_spot_reversal_is_late_rsi_chase, OptionsEngine, PendingEntryOrder,
+        PendingExitOrder, Position, RiskEngine, RobustRiskConfig, SessionPhase, Signal,
+        SignalAction, StrategyType, StrikeScanDirection, ENTRY_SCAN_VALIDATION_GRACE_MS,
+        FEED_SOFT_STALE_MS, MIN_TRADEABLE_OPTION_PRICE,
     };
     use crate::config::OptionsEngineConfig;
     use crate::execution::{OrderCommand, OrderSide, OrderUpdate};
@@ -5820,8 +7073,14 @@ mod tests {
     #[test]
     fn replay_scan_anchor_does_not_accumulate_tick_delay() {
         assert_eq!(advance_replay_scan_anchor(None, 1_000, 30_000), 1_000);
-        assert_eq!(advance_replay_scan_anchor(Some(1_000), 31_600, 30_000), 31_000);
-        assert_eq!(advance_replay_scan_anchor(Some(31_000), 61_900, 30_000), 61_000);
+        assert_eq!(
+            advance_replay_scan_anchor(Some(1_000), 31_600, 30_000),
+            31_000
+        );
+        assert_eq!(
+            advance_replay_scan_anchor(Some(31_000), 61_900, 30_000),
+            61_000
+        );
     }
 
     #[test]
@@ -5830,14 +7089,29 @@ mod tests {
         // Fresh feed: business as usual.
         assert_eq!(feed_stale_action(1_000, true, true), FeedAction::Normal);
         // Soft-stale: stop opening new trades, but do not panic-flatten yet (WS may recover).
-        assert_eq!(feed_stale_action(FEED_SOFT_STALE_MS, true, true), FeedAction::SkipNewEntries);
-        assert_eq!(feed_stale_action(FEED_SOFT_STALE_MS, true, false), FeedAction::SkipNewEntries);
+        assert_eq!(
+            feed_stale_action(FEED_SOFT_STALE_MS, true, true),
+            FeedAction::SkipNewEntries
+        );
+        assert_eq!(
+            feed_stale_action(FEED_SOFT_STALE_MS, true, false),
+            FeedAction::SkipNewEntries
+        );
         // Hard-stale with an open position: flatten + halt.
-        assert_eq!(feed_stale_action(FEED_HARD_STALE_MS, true, true), FeedAction::FlattenAndHalt);
+        assert_eq!(
+            feed_stale_action(FEED_HARD_STALE_MS, true, true),
+            FeedAction::FlattenAndHalt
+        );
         // Hard-stale but flat: nothing to protect, just hold new entries.
-        assert_eq!(feed_stale_action(FEED_HARD_STALE_MS, true, false), FeedAction::SkipNewEntries);
+        assert_eq!(
+            feed_stale_action(FEED_HARD_STALE_MS, true, false),
+            FeedAction::SkipNewEntries
+        );
         // Outside market hours a quiet feed is normal — never a false flatten.
-        assert_eq!(feed_stale_action(FEED_HARD_STALE_MS, false, true), FeedAction::Normal);
+        assert_eq!(
+            feed_stale_action(FEED_HARD_STALE_MS, false, true),
+            FeedAction::Normal
+        );
     }
 
     fn test_config() -> OptionsEngineConfig {
@@ -6044,8 +7318,14 @@ mod tests {
             !standalone_spot_reversal_is_late_rsi_chase(SignalAction::BuyCE, 56.6),
             "06-24-style standalone CE in mid RSI band remains eligible"
         );
-        assert!(!standalone_spot_reversal_is_late_rsi_chase(SignalAction::BuyPE, 37.0));
-        assert!(!standalone_spot_reversal_is_late_rsi_chase(SignalAction::Hold, 80.0));
+        assert!(!standalone_spot_reversal_is_late_rsi_chase(
+            SignalAction::BuyPE,
+            37.0
+        ));
+        assert!(!standalone_spot_reversal_is_late_rsi_chase(
+            SignalAction::Hold,
+            80.0
+        ));
     }
 
     #[test]
@@ -6134,7 +7414,10 @@ mod tests {
             !far_dte_composite_is_late_rsi_chase(SignalAction::BuyPE, 32.4),
             "06-19-style bearish continuation with RSI above panic tail remains eligible"
         );
-        assert!(!far_dte_composite_is_late_rsi_chase(SignalAction::BuyCE, 64.2));
+        assert!(!far_dte_composite_is_late_rsi_chase(
+            SignalAction::BuyCE,
+            64.2
+        ));
     }
 
     #[test]
@@ -6168,7 +7451,10 @@ mod tests {
         assert!(!lower.circuit_breaker_triggered(), "-14.8% still open");
         lower.record_trade(-20.0); // total -760 (-15.2%) => lower circuit
         assert!(lower.circuit_breaker_triggered());
-        assert_eq!(lower.circuit_reason(), Some("LOWER circuit (daily loss limit)"));
+        assert_eq!(
+            lower.circuit_reason(),
+            Some("LOWER circuit (daily loss limit)")
+        );
 
         let mut upper = RiskEngine::new(5_000.0, 0.15, 0.35);
         upper.record_trade(1_700.0); // +34% still open
@@ -6186,15 +7472,8 @@ mod tests {
         let mut cfg = test_config();
         cfg.max_daily_trades = 0;
         let store = TickStore::new();
-        let engine = OptionsEngine::new(
-            Vec::new(),
-            store,
-            HashMap::new(),
-            &cfg,
-            0.065,
-            0.0,
-            "/tmp",
-        );
+        let engine =
+            OptionsEngine::new(Vec::new(), store, HashMap::new(), &cfg, 0.065, 0.0, "/tmp");
         let signal = Signal {
             id: 1,
             underlying: "NIFTY".to_string(),
@@ -6289,38 +7568,379 @@ mod tests {
         )
     }
 
+    /// The four-mechanism robust risk-control config used by the tests below, injected directly
+    /// on the struct (no env vars) so parallel tests never race on process-global state.
+    fn robust_on() -> RobustRiskConfig {
+        RobustRiskConfig {
+            enabled: true,
+            risk_frac: 0.02,
+            premium_cap_frac: 0.33,
+            max_trade_loss_frac: 0.05,
+            min_rr: 1.2,
+        }
+    }
+
+    /// Mechanisms 1 (fixed-fractional sizing) + 2 (premium deployment cap): with the layer ON,
+    /// an entry that the baseline would size at ≥2 lots is capped so it deploys ≤ PREMIUM_CAP_FRAC
+    /// of capital, and OFF the sizing is byte-for-byte the baseline.
+    #[test]
+    fn robust_sizing_caps_lots_and_deployment() {
+        let capital = 14_000.0;
+        let option_price = 40.0; // ~₹2,600 premium/lot at NIFTY lot size 65
+        let lot_size = 65u32;
+        let stop_pct = 0.23; // the 08-05-shape wide stop
+
+        // Baseline (layer OFF): its result is unchanged from production sizing.
+        let mut re = RiskEngine::new(capital, 0.15, 0.35);
+        re.robust = RobustRiskConfig::disabled();
+        let baseline = re.size_lots(option_price, lot_size, stop_pct);
+        assert!(
+            baseline >= 2,
+            "baseline should size ≥2 lots for this cheap option, got {baseline}"
+        );
+
+        // Layer ON: sizing is capped to a single lot within the deployment cap.
+        re.robust = robust_on();
+        let robust = re.size_lots(option_price, lot_size, stop_pct);
+        assert_eq!(robust, 1, "robust layer caps this entry to 1 lot");
+        assert!(robust < baseline, "robust never sizes larger than baseline");
+
+        // Deployment stays within PREMIUM_CAP_FRAC × capital.
+        let deployed = option_price * lot_size as f64 * robust as f64;
+        assert!(
+            deployed <= 0.33 * capital + 1.0,
+            "deployment ₹{deployed:.0} exceeds 33% cap"
+        );
+    }
+
+    /// If even a single lot's premium exceeds the deployment cap, the layer SKIPS the trade
+    /// (returns 0) rather than deploy over the cap.
+    #[test]
+    fn robust_sizing_skips_when_one_lot_busts_premium_cap() {
+        let capital = 14_000.0;
+        // 1 lot premium = 130 × 65 = ₹8,450 > 33% of ₹14k (₹4,620) → skip.
+        let mut re = RiskEngine::new(capital, 0.15, 0.35);
+        re.robust = robust_on();
+        assert_eq!(re.size_lots(130.0, 65, 0.23), 0);
+    }
+
+    /// INVARIANT (mechanism 3): reconstruct the 2026-08-05 shape — ~₹7,332 deployed in one option
+    /// with a ~23% stop, which really realised −₹1,667 (≈ 11.9% of ₹14k). With the hard per-trade
+    /// loss cap ON, the position is flattened as its live net loss reaches 5% of capital (₹700),
+    /// FAR before the 23% stop price — proving no single trade can blow a 2–3-win-sized hole.
+    #[test]
+    fn robust_hard_cap_flattens_08_05_shape_at_5pct() {
+        let capital = 14_000.0;
+        let lot_size = 65u32;
+        let lots = 1u32;
+        let entry = 112.8; // 112.8 × 65 = ₹7,332 deployed (the 08-05 shape)
+        let deployed = entry * lot_size as f64 * lots as f64;
+        assert!((deployed - 7_332.0).abs() < 5.0);
+        let stop = entry * 0.77; // 23% stop → the deep price the option actually reached
+
+        // Reference: the UNCAPPED realised loss if the trade runs to its 23% stop.
+        let uncapped_gross = (stop - entry) * lot_size as f64 * lots as f64;
+        let uncapped_net =
+            uncapped_gross - round_trip_order_cost(entry, stop, lot_size, lots, test_ist_ms(11, 0, 0));
+        assert!(
+            uncapped_net < -1_600.0,
+            "08-05 shape uncapped loss should be ~-₹1,686, got {uncapped_net:.0}"
+        );
+
+        // Build a paper-mode engine (no order bridge ⇒ synchronous close at book price).
+        let store = TickStore::new();
+        let mut engine = test_engine_with_store(store.clone());
+        engine.risk.capital = capital;
+        engine.risk.daily_start_capital = capital;
+        engine.robust_risk = robust_on();
+        engine.risk.robust = robust_on();
+
+        let entry_ms = test_ist_ms(11, 0, 0);
+        engine.set_clock_override_ms(entry_ms);
+        let mut pos = test_position(false);
+        pos.entry_price = entry;
+        pos.stop_price = stop;
+        pos.target_price = entry * 1.40;
+        pos.lots = lots;
+        pos.lot_size = lot_size;
+        pos.entry_time_ms = entry_ms;
+        pos.capital_deployed = deployed;
+        engine.positions.push(pos);
+
+        // Feed a fine declining tick path (₹0.5 steps). The cap must catch the fall near ₹700,
+        // long before the price reaches the 23% stop (₹86.9).
+        let mut px = entry;
+        while px > stop && engine.positions[0].is_open {
+            px -= 0.5;
+            store.update(Tick {
+                token: 101,
+                ltp: px,
+                mode: TickMode::Ltp,
+                ..Tick::default()
+            });
+            engine.check_open_positions();
+        }
+
+        let pos = &engine.positions[0];
+        assert!(!pos.is_open, "hard cap must have flattened the position");
+        assert!(
+            pos.exit_reason.contains("HARD LOSS CAP"),
+            "expected hard-cap exit, got: {}",
+            pos.exit_reason
+        );
+        let cap = 0.05 * capital; // ₹700
+        // Realised loss is bounded near the cap: at most the cap plus one tick-step of notional
+        // (₹0.5 × 65 = ₹32.5 overshoot), and nowhere near the uncapped −₹1,686.
+        let one_step = 0.5 * lot_size as f64;
+        assert!(
+            pos.pnl < 0.0 && pos.pnl.abs() <= cap + one_step + 40.0,
+            "realised loss ₹{:.0} not bounded by 5% cap (₹{:.0})",
+            pos.pnl,
+            cap
+        );
+        assert!(
+            pos.pnl.abs() < uncapped_net.abs() * 0.55,
+            "hard cap must trim the loss to roughly half the uncapped −₹{:.0}, got ₹{:.0}",
+            uncapped_net.abs(),
+            pos.pnl
+        );
+        // The flatten happened while the price was still well above the 23% stop.
+        assert!(
+            pos.exit_price > stop + 10.0,
+            "cap should fire above the stop price, exit ₹{:.2} vs stop ₹{:.2}",
+            pos.exit_price,
+            stop
+        );
+    }
+
+    /// With the layer OFF the same 08-05-shape position is NOT flattened early — it runs to its
+    /// 23% stop and realises the full ~−₹1,686 loss. This proves the cap is the only thing adding
+    /// the early flatten, and that OFF behaviour is unchanged.
+    #[test]
+    fn robust_off_lets_08_05_shape_run_to_full_stop() {
+        let capital = 14_000.0;
+        let lot_size = 65u32;
+        let entry = 112.8;
+        let stop = entry * 0.77;
+
+        let store = TickStore::new();
+        let mut engine = test_engine_with_store(store.clone());
+        engine.risk.capital = capital;
+        engine.risk.daily_start_capital = capital;
+        // robust stays disabled (default in test env).
+        assert!(!engine.robust_risk.enabled);
+
+        let entry_ms = test_ist_ms(11, 0, 0);
+        engine.set_clock_override_ms(entry_ms);
+        let mut pos = test_position(false);
+        pos.entry_price = entry;
+        pos.stop_price = stop;
+        pos.target_price = entry * 1.40;
+        pos.lots = 1;
+        pos.lot_size = lot_size;
+        pos.entry_time_ms = entry_ms;
+        pos.capital_deployed = entry * lot_size as f64;
+        engine.positions.push(pos);
+
+        // Drop straight through the 5% level down to the stop.
+        for px in [104.0_f64, 100.0, 95.0, stop] {
+            store.update(Tick {
+                token: 101,
+                ltp: px,
+                mode: TickMode::Ltp,
+                ..Tick::default()
+            });
+            engine.check_open_positions();
+        }
+        let pos = &engine.positions[0];
+        assert!(!pos.is_open);
+        assert!(
+            pos.exit_reason.starts_with("STOP HIT"),
+            "OFF must exit on the % stop, got: {}",
+            pos.exit_reason
+        );
+        assert!(
+            pos.pnl < -1_600.0,
+            "OFF realises the full 08-05 loss ~-₹1,686, got ₹{:.0}",
+            pos.pnl
+        );
+    }
+
     #[test]
     fn trail_arms_without_time_gate_and_keeps_half_of_peak() {
         let store = TickStore::new();
         let mut engine = test_engine_with_store(store.clone());
-        let mut pos = test_position(false);   // entry 100, initial stop 85 (-15%)
-        pos.target_price = 140.0;             // far target so the trail (not target) governs
+        let mut pos = test_position(false); // entry 100, initial stop 85 (-15%)
+        pos.target_price = 140.0; // far target so the trail (not target) governs
         engine.positions.push(pos);
 
         // +16% at only 1 min held: the trail arms immediately — NO time gate (uniform with
         // multileg::trail_exits). stop = (100+116)/2 = 108 = give back 50% of the +16% peak.
         // The +12% lock stays 3-min-gated, so breakeven_stop_set is still false here.
-        store.update(Tick { token: 101, ltp: 116.0, mode: TickMode::Ltp, ..Tick::default() });
+        store.update(Tick {
+            token: 101,
+            ltp: 116.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
         engine.set_clock_override_ms(60_000);
         engine.check_open_positions();
-        assert!((engine.positions[0].stop_price - 108.0).abs() < 1e-9, "trail arms with no time gate");
+        assert!(
+            (engine.positions[0].stop_price - 108.0).abs() < 1e-9,
+            "trail arms with no time gate"
+        );
         assert_eq!(engine.positions[0].checkpoints_evaluated, 3);
-        assert!(!engine.positions[0].breakeven_stop_set, "lock is still time-gated; only the trail fired");
-        assert!(engine.positions[0].is_open, "trail must not close a live runner");
+        assert!(
+            !engine.positions[0].breakeven_stop_set,
+            "lock is still time-gated; only the trail fired"
+        );
+        assert!(
+            engine.positions[0].is_open,
+            "trail must not close a live runner"
+        );
 
         // +26%: trail ratchets up → (100+126)/2 = 113.
-        store.update(Tick { token: 101, ltp: 126.0, mode: TickMode::Ltp, ..Tick::default() });
+        store.update(Tick {
+            token: 101,
+            ltp: 126.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
         engine.set_clock_override_ms(4 * 60_000);
         engine.check_open_positions();
-        assert!((engine.positions[0].stop_price - 113.0).abs() < 1e-9, "trail ratchets up with the peak");
+        assert!(
+            (engine.positions[0].stop_price - 113.0).abs() < 1e-9,
+            "trail ratchets up with the peak"
+        );
         assert!(engine.positions[0].is_open);
 
         // pullback to +18%: one-way ratchet holds the stop at 113; still open (118 > 113).
-        store.update(Tick { token: 101, ltp: 118.0, mode: TickMode::Ltp, ..Tick::default() });
+        store.update(Tick {
+            token: 101,
+            ltp: 118.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
         engine.set_clock_override_ms(5 * 60_000);
         engine.check_open_positions();
-        assert!((engine.positions[0].stop_price - 113.0).abs() < 1e-9, "trail never lowers");
+        assert!(
+            (engine.positions[0].stop_price - 113.0).abs() < 1e-9,
+            "trail never lowers"
+        );
         assert!(engine.positions[0].is_open);
+    }
+
+    /// Feed a steadily rising spot series so `bias()` reads a confirmed Bull panel.
+    fn bull_spot_series() -> crate::technicals::SpotSeries {
+        let mut s = crate::technicals::SpotSeries::new();
+        let mut px = 100.0;
+        for m in 0..40u64 {
+            s.ingest(m * 60_000 + 1_000, px);
+            s.ingest(m * 60_000 + 30_000, px + 0.4);
+            px += 1.0;
+        }
+        // Close the final in-progress bar.
+        s.ingest(40 * 60_000 + 1_000, px);
+        assert_eq!(
+            s.bias().direction,
+            crate::technicals::Direction::Bull,
+            "rising series must read Bull"
+        );
+        s
+    }
+
+    // A BuyPE (bearish) position whose entry thesis is contradicted by a confirmed Bull spot
+    // bias must be closed at market with a "Thesis reversal" reason once the toggle is ON and
+    // the bias has persisted for `reversal_confirm_scans` scans — without ever touching the
+    // price stop/target.
+    #[test]
+    fn reversal_exit_fires_after_confirmed_opposite_bias() {
+        let store = TickStore::new();
+        let mut engine = test_engine_with_store(store.clone());
+        engine.exit_on_reversal = true;
+        engine.reversal_confirm_scans = 2;
+        engine.reversal_min_strength = 0.5;
+        engine
+            .spot_series
+            .insert("NIFTY".to_string(), bull_spot_series());
+
+        let mut pos = test_position(false);
+        pos.action = SignalAction::BuyPE; // bearish thesis vs a Bull tape
+        pos.entry_price = 100.0;
+        pos.stop_price = 50.0; // wide — the price stop must NOT be what fires
+        pos.target_price = 200.0; // far — the target must NOT be what fires
+        engine.positions.push(pos);
+
+        // Price sits between stop and target (a modest paper loss) so only the reversal rule
+        // can close it. Clock at 10 min held → no time stop.
+        store.update(Tick {
+            token: 101,
+            ltp: 90.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
+        engine.set_clock_override_ms(10 * 60_000);
+
+        // Scan 1: first contradicting observation → counter 1, still below confirm=2.
+        engine.scan_count = 1;
+        engine.check_open_positions();
+        assert!(
+            engine.positions[0].is_open,
+            "one confirming scan must not exit (needs 2)"
+        );
+
+        // Scan 2: second consecutive contradiction → confirmed → close at market.
+        engine.scan_count = 2;
+        engine.check_open_positions();
+        assert!(
+            !engine.positions[0].is_open,
+            "two confirmed scans must close the position"
+        );
+        assert!(
+            engine.positions[0].exit_reason.contains("Thesis reversal"),
+            "exit reason should be the reversal, got: {}",
+            engine.positions[0].exit_reason
+        );
+        assert!(
+            (engine.positions[0].exit_price - 90.0).abs() < 1e-9,
+            "reversal exits at the current market price"
+        );
+    }
+
+    // DEFAULT OFF: with the toggle disabled the identical setup must hold the position (proving
+    // live behaviour is unchanged).
+    #[test]
+    fn reversal_exit_disabled_by_default_holds_position() {
+        let store = TickStore::new();
+        let mut engine = test_engine_with_store(store.clone());
+        assert!(!engine.exit_on_reversal, "toggle must default OFF");
+        engine
+            .spot_series
+            .insert("NIFTY".to_string(), bull_spot_series());
+
+        let mut pos = test_position(false);
+        pos.action = SignalAction::BuyPE;
+        pos.entry_price = 100.0;
+        pos.stop_price = 50.0;
+        pos.target_price = 200.0;
+        engine.positions.push(pos);
+
+        store.update(Tick {
+            token: 101,
+            ltp: 90.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
+        engine.set_clock_override_ms(10 * 60_000);
+        for scan in 1..=5 {
+            engine.scan_count = scan;
+            engine.check_open_positions();
+        }
+        assert!(
+            engine.positions[0].is_open,
+            "default-OFF must never close on a thesis reversal"
+        );
+        assert!(engine.reversal_state.is_empty(), "OFF must not track state");
     }
 
     #[test]
@@ -6336,7 +7956,12 @@ mod tests {
         pos.entry_ctx.session = SessionPhase::Morning.to_string();
         engine.positions.push(pos);
 
-        store.update(Tick { token: 101, ltp: 130.0, mode: TickMode::Ltp, ..Tick::default() });
+        store.update(Tick {
+            token: 101,
+            ltp: 130.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
         engine.set_clock_override_ms(60_000);
         engine.check_open_positions();
 
@@ -6359,7 +7984,12 @@ mod tests {
         pos.entry_ctx.session = SessionPhase::Morning.to_string();
         engine.positions.push(pos);
 
-        store.update(Tick { token: 101, ltp: 130.0, mode: TickMode::Ltp, ..Tick::default() });
+        store.update(Tick {
+            token: 101,
+            ltp: 130.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
         engine.set_clock_override_ms(60_000);
         engine.check_open_positions();
 
@@ -6382,7 +8012,12 @@ mod tests {
         pos.entry_ctx.session = SessionPhase::Afternoon.to_string();
         engine.positions.push(pos);
 
-        store.update(Tick { token: 101, ltp: 130.0, mode: TickMode::Ltp, ..Tick::default() });
+        store.update(Tick {
+            token: 101,
+            ltp: 130.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
         engine.set_clock_override_ms(60_000);
         engine.check_open_positions();
 
@@ -6396,17 +8031,21 @@ mod tests {
     fn lock_arms_in_12_to_15_zone() {
         let store = TickStore::new();
         let mut engine = test_engine_with_store(store.clone());
-        let mut pos = test_position(false);   // entry 100, initial stop 85
+        let mut pos = test_position(false); // entry 100, initial stop 85
         pos.target_price = 140.0;
         engine.positions.push(pos);
 
         // +13% (>=3 min), never reached +15%: lock +2% net after modeled fees.
-        store.update(Tick { token: 101, ltp: 113.0, mode: TickMode::Ltp, ..Tick::default() });
+        store.update(Tick {
+            token: 101,
+            ltp: 113.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
         engine.set_clock_override_ms(4 * 60_000);
         engine.check_open_positions();
         assert!(
-            engine.positions[0].stop_price > 102.0
-                && engine.positions[0].stop_price < 104.0,
+            engine.positions[0].stop_price > 102.0 && engine.positions[0].stop_price < 104.0,
             "+13% arms a fee-adjusted lock above the old gross +2% level"
         );
         assert!(engine.positions[0].breakeven_stop_set);
@@ -6434,7 +8073,10 @@ mod tests {
             engine.positions[0].stop_price < engine.positions[0].target_price,
             "profit lock should not be placed on/above an unusually tight target"
         );
-        assert!(!engine.positions[0].is_open, "tight target should still close as target hit");
+        assert!(
+            !engine.positions[0].is_open,
+            "tight target should still close as target hit"
+        );
     }
 
     #[test]
@@ -6719,12 +8361,16 @@ mod tests {
             pending_quantity: Some(0),
             source: "status_poll".to_string(),
             message: Some(
-                "Insufficient funds. Margin required: 204193.50. Margin available: 15386.60.".to_string(),
+                "Insufficient funds. Margin required: 204193.50. Margin available: 15386.60."
+                    .to_string(),
             ),
         });
 
         assert!(engine.pending_exit_orders.is_empty());
-        assert!(engine.positions[0].is_open, "a reject must not falsely close the position");
+        assert!(
+            engine.positions[0].is_open,
+            "a reject must not falsely close the position"
+        );
         assert!(
             engine.positions[0].exit_pending,
             "exit_pending must stay true so close_position_at's guard blocks resubmit"
@@ -6783,7 +8429,10 @@ mod tests {
         });
 
         assert!(engine.pending_exit_orders.is_empty());
-        assert!(engine.positions[0].is_open, "a place error must not falsely close the position");
+        assert!(
+            engine.positions[0].is_open,
+            "a place error must not falsely close the position"
+        );
         assert!(
             engine.positions[0].exit_pending,
             "margin place_error must halt resubmits just like a REJECTED status"
@@ -6826,7 +8475,10 @@ mod tests {
             message: None,
         });
 
-        assert!(!engine.positions[0].is_open, "orphaned exit fill must close the position");
+        assert!(
+            !engine.positions[0].is_open,
+            "orphaned exit fill must close the position"
+        );
         assert!(!engine.positions[0].exit_pending);
         assert!((engine.positions[0].exit_price - 55.10).abs() < 0.01);
     }
@@ -6910,10 +8562,8 @@ mod tests {
     #[test]
     fn simulated_close_does_not_request_capital_sync() {
         let cfg = test_config();
-        let log_dir = std::env::temp_dir().join(format!(
-            "satavahana_sim_close_test_{}",
-            std::process::id()
-        ));
+        let log_dir =
+            std::env::temp_dir().join(format!("satavahana_sim_close_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&log_dir);
 
         let mut engine = OptionsEngine::new(
@@ -6936,10 +8586,8 @@ mod tests {
     #[test]
     fn global_position_lock_blocks_options_and_frees_on_close() {
         let cfg = test_config();
-        let log_dir = std::env::temp_dir().join(format!(
-            "satavahana_lock_close_test_{}",
-            std::process::id()
-        ));
+        let log_dir =
+            std::env::temp_dir().join(format!("satavahana_lock_close_test_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&log_dir);
 
         let mut engine = OptionsEngine::new(
@@ -6984,18 +8632,34 @@ mod tests {
         let lot = 65u32;
         let per_lot_excl = entry_cost_per_lot_excl_brokerage(price, lot);
         let flat = options_brokerage_per_order();
-        assert!((flat - 20.0 * 1.18).abs() < 1e-9, "flat brokerage = ₹20 + 18% GST = ₹23.60");
+        assert!(
+            (flat - 20.0 * 1.18).abs() < 1e-9,
+            "flat brokerage = ₹20 + 18% GST = ₹23.60"
+        );
 
         let one = entry_order_cost(price, lot, 1);
         let four = entry_order_cost(price, lot, 4);
-        assert!((one - (per_lot_excl + flat)).abs() < 1e-6, "1 lot = per-lot + ONE brokerage");
-        assert!((four - (4.0 * per_lot_excl + flat)).abs() < 1e-6, "4 lots = 4×per-lot + ONE brokerage");
+        assert!(
+            (one - (per_lot_excl + flat)).abs() < 1e-6,
+            "1 lot = per-lot + ONE brokerage"
+        );
+        assert!(
+            (four - (4.0 * per_lot_excl + flat)).abs() < 1e-6,
+            "4 lots = 4×per-lot + ONE brokerage"
+        );
         // The old per-lot bug would have added 4× brokerage; the real delta from 1→4 lots
         // must be exactly 3× the per-lot ex-brokerage cost, with NO extra brokerage.
-        assert!(((four - one) - 3.0 * per_lot_excl).abs() < 1e-6, "added lots must not each pay brokerage");
+        assert!(
+            ((four - one) - 3.0 * per_lot_excl).abs() < 1e-6,
+            "added lots must not each pay brokerage"
+        );
         // Sanity: the bug over-charged a 4-lot round trip by 3 extra brokerages PER LEG.
         let overcharge_per_leg = 3.0 * flat;
-        assert!(overcharge_per_leg > 70.0, "the fixed over-charge was material: ~₹{:.1}/leg", overcharge_per_leg);
+        assert!(
+            overcharge_per_leg > 70.0,
+            "the fixed over-charge was material: ~₹{:.1}/leg",
+            overcharge_per_leg
+        );
     }
 
     #[test]
@@ -7171,7 +8835,10 @@ mod tests {
 
         engine.set_clock_override_ms(now);
         engine.process_market_tick();
-        assert!(order_rx.try_recv().is_err(), "4s-old signal must still wait for its 5s delay");
+        assert!(
+            order_rx.try_recv().is_err(),
+            "4s-old signal must still wait for its 5s delay"
+        );
         assert_eq!(engine.pending_signals.len(), 1);
 
         engine.set_clock_override_ms(now + 2_000);
@@ -7352,7 +9019,10 @@ mod tests {
                 assert_eq!(cmd.tag, "SATAEXIT1");
                 assert_eq!(cmd.quantity, 50);
                 assert_eq!(cmd.side, OrderSide::Sell);
-                assert!(cmd.limit_price.is_none(), "emergency flatten should use MARKET");
+                assert!(
+                    cmd.limit_price.is_none(),
+                    "emergency flatten should use MARKET"
+                );
             }
             other => panic!("expected place command, got {:?}", other),
         }

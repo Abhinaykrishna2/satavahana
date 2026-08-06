@@ -9,17 +9,15 @@ use tracing::{error, info, warn};
 
 const KITE_ORDERS_URL: &str = "https://api.kite.trade/orders";
 const KITE_MARGINS_URL: &str = "https://api.kite.trade/user/margins";
-const KITE_BASKET_MARGIN_URL: &str = "https://api.kite.trade/margins/basket?consider_positions=true";
+const KITE_BASKET_MARGIN_URL: &str =
+    "https://api.kite.trade/margins/basket?consider_positions=true";
 
-pub async fn fetch_live_available_funds(
-    api_key: &str,
-    access_token: &str,
-) -> Result<f64, String> {
+pub async fn fetch_live_available_funds(api_key: &str, access_token: &str) -> Result<f64, String> {
     let auth_header = format!("token {}:{}", api_key, access_token);
     let client = Client::builder()
-                .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
-                .build()
-                .expect("failed to build HTTP client");
+        .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        .build()
+        .expect("failed to build HTTP client");
     let resp = client
         .get(KITE_MARGINS_URL)
         .header("X-Kite-Version", "3")
@@ -55,7 +53,10 @@ pub async fn fetch_live_available_funds(
         }
     }
 
-    Err(format!("margins response missing usable equity funds fields: {}", body))
+    Err(format!(
+        "margins response missing usable equity funds fields: {}",
+        body
+    ))
 }
 
 #[derive(Debug, Clone)]
@@ -158,16 +159,27 @@ pub struct PlaceOrderCmd {
 #[derive(Debug, Clone)]
 pub enum OrderCommand {
     Place(PlaceOrderCmd),
-    CancelByTag { tag: String },
-    StatusByTag { tag: String },
+    CancelByTag {
+        tag: String,
+    },
+    StatusByTag {
+        tag: String,
+    },
     /// Limit-chase re-peg: move the resting LIMIT order (found by tag) to a new
     /// price. One exchange action, cheaper than cancel+replace and friendlier to
     /// the 10 orders/sec SEBI cap.
-    ModifyByTag { tag: String, new_price: f64 },
+    ModifyByTag {
+        tag: String,
+        new_price: f64,
+    },
 }
 
 fn effective_order_type(limit_price: Option<f64>) -> &'static str {
-    if limit_price.is_some() { "LIMIT" } else { "MARKET" }
+    if limit_price.is_some() {
+        "LIMIT"
+    } else {
+        "MARKET"
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -281,7 +293,10 @@ impl OrderExecutor {
                             );
                             self.publish(OrderUpdate {
                                 tag: place.tag.clone(),
-                                order_id: self.known_orders.get(&place.tag).map(|o| o.order_id.clone()),
+                                order_id: self
+                                    .known_orders
+                                    .get(&place.tag)
+                                    .map(|o| o.order_id.clone()),
                                 status: None,
                                 average_price: None,
                                 filled_quantity: None,
@@ -386,7 +401,10 @@ impl OrderExecutor {
 
         match self.cancel_order(&known.variety, &known.order_id).await {
             Ok(()) => {
-                info!("LIVE ORDER cancel requested | tag={} order_id={}", tag, known.order_id);
+                info!(
+                    "LIVE ORDER cancel requested | tag={} order_id={}",
+                    tag, known.order_id
+                );
                 self.publish(OrderUpdate {
                     tag: tag.to_string(),
                     order_id: Some(known.order_id.clone()),
@@ -423,7 +441,10 @@ impl OrderExecutor {
             warn!("LIVE ORDER modify skipped: no order found for tag={}", tag);
             return;
         };
-        match self.modify_order(&known.variety, &known.order_id, new_price).await {
+        match self
+            .modify_order(&known.variety, &known.order_id, new_price)
+            .await
+        {
             Ok(()) => {
                 info!(
                     "LIVE ORDER modify (chase) | tag={} order_id={} -> ₹{:.2}",
@@ -459,7 +480,12 @@ impl OrderExecutor {
         }
     }
 
-    async fn modify_order(&self, variety: &str, order_id: &str, new_price: f64) -> Result<(), String> {
+    async fn modify_order(
+        &self,
+        variety: &str,
+        order_id: &str,
+        new_price: f64,
+    ) -> Result<(), String> {
         let url = format!("{}/{}/{}", KITE_ORDERS_URL, variety, order_id);
         // Round to the NSE ₹0.05 tick.
         let ticked = (new_price / 0.05).round() * 0.05;
@@ -484,7 +510,11 @@ impl OrderExecutor {
             .map_err(|e| format!("invalid JSON from modify-order response: {}", e))?;
 
         if !http.is_success() {
-            return Err(format!("HTTP {} from modify-order: {}", http, kite_message(&body)));
+            return Err(format!(
+                "HTTP {} from modify-order: {}",
+                http,
+                kite_message(&body)
+            ));
         }
         Ok(())
     }
@@ -518,7 +548,10 @@ impl OrderExecutor {
 
     async fn log_status_by_tag(&mut self, tag: &str) {
         let Some(known) = self.resolve_order_by_tag(tag, true).await else {
-            warn!("LIVE ORDER status unavailable: no order found for tag={}", tag);
+            warn!(
+                "LIVE ORDER status unavailable: no order found for tag={}",
+                tag
+            );
             self.publish(OrderUpdate {
                 tag: tag.to_string(),
                 order_id: None,
@@ -609,9 +642,7 @@ impl OrderExecutor {
             .get("status_message")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        let average_price = latest
-            .get("average_price")
-            .and_then(|v| v.as_f64());
+        let average_price = latest.get("average_price").and_then(|v| v.as_f64());
         let filled_quantity = latest
             .get("filled_quantity")
             .and_then(|v| v.as_u64())

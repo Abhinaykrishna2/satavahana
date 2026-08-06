@@ -50,7 +50,12 @@ pub struct PortfolioCircuit {
 }
 
 impl PortfolioCircuit {
-    pub fn new(day_start_capital: f64, loss_pct: f64, profit_pct: f64, max_trades_per_day: u32) -> Self {
+    pub fn new(
+        day_start_capital: f64,
+        loss_pct: f64,
+        profit_pct: f64,
+        max_trades_per_day: u32,
+    ) -> Self {
         PortfolioCircuit {
             day_start_capital: day_start_capital.max(0.0),
             realized_pnl: 0.0,
@@ -232,7 +237,9 @@ pub fn can_enter(c: &SharedCircuit) -> bool {
 
 /// Whether a new entry is allowed for one holder by the account P&L circuit and daily account cap.
 pub fn can_enter_holder(c: &SharedCircuit, holder: &'static str) -> bool {
-    c.lock().map(|g| g.can_enter_holder(holder)).unwrap_or(false)
+    c.lock()
+        .map(|g| g.can_enter_holder(holder))
+        .unwrap_or(false)
 }
 
 /// Record a closed trade's net P&L into the shared circuit.
@@ -251,7 +258,9 @@ pub fn record_for(c: &SharedCircuit, holder: &'static str, net_pnl: f64) {
 
 pub fn state(c: &SharedCircuit) -> CircuitState {
     // Fail-closed: treat an unreadable circuit as tripped.
-    c.lock().map(|g| g.state()).unwrap_or(CircuitState::LowerLoss)
+    c.lock()
+        .map(|g| g.state())
+        .unwrap_or(CircuitState::LowerLoss)
 }
 
 /// Atomically claim the one global position slot for `holder`. Race-free: the
@@ -316,8 +325,14 @@ mod tests {
     fn daily_cap_is_account_wide() {
         let c = new_shared(100_000.0, 15.0, 25.0, 1);
         record_for(&c, "multileg", 1_000.0);
-        assert!(!can_enter_holder(&c, "multileg"), "multi-leg used its one slot");
-        assert!(!can_enter_holder(&c, "options"), "single-leg must not trade after account daily cap");
+        assert!(
+            !can_enter_holder(&c, "multileg"),
+            "multi-leg used its one slot"
+        );
+        assert!(
+            !can_enter_holder(&c, "options"),
+            "single-leg must not trade after account daily cap"
+        );
         assert_eq!(
             halt_reason_for(&c, "multileg"),
             Some("daily account trade cap reached")
@@ -354,7 +369,11 @@ mod tests {
         }
 
         // Exactly one of eight racing threads may hold the single slot.
-        assert_eq!(wins.load(Ordering::SeqCst), 1, "exactly one engine wins the race");
+        assert_eq!(
+            wins.load(Ordering::SeqCst),
+            1,
+            "exactly one engine wins the race"
+        );
         assert!(is_locked(&c));
 
         // A held slot blocks every further claim, including from another engine.
@@ -363,18 +382,31 @@ mod tests {
 
         // Only the holder's release frees it; then a fresh claim succeeds.
         let winner = c.lock().unwrap().position_holder().unwrap();
-        release(&c, if winner == "options" { "micro" } else { "options" }); // wrong holder: no-op
+        release(
+            &c,
+            if winner == "options" {
+                "micro"
+            } else {
+                "options"
+            },
+        ); // wrong holder: no-op
         assert!(is_locked(&c), "a non-holder release must not free the slot");
         release(&c, winner);
         assert!(!is_locked(&c));
-        assert!(try_claim(&c, "options"), "after release the slot is claimable again");
+        assert!(
+            try_claim(&c, "options"),
+            "after release the slot is claimable again"
+        );
     }
 
     #[test]
     fn claim_is_denied_while_circuit_is_tripped() {
         let c = new_shared(100_000.0, 15.0, 25.0, u32::MAX);
         record_for(&c, "options", -16_000.0); // -16% trips the lower circuit
-        assert!(!try_claim(&c, "options"), "no new position may open once the circuit trips");
+        assert!(
+            !try_claim(&c, "options"),
+            "no new position may open once the circuit trips"
+        );
         assert!(!is_locked(&c));
     }
 
@@ -383,7 +415,14 @@ mod tests {
         let c = new_shared(100_000.0, 15.0, 25.0, u32::MAX);
         assert!(try_claim(&c, "options"));
         assert_eq!(reap_stale(&c, 3600), None, "fresh claim is not reaped");
-        assert_eq!(reap_stale(&c, 0), Some("options"), "held >= 0s is force-released");
-        assert!(!is_locked(&c), "watchdog frees the slot for the next signal");
-        }
+        assert_eq!(
+            reap_stale(&c, 0),
+            Some("options"),
+            "held >= 0s is force-released"
+        );
+        assert!(
+            !is_locked(&c),
+            "watchdog frees the slot for the next signal"
+        );
+    }
 }

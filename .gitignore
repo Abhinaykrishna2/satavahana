@@ -1,3 +1,4 @@
+
 # Rust
 /target/
 src/target/
@@ -61,3 +62,6 @@ src/recorder.rs
 # Large local assets
 logo.png
 lion.mp4
+
+# Scripts
+scripts.sh
