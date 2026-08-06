@@ -1,4 +1,3 @@
-
 use hex;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -73,7 +72,10 @@ impl KiteAuth {
         api_secret: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         if let Some(cached) = load_cached_token() {
-            info!("Reusing access token cached from earlier today ({})", TOKEN_CACHE_PATH);
+            info!(
+                "Reusing access token cached from earlier today ({})",
+                TOKEN_CACHE_PATH
+            );
             return Ok(cached);
         }
 
@@ -130,13 +132,15 @@ impl KiteAuth {
         let access_token = exchange_token(api_key, api_secret, &request_token).await?;
 
         save_cached_token(&access_token);
-        info!("  Access token obtained and cached for today ({}).", TOKEN_CACHE_PATH);
+        info!(
+            "  Access token obtained and cached for today ({}).",
+            TOKEN_CACHE_PATH
+        );
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
 
         Ok(access_token)
     }
 }
-
 
 fn extract_request_token(
     request: &str,
@@ -228,7 +232,11 @@ async fn send_http_response(
     status_code: u16,
     body: &str,
 ) -> Result<(), std::io::Error> {
-    let status_text = if status_code == 200 { "OK" } else { "Bad Request" };
+    let status_text = if status_code == 200 {
+        "OK"
+    } else {
+        "Bad Request"
+    };
     let response = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         status_code, status_text, body.len(), body
@@ -236,7 +244,6 @@ async fn send_http_response(
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await
 }
-
 
 fn today_ist() -> String {
     use chrono::TimeZone;
@@ -280,7 +287,11 @@ fn save_cached_token(token: &str) {
     let path = token_cache_path();
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
-            warn!("Could not create token cache directory {}: {}", parent.display(), e);
+            warn!(
+                "Could not create token cache directory {}: {}",
+                parent.display(),
+                e
+            );
             return;
         }
     }
@@ -289,7 +300,6 @@ fn save_cached_token(token: &str) {
         warn!("Could not write token cache {}: {}", path.display(), e);
     }
 }
-
 
 #[cfg(test)]
 mod tests {

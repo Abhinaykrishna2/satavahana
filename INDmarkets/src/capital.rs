@@ -93,7 +93,11 @@ pub fn spawn_capital_sync(
 
             match fetch_live_available_funds(&api_key, &access_token).await {
                 Ok(funds) => {
-                    info!("💰 Capital sync @ {} IST: live margins ₹{:.2}", ist_now().format("%H:%M:%S"), funds);
+                    info!(
+                        "💰 Capital sync @ {} IST: live margins ₹{:.2}",
+                        ist_now().format("%H:%M:%S"),
+                        funds
+                    );
                     if tx.send(funds).is_err() {
                         info!("💰 Capital sync: manager channel closed; ending.");
                         break;
@@ -113,7 +117,10 @@ mod tests {
     use chrono::Timelike;
 
     fn ist(h: u32, m: u32, s: u32) -> DateTime<FixedOffset> {
-        ist_offset().with_ymd_and_hms(2026, 6, 16, h, m, s).single().unwrap()
+        ist_offset()
+            .with_ymd_and_hms(2026, 6, 16, h, m, s)
+            .single()
+            .unwrap()
     }
 
     #[test]

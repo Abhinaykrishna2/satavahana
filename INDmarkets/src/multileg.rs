@@ -144,14 +144,12 @@ pub fn opening_directional_efficiency(closes: &[f64]) -> Option<f64> {
     let min = closes.iter().copied().fold(f64::INFINITY, f64::min);
     let max = closes.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let range = max - min;
-    (range > 0.0 && range.is_finite())
-        .then(|| ((last - first).abs() / range).clamp(0.0, 1.0))
+    (range > 0.0 && range.is_finite()).then(|| ((last - first).abs() / range).clamp(0.0, 1.0))
 }
 
 pub fn credit_edge_directional_efficiency_admits(dte: i64, efficiency: f64) -> bool {
     dte_allows(dte)
-        || (efficiency.is_finite()
-            && efficiency >= CREDIT_EDGE_FAR_DTE_MIN_DIRECTIONAL_EFFICIENCY)
+        || (efficiency.is_finite() && efficiency >= CREDIT_EDGE_FAR_DTE_MIN_DIRECTIONAL_EFFICIENCY)
 }
 
 /// Near-expiry selling can use the normal 09:45 open because intraday theta is fast enough to
@@ -195,9 +193,16 @@ pub fn far_dte_sideways_metrics(
     let first = *session_closes.first()?;
     let last = *session_closes.last()?;
     let min = session_closes.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max = session_closes.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let max = session_closes
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
     let range = max - min;
-    let range_pos = if range <= 0.0 { 0.5 } else { (last - min) / range };
+    let range_pos = if range <= 0.0 {
+        0.5
+    } else {
+        (last - min) / range
+    };
     Some(FarDteSideways {
         session_er,
         recent_er,
@@ -229,7 +234,11 @@ fn has_strike(q: &[StrikeQuote], k: f64) -> bool {
 
 /// Select the 4 defined-risk legs for `structure`. Returns None if the chain can't seat the
 /// wings (e.g. the short would sit at the chain edge with no strike beyond it for the wing).
-pub fn select_legs(quotes: &[StrikeQuote], spot: f64, structure: SellStructure) -> Option<Vec<PlannedLeg>> {
+pub fn select_legs(
+    quotes: &[StrikeQuote],
+    spot: f64,
+    structure: SellStructure,
+) -> Option<Vec<PlannedLeg>> {
     if structure == SellStructure::CreditEdge {
         return None;
     }
@@ -241,13 +250,25 @@ pub fn select_legs(quotes: &[StrikeQuote], spot: f64, structure: SellStructure) 
     if usable.is_empty() {
         return None;
     }
-    let kmin = usable.iter().map(|q| q.strike).fold(f64::INFINITY, f64::min);
-    let kmax = usable.iter().map(|q| q.strike).fold(f64::NEG_INFINITY, f64::max);
+    let kmin = usable
+        .iter()
+        .map(|q| q.strike)
+        .fold(f64::INFINITY, f64::min);
+    let kmax = usable
+        .iter()
+        .map(|q| q.strike)
+        .fold(f64::NEG_INFINITY, f64::max);
 
     // Short-strike picker for one side. `is_ce` avoids needing OptionType: Copy.
     let pick = |is_ce: bool| -> Option<f64> {
         let delta_of = |q: &StrikeQuote| if is_ce { q.ce_delta } else { q.pe_delta };
-        let room = |k: f64| if is_ce { k + wing <= kmax } else { k - wing >= kmin };
+        let room = |k: f64| {
+            if is_ce {
+                k + wing <= kmax
+            } else {
+                k - wing >= kmin
+            }
+        };
         match tgt {
             None => quotes
                 .iter()
@@ -272,7 +293,8 @@ pub fn select_legs(quotes: &[StrikeQuote], spot: f64, structure: SellStructure) 
                         && room(q.strike)
                 })
                 .min_by(|a, b| {
-                    (delta_of(a).abs() - t).abs()
+                    (delta_of(a).abs() - t)
+                        .abs()
                         .partial_cmp(&(delta_of(b).abs() - t).abs())
                         .unwrap_or(Ordering::Equal)
                 })
@@ -288,10 +310,30 @@ pub fn select_legs(quotes: &[StrikeQuote], spot: f64, structure: SellStructure) 
         return None;
     }
     Some(vec![
-        PlannedLeg { strike: ce_s, opt: OptionType::CE, side: OrderSide::Sell, wing: false },
-        PlannedLeg { strike: ce_w, opt: OptionType::CE, side: OrderSide::Buy, wing: true },
-        PlannedLeg { strike: pe_s, opt: OptionType::PE, side: OrderSide::Sell, wing: false },
-        PlannedLeg { strike: pe_w, opt: OptionType::PE, side: OrderSide::Buy, wing: true },
+        PlannedLeg {
+            strike: ce_s,
+            opt: OptionType::CE,
+            side: OrderSide::Sell,
+            wing: false,
+        },
+        PlannedLeg {
+            strike: ce_w,
+            opt: OptionType::CE,
+            side: OrderSide::Buy,
+            wing: true,
+        },
+        PlannedLeg {
+            strike: pe_s,
+            opt: OptionType::PE,
+            side: OrderSide::Sell,
+            wing: false,
+        },
+        PlannedLeg {
+            strike: pe_w,
+            opt: OptionType::PE,
+            side: OrderSide::Buy,
+            wing: true,
+        },
     ])
 }
 
@@ -366,7 +408,11 @@ pub fn select_credit_spread_legs(
 /// short rejects, immediately flatten the filled wings. See [`basket_margin_ok`] for the
 /// pre-trade margin gate that must also pass first.
 pub fn placement_sequence(legs: &[PlannedLeg]) -> Vec<PlannedLeg> {
-    let mut out: Vec<PlannedLeg> = legs.iter().filter(|l| l.side == OrderSide::Buy).cloned().collect();
+    let mut out: Vec<PlannedLeg> = legs
+        .iter()
+        .filter(|l| l.side == OrderSide::Buy)
+        .cloned()
+        .collect();
     out.extend(legs.iter().filter(|l| l.side == OrderSide::Sell).cloned());
     out
 }
@@ -530,7 +576,11 @@ pub const TRAIL_FRAC: f64 = 0.50;
 /// credit]`. Condor → put/call shorts; fly → ATM ± credit. Returns `(lower, upper, width)`, or
 /// None if there are no shorts or credit isn't positive.
 pub fn profit_zone(legs: &[PlannedLeg], credit: f64) -> Option<(f64, f64, f64)> {
-    let shorts: Vec<f64> = legs.iter().filter(|l| l.side == OrderSide::Sell).map(|l| l.strike).collect();
+    let shorts: Vec<f64> = legs
+        .iter()
+        .filter(|l| l.side == OrderSide::Sell)
+        .map(|l| l.strike)
+        .collect();
     if shorts.is_empty() || credit <= 0.0 {
         return None;
     }
@@ -542,7 +592,11 @@ pub fn profit_zone(legs: &[PlannedLeg], credit: f64) -> Option<(f64, f64, f64)> 
 
 /// Entry drift gate: admit only if the opening range is at most `ENTRY_DRIFT_ZONE_CAP` of the
 /// profit-zone width (the day hasn't already consumed the cushion).
-pub fn entry_drift_admits(opening_range_pts: f64, zone_width: f64, structure: SellStructure) -> bool {
+pub fn entry_drift_admits(
+    opening_range_pts: f64,
+    zone_width: f64,
+    structure: SellStructure,
+) -> bool {
     zone_width > 0.0 && opening_range_pts / zone_width <= entry_drift_zone_cap(structure)
 }
 
@@ -561,28 +615,40 @@ pub fn move_trims(move_pts: f64, spot: f64, zone_width: f64, structure: SellStru
 pub fn target_frac(structure: SellStructure) -> f64 {
     match structure {
         SellStructure::CreditEdge => CREDIT_EDGE_TARGET_FRAC,
-        SellStructure::Condor | SellStructure::Tight | SellStructure::Fly | SellStructure::WideFly => 0.50,
+        SellStructure::Condor
+        | SellStructure::Tight
+        | SellStructure::Fly
+        | SellStructure::WideFly => 0.50,
     }
 }
 
 pub fn stop_frac_ml(structure: SellStructure) -> f64 {
     match structure {
         SellStructure::CreditEdge => CREDIT_EDGE_STOP_FRAC_ML,
-        SellStructure::Condor | SellStructure::Tight | SellStructure::Fly | SellStructure::WideFly => STOP_FRAC_ML,
+        SellStructure::Condor
+        | SellStructure::Tight
+        | SellStructure::Fly
+        | SellStructure::WideFly => STOP_FRAC_ML,
     }
 }
 
 pub fn hard_stop_frac_cap(structure: SellStructure) -> f64 {
     match structure {
         SellStructure::CreditEdge => CREDIT_EDGE_HARD_STOP_FRAC_CAP,
-        SellStructure::Condor | SellStructure::Tight | SellStructure::Fly | SellStructure::WideFly => STOP_FRAC_CAP,
+        SellStructure::Condor
+        | SellStructure::Tight
+        | SellStructure::Fly
+        | SellStructure::WideFly => STOP_FRAC_CAP,
     }
 }
 
 pub fn exit_min_for(structure: SellStructure) -> u32 {
     match structure {
         SellStructure::CreditEdge => CREDIT_EDGE_EXIT_MIN,
-        SellStructure::Condor | SellStructure::Tight | SellStructure::Fly | SellStructure::WideFly => EXIT_MIN,
+        SellStructure::Condor
+        | SellStructure::Tight
+        | SellStructure::Fly
+        | SellStructure::WideFly => EXIT_MIN,
     }
 }
 
@@ -720,7 +786,9 @@ pub fn structure_regime_score(
             chop * 0.25 + drift_headroom * 0.30 + (1.0 - centered) * 0.20 + edge_headroom * 0.25
         }
         // Realized running hot vs implied → need the 200pt wings.
-        SellStructure::WideFly => chop * 0.20 + hot * 0.35 + drift_headroom * 0.25 + edge_headroom * 0.20,
+        SellStructure::WideFly => {
+            chop * 0.20 + hot * 0.35 + drift_headroom * 0.25 + edge_headroom * 0.20
+        }
     };
 
     0.20 * drift_headroom + 0.15 * edge_headroom + 0.65 * affinity
@@ -1066,13 +1134,20 @@ impl MultiLegEngine {
 
     fn feed_age_ms(&self, now: u64) -> u64 {
         let mut required_clock = self.last_tick_ms;
-        for active in self.state.values().filter_map(|state| state.active.as_ref()) {
+        for active in self
+            .state
+            .values()
+            .filter_map(|state| state.active.as_ref())
+        {
             if let Some(token) = self.underlying_tokens.get(&active.underlying) {
-                required_clock = required_clock.min(
-                    self.last_tick_by_token.get(token).copied().unwrap_or(0),
-                );
+                required_clock =
+                    required_clock.min(self.last_tick_by_token.get(token).copied().unwrap_or(0));
             }
-            for leg in active.legs.iter().filter(|leg| leg.plan.side == OrderSide::Sell) {
+            for leg in active
+                .legs
+                .iter()
+                .filter(|leg| leg.plan.side == OrderSide::Sell)
+            {
                 required_clock = required_clock.min(
                     self.last_tick_by_token
                         .get(&leg.market.token)
@@ -1129,7 +1204,12 @@ impl MultiLegEngine {
             if let Some(spot) = self.current_spot(&underlying) {
                 self.record_spot(&underlying, now_ms, secs, spot);
             }
-            if self.state.get(&underlying).and_then(|s| s.active.as_ref()).is_some() {
+            if self
+                .state
+                .get(&underlying)
+                .and_then(|s| s.active.as_ref())
+                .is_some()
+            {
                 self.manage_active(&underlying, now_ms, mins).await;
                 continue;
             }
@@ -1143,7 +1223,8 @@ impl MultiLegEngine {
             if let Some(st) = self.state.get_mut(&underlying) {
                 st.last_scan_ms = now_ms;
             }
-            self.process_underlying(&underlying, now_ms, day, wd, mins).await;
+            self.process_underlying(&underlying, now_ms, day, wd, mins)
+                .await;
         }
     }
 
@@ -1155,7 +1236,12 @@ impl MultiLegEngine {
         _wd: Weekday,
         mins: u32,
     ) {
-        if self.state.get(underlying).and_then(|s| s.active.as_ref()).is_some() {
+        if self
+            .state
+            .get(underlying)
+            .and_then(|s| s.active.as_ref())
+            .is_some()
+        {
             self.manage_active(underlying, now_ms, mins).await;
             return;
         }
@@ -1202,7 +1288,10 @@ impl MultiLegEngine {
                 self.log_skip(
                     underlying,
                     now_ms,
-                    format!("multi-leg stand aside: expiry {} is expired ({}DTE)", snapshot.expiry, dte),
+                    format!(
+                        "multi-leg stand aside: expiry {} is expired ({}DTE)",
+                        snapshot.expiry, dte
+                    ),
                 );
                 return;
             }
@@ -1216,7 +1305,8 @@ impl MultiLegEngine {
             }
         };
         let near_expiry = dte_allows(dte);
-        let credit_edge_window = mins <= CREDIT_EDGE_LATEST_ENTRY_MIN && dte <= CREDIT_EDGE_MAX_DTE_DAYS;
+        let credit_edge_window =
+            mins <= CREDIT_EDGE_LATEST_ENTRY_MIN && dte <= CREDIT_EDGE_MAX_DTE_DAYS;
         let mut standard_window = near_expiry || mins >= FAR_DTE_ENTRY_MIN;
         if !credit_edge_window && !standard_window {
             return;
@@ -1292,8 +1382,7 @@ impl MultiLegEngine {
                     er,
                     range_pts,
                     straddle,
-                    directional_efficiency: opening_directional_efficiency(&closes)
-                        .unwrap_or(0.0),
+                    directional_efficiency: opening_directional_efficiency(&closes).unwrap_or(0.0),
                     edge_frac,
                 }
             }
@@ -1312,15 +1401,18 @@ impl MultiLegEngine {
             credit_edge_window,
             standard_window,
             standard_regime_skip,
-        )
-        else {
+        ) else {
             return;
         };
         self.open_combo(active, snapshot).await;
     }
 
     fn underlyings(&self) -> Vec<String> {
-        let mut out: Vec<String> = self.contracts.iter().map(|c| c.underlying.clone()).collect();
+        let mut out: Vec<String> = self
+            .contracts
+            .iter()
+            .map(|c| c.underlying.clone())
+            .collect();
         out.sort();
         out.dedup();
         out
@@ -1329,7 +1421,10 @@ impl MultiLegEngine {
     fn reset_day(&mut self, underlying: &str, day: NaiveDate) {
         let st = self.state.entry(underlying.to_string()).or_default();
         if st.day != Some(day) {
-            *st = UnderlyingState { day: Some(day), ..UnderlyingState::default() };
+            *st = UnderlyingState {
+                day: Some(day),
+                ..UnderlyingState::default()
+            };
         }
     }
 
@@ -1369,11 +1464,16 @@ impl MultiLegEngine {
             .single()
             .unwrap_or_else(Utc::now);
         let t_years = compute_time_to_expiry_at(&expiry, as_of_utc)?;
-        let mut partial: HashMap<u64, (Option<(f64, f64, f64)>, Option<(f64, f64, f64)>)> = HashMap::new();
+        let mut partial: HashMap<u64, (Option<(f64, f64, f64)>, Option<(f64, f64, f64)>)> =
+            HashMap::new();
         let mut markets = HashMap::new();
         let mut lot_size = None;
 
-        for c in self.contracts.iter().filter(|c| c.underlying == underlying && c.expiry == expiry) {
+        for c in self
+            .contracts
+            .iter()
+            .filter(|c| c.underlying == underlying && c.expiry == expiry)
+        {
             let Some(tick) = self.store.get(c.instrument_token) else {
                 continue;
             };
@@ -1470,10 +1570,7 @@ impl MultiLegEngine {
                     );
                     continue;
                 }
-                if !credit_edge_directional_efficiency_admits(
-                    dte,
-                    regime.directional_efficiency,
-                ) {
+                if !credit_edge_directional_efficiency_admits(dte, regime.directional_efficiency) {
                     last_err = format!(
                         "CreditEdge CRED directional efficiency {:.2} < {:.2}",
                         regime.directional_efficiency,
@@ -1518,7 +1615,10 @@ impl MultiLegEngine {
             self.log_skip(
                 underlying,
                 now_ms,
-                format!("multi-leg skipped: no structure passed gates ({})", last_err),
+                format!(
+                    "multi-leg skipped: no structure passed gates ({})",
+                    last_err
+                ),
             );
             return None;
         }
@@ -1540,7 +1640,11 @@ impl MultiLegEngine {
             "MULTILEG regime pick {:?} score {:.2} | ER {:.2} RVS {:.0}% centered {:.0}% | \
              CRED={} Condor={} Tight={} Fly={} WideFly={}",
             best,
-            scoreboard.iter().find(|(s, _)| *s == best).map(|(_, sc)| *sc).unwrap_or(0.0),
+            scoreboard
+                .iter()
+                .find(|(s, _)| *s == best)
+                .map(|(_, sc)| *sc)
+                .unwrap_or(0.0),
             regime.er,
             regime.range_straddle() * 100.0,
             regime.centered() * 100.0,
@@ -1587,8 +1691,7 @@ impl MultiLegEngine {
             )
             .ok_or("CRED legs not seatable")?
         } else {
-            select_legs(&snapshot.quotes, snapshot.spot, structure)
-                .ok_or("legs not seatable")?
+            select_legs(&snapshot.quotes, snapshot.spot, structure).ok_or("legs not seatable")?
         };
         let credit = combo_credit(&legs, &snapshot.quotes).ok_or("no credit")?;
         let max_loss_unit = structure.wing() - credit;
@@ -1643,8 +1746,15 @@ impl MultiLegEngine {
                 .get(&(strike_key(leg.strike), leg.opt))
                 .ok_or("missing leg market")?
                 .clone();
-            let entry_px = entry_fill(&leg, quote_at(&snapshot.quotes, leg.strike).ok_or("missing quote")?);
-            live_legs.push(LiveLeg { plan: leg, market, entry_px });
+            let entry_px = entry_fill(
+                &leg,
+                quote_at(&snapshot.quotes, leg.strike).ok_or("missing quote")?,
+            );
+            live_legs.push(LiveLeg {
+                plan: leg,
+                market,
+                entry_px,
+            });
         }
 
         Ok((
@@ -1665,10 +1775,16 @@ impl MultiLegEngine {
 
     #[cfg(test)]
     fn opening_range(&self, underlying: &str, day: NaiveDate) -> Option<f64> {
-        self.opening_latent(underlying, day, None).map(|l| l.range_pts)
+        self.opening_latent(underlying, day, None)
+            .map(|l| l.range_pts)
     }
 
-    fn opening_latent(&self, underlying: &str, day: NaiveDate, end_ms: Option<u64>) -> Option<OpeningLatent> {
+    fn opening_latent(
+        &self,
+        underlying: &str,
+        day: NaiveDate,
+        end_ms: Option<u64>,
+    ) -> Option<OpeningLatent> {
         let st = self.state.get(underlying)?;
         if st.day != Some(day) {
             return None;
@@ -1714,7 +1830,12 @@ impl MultiLegEngine {
 
     /// 1-min spot closes over the entry window [09:15:05, end], chronological. Buckets the
     /// per-tick spot history by minute (last sample wins) to match the backtest's resample.
-    fn entry_minute_closes(&self, underlying: &str, day: NaiveDate, end_ms: Option<u64>) -> Vec<f64> {
+    fn entry_minute_closes(
+        &self,
+        underlying: &str,
+        day: NaiveDate,
+        end_ms: Option<u64>,
+    ) -> Vec<f64> {
         let Some(st) = self.state.get(underlying) else {
             return Vec::new();
         };
@@ -1741,7 +1862,13 @@ impl MultiLegEngine {
         by_min.into_values().collect()
     }
 
-    fn recent_minute_closes(&self, underlying: &str, day: NaiveDate, now_ms: u64, minutes: u32) -> Vec<f64> {
+    fn recent_minute_closes(
+        &self,
+        underlying: &str,
+        day: NaiveDate,
+        now_ms: u64,
+        minutes: u32,
+    ) -> Vec<f64> {
         let Some(st) = self.state.get(underlying) else {
             return Vec::new();
         };
@@ -1776,7 +1903,10 @@ impl MultiLegEngine {
                         failure.message()
                     );
                 } else {
-                    warn!("MULTILEG margin preflight skipped entry: {}", failure.message());
+                    warn!(
+                        "MULTILEG margin preflight skipped entry: {}",
+                        failure.message()
+                    );
                 }
                 crate::portfolio::release(&self.shared_circuit, HOLDER);
                 return;
@@ -1789,7 +1919,11 @@ impl MultiLegEngine {
                     let key = active.underlying.clone();
                     info!(
                         "MULTILEG LIVE OPEN {} {:?} x{}lot credit {:.2}/u expiry {}",
-                        active.underlying, active.structure, active.lots, active.credit, snapshot.expiry
+                        active.underlying,
+                        active.structure,
+                        active.lots,
+                        active.credit,
+                        snapshot.expiry
                     );
                     self.state.entry(key).or_default().active = Some(active);
                 }
@@ -1820,7 +1954,9 @@ impl MultiLegEngine {
         active: &mut ActiveCombo,
         snapshot: &ChainSnapshot,
     ) -> Result<(), MarginPreflightFailure> {
-        let Some(live) = &self.live else { return Ok(()); };
+        let Some(live) = &self.live else {
+            return Ok(());
+        };
         let funds = match fetch_live_available_funds(&live.api_key, &live.access_token).await {
             Ok(v) => v,
             Err(e) => {
@@ -1849,15 +1985,16 @@ impl MultiLegEngine {
                     price: marketable_limit(l.plan.side, l.market.bid, l.market.ask),
                 })
                 .collect();
-            let final_margin = match fetch_basket_final_margin(&live.api_key, &live.access_token, &orders).await {
-                Ok(v) => v,
-                Err(e) => {
-                    return Err(MarginPreflightFailure::Transient(format!(
-                        "basket margin unavailable: {}",
-                        e
-                    )));
-                }
-            };
+            let final_margin =
+                match fetch_basket_final_margin(&live.api_key, &live.access_token, &orders).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(MarginPreflightFailure::Transient(format!(
+                            "basket margin unavailable: {}",
+                            e
+                        )));
+                    }
+                };
             if basket_margin_ok(final_margin, funds, MARGIN_BUFFER_FRAC) {
                 if lots != active.lots {
                     warn!(
@@ -1903,11 +2040,21 @@ impl MultiLegEngine {
     async fn place_live_entry(&mut self, active: &mut ActiveCombo) -> Result<(), LiveEntryFailure> {
         let qty = active.lots.saturating_mul(active.lot_size);
         let mut completed: Vec<FilledLiveLeg> = Vec::new();
-        for plan in placement_sequence(&active.legs.iter().map(|l| l.plan.clone()).collect::<Vec<_>>()) {
+        for plan in placement_sequence(
+            &active
+                .legs
+                .iter()
+                .map(|l| l.plan.clone())
+                .collect::<Vec<_>>(),
+        ) {
             let idx = active
                 .legs
                 .iter()
-                .position(|l| l.plan.strike == plan.strike && l.plan.opt == plan.opt && l.plan.side == plan.side)
+                .position(|l| {
+                    l.plan.strike == plan.strike
+                        && l.plan.opt == plan.opt
+                        && l.plan.side == plan.side
+                })
                 .ok_or_else(|| LiveEntryFailure {
                     message: "entry sequence leg missing".to_string(),
                     safe_to_release: true,
@@ -2013,7 +2160,8 @@ impl MultiLegEngine {
                 reason = Some(ExitReason::TakeProfit);
             } else if credit_edge_late_net_exit(active.structure, mins, net_now, active.lots) {
                 reason = Some(ExitReason::TakeProfit);
-            } else if trail_enabled(active.structure) && trail_exits(gain, peak_gain, active.credit) {
+            } else if trail_enabled(active.structure) && trail_exits(gain, peak_gain, active.credit)
+            {
                 // Half-gain profit trail: a winner that peaked past +15% gives back at most half.
                 reason = Some(ExitReason::Trail);
             } else if net_now <= -hard_stop_frac_cap(active.structure) * self.capital {
@@ -2076,13 +2224,21 @@ impl MultiLegEngine {
         Some((now_spot - prev).abs())
     }
 
-    async fn close_active(&mut self, active: ActiveCombo, snapshot: ChainSnapshot, reason: ExitReason) {
+    async fn close_active(
+        &mut self,
+        active: ActiveCombo,
+        snapshot: ChainSnapshot,
+        reason: ExitReason,
+    ) {
         let qty = active.lots.saturating_mul(active.lot_size);
         let exit_prices = self.exit_prices(&active, &snapshot);
         if self.live.is_some() {
             let mut live_active = active.clone();
             for leg in &mut live_active.legs {
-                if let Some(m) = snapshot.markets.get(&(strike_key(leg.plan.strike), leg.plan.opt)) {
+                if let Some(m) = snapshot
+                    .markets
+                    .get(&(strike_key(leg.plan.strike), leg.plan.opt))
+                {
                     leg.market = m.clone();
                 }
             }
@@ -2092,7 +2248,10 @@ impl MultiLegEngine {
                 "exit"
             };
             if let Err(e) = self.flatten_live_legs(&live_active.legs, qty, label).await {
-                warn!("MULTILEG live exit failed; keeping lock/active position: {}", e);
+                warn!(
+                    "MULTILEG live exit failed; keeping lock/active position: {}",
+                    e
+                );
                 return;
             }
         }
@@ -2110,10 +2269,17 @@ impl MultiLegEngine {
         );
     }
 
-    fn exit_prices(&self, active: &ActiveCombo, snapshot: &ChainSnapshot) -> HashMap<(u64, OptionType), f64> {
+    fn exit_prices(
+        &self,
+        active: &ActiveCombo,
+        snapshot: &ChainSnapshot,
+    ) -> HashMap<(u64, OptionType), f64> {
         let mut out = HashMap::new();
         for leg in &active.legs {
-            if let Some(m) = snapshot.markets.get(&(strike_key(leg.plan.strike), leg.plan.opt)) {
+            if let Some(m) = snapshot
+                .markets
+                .get(&(strike_key(leg.plan.strike), leg.plan.opt))
+            {
                 let px = match leg.plan.side {
                     OrderSide::Sell => m.ask,
                     OrderSide::Buy => m.bid,
@@ -2146,7 +2312,12 @@ impl MultiLegEngine {
         }
     }
 
-    async fn flatten_live_legs(&mut self, legs: &[LiveLeg], qty: u32, label: &str) -> Result<(), String> {
+    async fn flatten_live_legs(
+        &mut self,
+        legs: &[LiveLeg],
+        qty: u32,
+        label: &str,
+    ) -> Result<(), String> {
         let fills: Vec<FilledLiveLeg> = legs
             .iter()
             .cloned()
@@ -2155,7 +2326,11 @@ impl MultiLegEngine {
         self.flatten_live_fills(&fills, label).await
     }
 
-    async fn flatten_live_fills(&mut self, fills: &[FilledLiveLeg], label: &str) -> Result<(), String> {
+    async fn flatten_live_fills(
+        &mut self,
+        fills: &[FilledLiveLeg],
+        label: &str,
+    ) -> Result<(), String> {
         // Close order is the mirror of entry: buy back every SHORT first, THEN sell the wings, so a
         // short is never momentarily left naked. Stable sort preserves intra-group order.
         let mut seq: Vec<FilledLiveLeg> = fills.iter().filter(|f| f.qty > 0).cloned().collect();
@@ -2165,7 +2340,10 @@ impl MultiLegEngine {
             let tag = self.next_tag(if label == "exit" { "MLX" } else { "MLF" });
             let limit = flatten_limit(label, side, fill.leg.market.bid, fill.leg.market.ask);
             self.send_order(&tag, &fill.leg, side, fill.qty, limit)?;
-            match self.wait_complete(&tag, fill.qty, LIVE_ORDER_TIMEOUT_SECS).await {
+            match self
+                .wait_complete(&tag, fill.qty, LIVE_ORDER_TIMEOUT_SECS)
+                .await
+            {
                 Ok(_) => {}
                 Err(e) => {
                     if let Some(done) = e.fill {
@@ -2196,7 +2374,10 @@ impl MultiLegEngine {
         qty: u32,
         limit_price: Option<f64>,
     ) -> Result<(), String> {
-        let live = self.live.as_ref().ok_or_else(|| "live bridge not configured".to_string())?;
+        let live = self
+            .live
+            .as_ref()
+            .ok_or_else(|| "live bridge not configured".to_string())?;
         live.order_tx
             .send(OrderCommand::Place(PlaceOrderCmd {
                 tag: tag.to_string(),
@@ -2214,16 +2395,14 @@ impl MultiLegEngine {
         qty: u32,
         timeout_secs: u64,
     ) -> Result<LiveOrderFill, LiveOrderFailure> {
-        let rx = self
-            .updates_rx
-            .as_mut()
-            .ok_or_else(|| LiveOrderFailure {
-                message: "live order updates receiver not configured".to_string(),
-                fill: None,
-                reconciled: false,
-            })?;
+        let rx = self.updates_rx.as_mut().ok_or_else(|| LiveOrderFailure {
+            message: "live order updates receiver not configured".to_string(),
+            fill: None,
+            reconciled: false,
+        })?;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-        let mut poll = tokio::time::interval(std::time::Duration::from_millis(ORDER_STATUS_POLL_MS));
+        let mut poll =
+            tokio::time::interval(std::time::Duration::from_millis(ORDER_STATUS_POLL_MS));
         let mut fill = None;
         loop {
             tokio::select! {
@@ -2284,8 +2463,12 @@ impl MultiLegEngine {
         mut fill: Option<LiveOrderFill>,
     ) -> Result<LiveOrderFill, LiveOrderFailure> {
         if let Some(live) = &self.live {
-            let _ = live.order_tx.send(OrderCommand::CancelByTag { tag: tag.to_string() });
-            let _ = live.order_tx.send(OrderCommand::StatusByTag { tag: tag.to_string() });
+            let _ = live.order_tx.send(OrderCommand::CancelByTag {
+                tag: tag.to_string(),
+            });
+            let _ = live.order_tx.send(OrderCommand::StatusByTag {
+                tag: tag.to_string(),
+            });
         }
 
         let rx = self.updates_rx.as_mut().ok_or_else(|| LiveOrderFailure {
@@ -2293,9 +2476,10 @@ impl MultiLegEngine {
             fill,
             reconciled: false,
         })?;
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(CANCEL_RECONCILE_TIMEOUT_SECS);
-        let mut poll = tokio::time::interval(std::time::Duration::from_millis(ORDER_STATUS_POLL_MS));
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(CANCEL_RECONCILE_TIMEOUT_SECS);
+        let mut poll =
+            tokio::time::interval(std::time::Duration::from_millis(ORDER_STATUS_POLL_MS));
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(deadline) => {
@@ -2374,7 +2558,8 @@ fn best_bid_ask(tick: &crate::models::Tick) -> Option<(f64, f64)> {
     let d = tick.depth.as_ref()?;
     let bid = d.bids[0].price;
     let ask = d.asks[0].price;
-    (bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 && ask >= bid).then_some((bid, ask))
+    (bid.is_finite() && ask.is_finite() && bid > 0.0 && ask > 0.0 && ask >= bid)
+        .then_some((bid, ask))
 }
 
 fn strike_key(strike: f64) -> u64 {
@@ -2453,7 +2638,10 @@ fn abort_flatten_set(
 }
 
 fn is_terminal_status(status_upper: &str) -> bool {
-    matches!(status_upper, "REJECTED" | "CANCELLED" | "CANCELED" | "EXPIRED")
+    matches!(
+        status_upper,
+        "REJECTED" | "CANCELLED" | "CANCELED" | "EXPIRED"
+    )
 }
 
 fn update_fill_progress(fill: &mut Option<LiveOrderFill>, upd: &OrderUpdate) {
@@ -2478,7 +2666,10 @@ fn update_fill_progress(fill: &mut Option<LiveOrderFill>, upd: &OrderUpdate) {
 }
 
 fn sanitize_tag(s: &str) -> String {
-    s.chars().filter(|c| c.is_ascii_alphanumeric()).take(20).collect()
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(20)
+        .collect()
 }
 
 fn realized_pnl(
@@ -2509,8 +2700,16 @@ pub(crate) fn option_order_cost(price: f64, qty: u32, side: OrderSide, ts_ms: u6
     let exch = 0.000311 * prem;
     let sebi = 0.000001 * prem;
     let gst = 0.18 * (brokerage + exch + sebi);
-    let stt = if side == OrderSide::Sell { options_sell_stt_rate(ts_ms) * prem } else { 0.0 };
-    let stamp = if side == OrderSide::Buy { 0.00003 * prem } else { 0.0 };
+    let stt = if side == OrderSide::Sell {
+        options_sell_stt_rate(ts_ms) * prem
+    } else {
+        0.0
+    };
+    let stamp = if side == OrderSide::Buy {
+        0.00003 * prem
+    } else {
+        0.0
+    };
     brokerage + exch + sebi + gst + stt + stamp
 }
 
@@ -2522,7 +2721,11 @@ fn options_sell_stt_rate(ts_ms: u64) -> f64 {
         .unwrap_or_else(Utc::now)
         .with_timezone(&ist);
     let hike = NaiveDate::from_ymd_opt(2026, 4, 1).expect("valid STT hike date");
-    if dt.date_naive() >= hike { 0.0015 } else { 0.0010 }
+    if dt.date_naive() >= hike {
+        0.0015
+    } else {
+        0.0010
+    }
 }
 
 #[cfg(test)]
@@ -2530,7 +2733,15 @@ mod tests {
     use super::*;
 
     fn sq(strike: f64, cd: f64, pd: f64, cb: f64, ca: f64, pb: f64, pa: f64) -> StrikeQuote {
-        StrikeQuote { strike, ce_delta: cd, pe_delta: pd, ce_bid: cb, ce_ask: ca, pe_bid: pb, pe_ask: pa }
+        StrikeQuote {
+            strike,
+            ce_delta: cd,
+            pe_delta: pd,
+            ce_bid: cb,
+            ce_ask: ca,
+            pe_bid: pb,
+            pe_ask: pa,
+        }
     }
 
     /// 06-22-like NIFTY chain (spot ~24109), deltas/quotes from the real recorded data.
@@ -2567,10 +2778,15 @@ mod tests {
 
     #[test]
     fn far_dte_sideways_gate_admits_clean_range_and_rejects_recent_trend() {
-        let sideways = [24000.0, 24020.0, 24005.0, 24025.0, 24010.0, 24030.0, 24015.0, 24020.0];
+        let sideways = [
+            24000.0, 24020.0, 24005.0, 24025.0, 24010.0, 24030.0, 24015.0, 24020.0,
+        ];
         let recent_chop = [24015.0, 24025.0, 24018.0, 24028.0, 24020.0];
         let m = far_dte_sideways_metrics(&sideways, &recent_chop, 24020.0).unwrap();
-        assert!(far_dte_sideways_reject(m).is_none(), "clean far-DTE range should admit: {m:?}");
+        assert!(
+            far_dte_sideways_reject(m).is_none(),
+            "clean far-DTE range should admit: {m:?}"
+        );
 
         let recent_trend = [24020.0, 24030.0, 24040.0, 24050.0, 24060.0];
         let m = far_dte_sideways_metrics(&sideways, &recent_trend, 24060.0).unwrap();
@@ -2581,12 +2797,24 @@ mod tests {
     fn condor_picks_quarter_delta_shorts_with_wings() {
         let legs = select_legs(&chain(), 24109.0, SellStructure::Condor).unwrap();
         assert_eq!(legs.len(), 4);
-        let ce_s = legs.iter().find(|l| l.opt == OptionType::CE && l.side == OrderSide::Sell).unwrap();
-        let pe_s = legs.iter().find(|l| l.opt == OptionType::PE && l.side == OrderSide::Sell).unwrap();
+        let ce_s = legs
+            .iter()
+            .find(|l| l.opt == OptionType::CE && l.side == OrderSide::Sell)
+            .unwrap();
+        let pe_s = legs
+            .iter()
+            .find(|l| l.opt == OptionType::PE && l.side == OrderSide::Sell)
+            .unwrap();
         assert_eq!(ce_s.strike, 24250.0); // ~0.25Δ call
         assert_eq!(pe_s.strike, 23950.0); // ~|0.25|Δ put (23900 has no wing room → excluded)
-        assert!(legs.iter().any(|l| l.opt == OptionType::CE && l.side == OrderSide::Buy && (l.strike - 24350.0).abs() < 1e-6 && l.wing));
-        assert!(legs.iter().any(|l| l.opt == OptionType::PE && l.side == OrderSide::Buy && (l.strike - 23850.0).abs() < 1e-6 && l.wing));
+        assert!(legs.iter().any(|l| l.opt == OptionType::CE
+            && l.side == OrderSide::Buy
+            && (l.strike - 24350.0).abs() < 1e-6
+            && l.wing));
+        assert!(legs.iter().any(|l| l.opt == OptionType::PE
+            && l.side == OrderSide::Buy
+            && (l.strike - 23850.0).abs() < 1e-6
+            && l.wing));
     }
 
     #[test]
@@ -2611,10 +2839,15 @@ mod tests {
         .expect("bull-put credit spread must seat");
         assert_eq!(bull_put.len(), 2);
         assert!(bull_put.iter().any(|l| {
-            l.opt == OptionType::PE && l.side == OrderSide::Sell && (l.strike - 24000.0).abs() < 1e-6
+            l.opt == OptionType::PE
+                && l.side == OrderSide::Sell
+                && (l.strike - 24000.0).abs() < 1e-6
         }));
         assert!(bull_put.iter().any(|l| {
-            l.opt == OptionType::PE && l.side == OrderSide::Buy && l.wing && (l.strike - 23900.0).abs() < 1e-6
+            l.opt == OptionType::PE
+                && l.side == OrderSide::Buy
+                && l.wing
+                && (l.strike - 23900.0).abs() < 1e-6
         }));
 
         let bear_call = select_credit_spread_legs(
@@ -2627,33 +2860,60 @@ mod tests {
         .expect("bear-call credit spread must seat");
         assert_eq!(bear_call.len(), 2);
         assert!(bear_call.iter().any(|l| {
-            l.opt == OptionType::CE && l.side == OrderSide::Sell && (l.strike - 24200.0).abs() < 1e-6
+            l.opt == OptionType::CE
+                && l.side == OrderSide::Sell
+                && (l.strike - 24200.0).abs() < 1e-6
         }));
         assert!(bear_call.iter().any(|l| {
-            l.opt == OptionType::CE && l.side == OrderSide::Buy && l.wing && (l.strike - 24300.0).abs() < 1e-6
+            l.opt == OptionType::CE
+                && l.side == OrderSide::Buy
+                && l.wing
+                && (l.strike - 24300.0).abs() < 1e-6
         }));
 
         let seq = placement_sequence(&bear_call);
-        assert_eq!(seq[0].side, OrderSide::Buy, "CRED must buy the hedge before selling the short");
+        assert_eq!(
+            seq[0].side,
+            OrderSide::Buy,
+            "CRED must buy the hedge before selling the short"
+        );
         assert_eq!(seq[1].side, OrderSide::Sell);
     }
 
     #[test]
     fn credit_edge_er_gate_rejects_trending_open() {
-        assert!(credit_edge_er_admits(0.50), "trained boundary should remain tradable");
-        assert!(!credit_edge_er_admits(0.53), "2026-07-15 trending open should be vetoed");
-        assert!(!credit_edge_er_admits(f64::NAN), "invalid ER must not admit a credit spread");
+        assert!(
+            credit_edge_er_admits(0.50),
+            "trained boundary should remain tradable"
+        );
+        assert!(
+            !credit_edge_er_admits(0.53),
+            "2026-07-15 trending open should be vetoed"
+        );
+        assert!(
+            !credit_edge_er_admits(f64::NAN),
+            "invalid ER must not admit a credit spread"
+        );
         assert!(credit_edge_directional_efficiency_admits(1, 0.10));
         assert!(credit_edge_directional_efficiency_admits(4, 0.51));
         assert!(!credit_edge_directional_efficiency_admits(4, 0.34));
-        assert_eq!(opening_directional_efficiency(&[100.0, 90.0, 95.0]), Some(0.5));
+        assert_eq!(
+            opening_directional_efficiency(&[100.0, 90.0, 95.0]),
+            Some(0.5)
+        );
     }
 
     #[test]
     fn fly_shorts_at_the_money() {
         let legs = select_legs(&chain(), 24109.0, SellStructure::Fly).unwrap();
-        let ce_s = legs.iter().find(|l| l.opt == OptionType::CE && l.side == OrderSide::Sell).unwrap();
-        let pe_s = legs.iter().find(|l| l.opt == OptionType::PE && l.side == OrderSide::Sell).unwrap();
+        let ce_s = legs
+            .iter()
+            .find(|l| l.opt == OptionType::CE && l.side == OrderSide::Sell)
+            .unwrap();
+        let pe_s = legs
+            .iter()
+            .find(|l| l.opt == OptionType::PE && l.side == OrderSide::Sell)
+            .unwrap();
         assert_eq!(ce_s.strike, 24100.0); // nearest spot 24109
         assert_eq!(pe_s.strike, 24100.0);
     }
@@ -2664,8 +2924,14 @@ mod tests {
         let seq = placement_sequence(&legs);
         let first_sell = seq.iter().position(|l| l.side == OrderSide::Sell).unwrap();
         let last_buy = seq.iter().rposition(|l| l.side == OrderSide::Buy).unwrap();
-        assert!(last_buy < first_sell, "every wing (BUY) must precede every short (SELL)");
-        assert!(seq[..first_sell].iter().all(|l| l.wing), "the legs placed first are the protective wings");
+        assert!(
+            last_buy < first_sell,
+            "every wing (BUY) must precede every short (SELL)"
+        );
+        assert!(
+            seq[..first_sell].iter().all(|l| l.wing),
+            "the legs placed first are the protective wings"
+        );
     }
 
     #[test]
@@ -2675,7 +2941,10 @@ mod tests {
         let mut legs = select_legs(&chain(), 24109.0, SellStructure::Condor).unwrap();
         legs.sort_by_key(|l| close_order_rank(l.side));
         let first_buy = legs.iter().position(|l| l.side == OrderSide::Buy).unwrap();
-        let last_sell = legs.iter().rposition(|l| l.side == OrderSide::Sell).unwrap();
+        let last_sell = legs
+            .iter()
+            .rposition(|l| l.side == OrderSide::Sell)
+            .unwrap();
         assert!(
             last_sell < first_buy,
             "every short (SELL, bought back) must close before any wing (BUY, sold)"
@@ -2696,7 +2965,10 @@ mod tests {
 
     #[test]
     fn feed_stale_exit_uses_market_orders() {
-        assert_eq!(flatten_limit("feed-stale", OrderSide::Buy, 12.0, 12.1), None);
+        assert_eq!(
+            flatten_limit("feed-stale", OrderSide::Buy, 12.0, 12.1),
+            None
+        );
         assert!(flatten_limit("exit", OrderSide::Buy, 12.0, 12.1).is_some());
     }
 
@@ -2719,17 +2991,32 @@ mod tests {
         assert!((credit - 31.2).abs() < 1e-6, "credit = {credit}");
         // closing immediately costs slightly MORE than the credit (you pay the spread)
         let close = combo_close_cost(&legs, &chain()).unwrap();
-        assert!(close > credit, "entry close-cost {close} should exceed credit {credit}");
+        assert!(
+            close > credit,
+            "entry close-cost {close} should exceed credit {credit}"
+        );
     }
 
     #[test]
     fn tight_picks_third_delta_shorts_with_100pt_wings() {
         // TIGHT shorts sit nearer ATM than the condor (~0.33Δ), wings still 100pt.
         let legs = select_legs(&chain(), 24109.0, SellStructure::Tight).expect("tight must seat");
-        let ce_s = legs.iter().find(|l| l.opt == OptionType::CE && l.side == OrderSide::Sell).unwrap();
-        let pe_s = legs.iter().find(|l| l.opt == OptionType::PE && l.side == OrderSide::Sell).unwrap();
-        let ce_w = legs.iter().find(|l| l.opt == OptionType::CE && l.side == OrderSide::Buy).unwrap();
-        let pe_w = legs.iter().find(|l| l.opt == OptionType::PE && l.side == OrderSide::Buy).unwrap();
+        let ce_s = legs
+            .iter()
+            .find(|l| l.opt == OptionType::CE && l.side == OrderSide::Sell)
+            .unwrap();
+        let pe_s = legs
+            .iter()
+            .find(|l| l.opt == OptionType::PE && l.side == OrderSide::Sell)
+            .unwrap();
+        let ce_w = legs
+            .iter()
+            .find(|l| l.opt == OptionType::CE && l.side == OrderSide::Buy)
+            .unwrap();
+        let pe_w = legs
+            .iter()
+            .find(|l| l.opt == OptionType::PE && l.side == OrderSide::Buy)
+            .unwrap();
         assert_eq!(ce_s.strike, 24200.0, "CE short at ~0.33Δ");
         assert_eq!(pe_s.strike, 24000.0, "PE short at ~0.33Δ");
         assert_eq!(ce_w.strike, 24300.0, "CE wing 100pt out");
@@ -2739,11 +3026,24 @@ mod tests {
 
     #[test]
     fn widefly_is_atm_with_200pt_wings_and_larger_maxloss() {
-        let legs = select_legs(&chain(), 24109.0, SellStructure::WideFly).expect("widefly must seat");
-        let ce_s = legs.iter().find(|l| l.opt == OptionType::CE && l.side == OrderSide::Sell).unwrap();
-        let pe_s = legs.iter().find(|l| l.opt == OptionType::PE && l.side == OrderSide::Sell).unwrap();
-        let ce_w = legs.iter().find(|l| l.opt == OptionType::CE && l.side == OrderSide::Buy).unwrap();
-        let pe_w = legs.iter().find(|l| l.opt == OptionType::PE && l.side == OrderSide::Buy).unwrap();
+        let legs =
+            select_legs(&chain(), 24109.0, SellStructure::WideFly).expect("widefly must seat");
+        let ce_s = legs
+            .iter()
+            .find(|l| l.opt == OptionType::CE && l.side == OrderSide::Sell)
+            .unwrap();
+        let pe_s = legs
+            .iter()
+            .find(|l| l.opt == OptionType::PE && l.side == OrderSide::Sell)
+            .unwrap();
+        let ce_w = legs
+            .iter()
+            .find(|l| l.opt == OptionType::CE && l.side == OrderSide::Buy)
+            .unwrap();
+        let pe_w = legs
+            .iter()
+            .find(|l| l.opt == OptionType::PE && l.side == OrderSide::Buy)
+            .unwrap();
         assert_eq!(ce_s.strike, 24100.0, "ATM short");
         assert_eq!(pe_s.strike, 24100.0, "ATM short (same strike)");
         assert_eq!(ce_w.strike, 24300.0, "CE wing 200pt out");
@@ -2759,8 +3059,16 @@ mod tests {
 
     #[test]
     fn per_structure_caps_match_satakarni() {
-        assert_eq!(stop_frac_ml(SellStructure::CreditEdge), 0.25, "CRED uses the optimized 25%ML stop");
-        assert_eq!(target_frac(SellStructure::CreditEdge), 0.50, "CRED target remains 50% credit capture");
+        assert_eq!(
+            stop_frac_ml(SellStructure::CreditEdge),
+            0.25,
+            "CRED uses the optimized 25%ML stop"
+        );
+        assert_eq!(
+            target_frac(SellStructure::CreditEdge),
+            0.50,
+            "CRED target remains 50% credit capture"
+        );
         for (s, drift, edge, mv) in [
             (SellStructure::CreditEdge, 1.00, 1.00, 1.00),
             (SellStructure::Condor, 0.50, 0.70, 0.35),
@@ -2813,7 +3121,7 @@ mod tests {
         // (which is exactly why the ladder falls condor→fly at 15k).
         assert_eq!(size_lots(15_000.0, fly_mll, 0.10, 5), 1); // ₹1.5k budget / ₹1300 → 1 fly lot
         assert_eq!(size_lots(15_000.0, condor_mll, 0.10, 5), 0); // ₹1.5k < one condor lot → SKIP
-        // Only once the account compounds up does the condor become fundable.
+                                                                 // Only once the account compounds up does the condor become fundable.
         assert_eq!(size_lots(50_000.0, condor_mll, 0.10, 5), 1); // ₹5k budget / ₹4472 → 1 condor lot
     }
 
@@ -2821,13 +3129,22 @@ mod tests {
     fn fly_at_chain_edge_picks_nearest_strike_with_wing_room() {
         // strikes 24000..24300; spot 24290. Literal-nearest 24300 has no upper wing (24400
         // absent) → old code returned None. Now it must fall back to 24200 (wings 24300/24100).
-        let edge: Vec<StrikeQuote> = [24000.0, 24050.0, 24100.0, 24150.0, 24200.0, 24250.0, 24300.0]
+        let edge: Vec<StrikeQuote> = [
+            24000.0, 24050.0, 24100.0, 24150.0, 24200.0, 24250.0, 24300.0,
+        ]
+        .iter()
+        .map(|&k| sq(k, 0.5, -0.5, 10.0, 10.2, 10.0, 10.2))
+        .collect();
+        let legs =
+            select_legs(&edge, 24290.0, SellStructure::Fly).expect("a near-ATM fly must exist");
+        let ce_s = legs
             .iter()
-            .map(|&k| sq(k, 0.5, -0.5, 10.0, 10.2, 10.0, 10.2))
-            .collect();
-        let legs = select_legs(&edge, 24290.0, SellStructure::Fly).expect("a near-ATM fly must exist");
-        let ce_s = legs.iter().find(|l| l.opt == OptionType::CE && l.side == OrderSide::Sell).unwrap();
-        let pe_s = legs.iter().find(|l| l.opt == OptionType::PE && l.side == OrderSide::Sell).unwrap();
+            .find(|l| l.opt == OptionType::CE && l.side == OrderSide::Sell)
+            .unwrap();
+        let pe_s = legs
+            .iter()
+            .find(|l| l.opt == OptionType::PE && l.side == OrderSide::Sell)
+            .unwrap();
         assert_eq!(ce_s.strike, 24200.0);
         assert_eq!(pe_s.strike, 24200.0);
     }
@@ -2837,8 +3154,8 @@ mod tests {
         // condor final margin ₹13,455 + 15% buffer = ₹15,473
         assert!(basket_margin_ok(13455.0, 16000.0, 0.15));
         assert!(!basket_margin_ok(13455.0, 15000.0, 0.15)); // funds short of margin+buffer
-        assert!(!basket_margin_ok(0.0, 100000.0, 0.15));    // no/invalid margin → reject
-        assert!(!basket_margin_ok(5000.0, 0.0, 0.15));      // no funds → reject
+        assert!(!basket_margin_ok(0.0, 100000.0, 0.15)); // no/invalid margin → reject
+        assert!(!basket_margin_ok(5000.0, 0.0, 0.15)); // no funds → reject
         assert!(!basket_margin_ok(5000.0, 100000.0, -0.5)); // negative buffer weakens check → reject
     }
 
@@ -2847,28 +3164,34 @@ mod tests {
         let legs = select_legs(&chain(), 24109.0, SellStructure::Condor).unwrap();
         let credit = combo_credit(&legs, &chain()).unwrap(); // 31.2
         let (lo, hi, w) = profit_zone(&legs, credit).unwrap();
-        assert!((lo - (23950.0 - credit)).abs() < 1e-6, "lower = short put − credit");
-        assert!((hi - (24250.0 + credit)).abs() < 1e-6, "upper = short call + credit");
+        assert!(
+            (lo - (23950.0 - credit)).abs() < 1e-6,
+            "lower = short put − credit"
+        );
+        assert!(
+            (hi - (24250.0 + credit)).abs() < 1e-6,
+            "upper = short call + credit"
+        );
         assert!((w - (hi - lo)).abs() < 1e-6 && w > 0.0);
     }
 
     #[test]
     fn entry_drift_gate_rejects_when_open_range_eats_the_zone() {
         let zone = 362.0;
-        assert!(entry_drift_admits(90.0, zone, SellStructure::Condor));   // 25% of zone → ok
+        assert!(entry_drift_admits(90.0, zone, SellStructure::Condor)); // 25% of zone → ok
         assert!(!entry_drift_admits(200.0, zone, SellStructure::Condor)); // 55% → rejected (>50%)
-        assert!(!entry_drift_admits(165.0, zone, SellStructure::Fly));    // 46% → rejected for fly (>45%)
-        assert!(!entry_drift_admits(50.0, 0.0, SellStructure::Condor));   // no zone → reject
+        assert!(!entry_drift_admits(165.0, zone, SellStructure::Fly)); // 46% → rejected for fly (>45%)
+        assert!(!entry_drift_admits(50.0, 0.0, SellStructure::Condor)); // no zone → reject
         assert!(entry_balance_admits(0.60, SellStructure::Condor));
         assert!(!entry_balance_admits(0.60, SellStructure::Fly));
     }
 
     #[test]
     fn move_trim_fires_on_spot_pct_or_zone_fraction() {
-        assert!(!move_trims(55.0, 24100.0, 362.0, SellStructure::Condor));   // 0.23% spot, 15% zone → hold
-        assert!(move_trims(130.0, 24100.0, 362.0, SellStructure::Condor));   // 0.54% of spot → trim
+        assert!(!move_trims(55.0, 24100.0, 362.0, SellStructure::Condor)); // 0.23% spot, 15% zone → hold
+        assert!(move_trims(130.0, 24100.0, 362.0, SellStructure::Condor)); // 0.54% of spot → trim
         assert!(move_trims(130.0, 100_000.0, 300.0, SellStructure::Condor)); // 0.13% spot but 43% zone
-        assert!(move_trims(80.0, 100_000.0, 300.0, SellStructure::Fly));     // fly cap is tighter: 27% zone
+        assert!(move_trims(80.0, 100_000.0, 300.0, SellStructure::Fly)); // fly cap is tighter: 27% zone
     }
 
     fn test_engine_with_live_bridge(
@@ -2899,13 +3222,10 @@ mod tests {
 
     async fn wait_for_cancel(mut order_rx: mpsc::UnboundedReceiver<OrderCommand>, tag: &str) {
         for _ in 0..12 {
-            let cmd = tokio::time::timeout(
-                std::time::Duration::from_millis(250),
-                order_rx.recv(),
-            )
-            .await
-            .expect("wait_complete should send cancel/status commands")
-            .expect("order command channel should stay open");
+            let cmd = tokio::time::timeout(std::time::Duration::from_millis(250), order_rx.recv())
+                .await
+                .expect("wait_complete should send cancel/status commands")
+                .expect("order command channel should stay open");
             if let OrderCommand::CancelByTag { tag: got } = cmd {
                 assert_eq!(got, tag);
                 return;
@@ -2939,9 +3259,18 @@ mod tests {
             .send(order_update("TAGCXL", "CANCELLED", 0.0, 0))
             .expect("test update receiver should be alive");
 
-        let err = handle.await.expect("wait task should not panic").unwrap_err();
-        assert!(err.reconciled, "broker terminal status makes this safe to release");
-        assert_eq!(err.fill, None, "cancelled-without-fill must not be flattened");
+        let err = handle
+            .await
+            .expect("wait task should not panic")
+            .unwrap_err();
+        assert!(
+            err.reconciled,
+            "broker terminal status makes this safe to release"
+        );
+        assert_eq!(
+            err.fill, None,
+            "cancelled-without-fill must not be flattened"
+        );
     }
 
     #[tokio::test]
@@ -2956,7 +3285,10 @@ mod tests {
             .send(order_update("TAGFILL", "COMPLETE", 12.35, 50))
             .expect("test update receiver should be alive");
 
-        let err = handle.await.expect("wait task should not panic").unwrap_err();
+        let err = handle
+            .await
+            .expect("wait task should not panic")
+            .unwrap_err();
         assert!(err.reconciled);
         assert_eq!(
             err.fill,
@@ -3022,7 +3354,9 @@ mod tests {
 
     #[test]
     fn pick_best_structure_breaks_ties_to_safer_ladder_rank() {
-        let chosen = pick_best_structure(&[(SellStructure::Fly, 0.75), (SellStructure::Condor, 0.75)]).unwrap();
+        let chosen =
+            pick_best_structure(&[(SellStructure::Fly, 0.75), (SellStructure::Condor, 0.75)])
+                .unwrap();
         assert_eq!(chosen, SellStructure::Condor);
     }
 
@@ -3053,8 +3387,18 @@ mod tests {
     fn filled_leg(opt: OptionType, side: OrderSide, wing: bool) -> FilledLiveLeg {
         FilledLiveLeg {
             leg: LiveLeg {
-                plan: PlannedLeg { strike: 100.0, opt, side, wing },
-                market: LegMarket { token: 1, tradingsymbol: "X".to_string(), bid: 1.0, ask: 1.1 },
+                plan: PlannedLeg {
+                    strike: 100.0,
+                    opt,
+                    side,
+                    wing,
+                },
+                market: LegMarket {
+                    token: 1,
+                    tradingsymbol: "X".to_string(),
+                    bid: 1.0,
+                    ask: 1.1,
+                },
                 entry_px: 1.0,
             },
             qty: 50,
@@ -3077,8 +3421,14 @@ mod tests {
             !set.iter().any(|f| f.leg.plan.opt == PE && f.leg.plan.wing),
             "the same-side PE wing must be preserved as a hedge"
         );
-        assert!(set.iter().any(|f| f.leg.plan.opt == CE && f.leg.plan.wing), "CE wing still flattened");
-        assert!(set.iter().any(|f| f.leg.plan.side == Sell), "the filled CE short still flattened");
+        assert!(
+            set.iter().any(|f| f.leg.plan.opt == CE && f.leg.plan.wing),
+            "CE wing still flattened"
+        );
+        assert!(
+            set.iter().any(|f| f.leg.plan.side == Sell),
+            "the filled CE short still flattened"
+        );
         assert_eq!(set.len(), 2);
     }
 
@@ -3086,7 +3436,10 @@ mod tests {
     fn abort_flattens_everything_when_short_status_confirmed() {
         use OptionType::PE;
         use OrderSide::{Buy, Sell};
-        let completed = vec![filled_leg(crate::models::OptionType::CE, Buy, true), filled_leg(PE, Buy, true)];
+        let completed = vec![
+            filled_leg(crate::models::OptionType::CE, Buy, true),
+            filled_leg(PE, Buy, true),
+        ];
         // reconciled=true (broker confirmed terminal) -> no naked risk, flatten all.
         let set = abort_flatten_set(&completed, Sell, PE, true);
         assert_eq!(set.len(), 2);
@@ -3368,7 +3721,11 @@ mod tests {
             engine.on_event_at(ist_ms(day, h, m, s)).await;
         }
 
-        engine.state.entry("NIFTY".to_string()).or_default().margin_block = Some(MarginBlock {
+        engine
+            .state
+            .entry("NIFTY".to_string())
+            .or_default()
+            .margin_block = Some(MarginBlock {
             structure: SellStructure::CreditEdge,
             lots: 1,
             final_margin: 36_000.0,

@@ -46,7 +46,11 @@ pub struct TechnicalBias {
 
 impl TechnicalBias {
     pub fn neutral() -> Self {
-        TechnicalBias { direction: Direction::Neutral, strength: 0.0, rsi_extreme: false }
+        TechnicalBias {
+            direction: Direction::Neutral,
+            strength: 0.0,
+            rsi_extreme: false,
+        }
     }
 }
 
@@ -136,7 +140,11 @@ pub struct SpotSeries {
 
 impl SpotSeries {
     pub fn new() -> Self {
-        SpotSeries { bars: VecDeque::with_capacity(MAX_BARS + 1), cur: None, cur_minute: -1 }
+        SpotSeries {
+            bars: VecDeque::with_capacity(MAX_BARS + 1),
+            cur: None,
+            cur_minute: -1,
+        }
     }
 
     /// Ingest a spot tick. When the wall-clock minute rolls over, the in-progress bar
@@ -236,8 +244,7 @@ impl SpotSeries {
         }
         let window = &values[values.len() - period..];
         let mean = window.iter().sum::<f64>() / period as f64;
-        let var = window.iter().map(|v| (v - mean).powi(2)).sum::<f64>()
-            / period as f64;
+        let var = window.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / period as f64;
         let sd = var.sqrt();
         Some((mean - k * sd, mean, mean + k * sd))
     }
@@ -653,7 +660,11 @@ impl SpotSeries {
             parts.push(format!(
                 "BBW {:.2}% {}",
                 width.width_pct,
-                if width.expanding { "expanding" } else { "contracting" }
+                if width.expanding {
+                    "expanding"
+                } else {
+                    "contracting"
+                }
             ));
         }
         if let Some(or) = self.opening_range() {
@@ -691,7 +702,11 @@ impl SpotSeries {
             if bias.direction == direction {
                 aligned += 1;
             }
-            parts.push(format!("bias {:?}/{:.0}%", bias.direction, bias.strength * 100.0));
+            parts.push(format!(
+                "bias {:?}/{:.0}%",
+                bias.direction,
+                bias.strength * 100.0
+            ));
         }
 
         if let Some(dmi) = self.dmi_adx() {
@@ -699,10 +714,7 @@ impl SpotSeries {
             if dmi.direction == direction {
                 aligned += 1;
             }
-            parts.push(format!(
-                "DMI {:?} ADX {:.1}",
-                dmi.direction, dmi.adx
-            ));
+            parts.push(format!("DMI {:?} ADX {:.1}", dmi.direction, dmi.adx));
         }
 
         if let Some((_, mid, _)) = Self::bollinger(&closes, BB_PERIOD, BB_K) {
@@ -724,7 +736,11 @@ impl SpotSeries {
             parts.push(format!(
                 "BBW {:.2}% {}",
                 width.width_pct,
-                if width.expanding { "expanding" } else { "contracting" }
+                if width.expanding {
+                    "expanding"
+                } else {
+                    "contracting"
+                }
             ));
         }
 
@@ -814,7 +830,11 @@ impl SpotSeries {
         } else {
             Direction::Neutral
         };
-        TechnicalBias { direction, strength, rsi_extreme }
+        TechnicalBias {
+            direction,
+            strength,
+            rsi_extreme,
+        }
     }
 
     /// **The hard gate.** Returns true if a BUY-CALL (bullish) trade is permitted: blocked
@@ -868,9 +888,8 @@ mod tests {
     fn rsi_uses_wilder_smoothing() {
         // Classic Wilder RSI sample. The first RSI after 14 periods is about 70.46.
         let closes = [
-            44.34, 44.09, 44.15, 43.61, 44.33,
-            44.83, 45.10, 45.42, 45.84, 46.08,
-            45.89, 46.03, 45.61, 46.28, 46.28,
+            44.34, 44.09, 44.15, 43.61, 44.33, 44.83, 45.10, 45.42, 45.84, 46.08, 45.89, 46.03,
+            45.61, 46.28, 46.28,
         ];
         let rsi = SpotSeries::rsi(&closes, 14).expect("RSI should form");
         assert!((rsi - 70.46).abs() < 0.05, "unexpected Wilder RSI {rsi}");
@@ -879,9 +898,8 @@ mod tests {
     #[test]
     fn rsi14_accessor_matches_wilder_rsi() {
         let closes = [
-            44.34, 44.09, 44.15, 43.61, 44.33,
-            44.83, 45.10, 45.42, 45.84, 46.08,
-            45.89, 46.03, 45.61, 46.28, 46.28,
+            44.34, 44.09, 44.15, 43.61, 44.33, 44.83, 45.10, 45.42, 45.84, 46.08, 45.89, 46.03,
+            45.61, 46.28, 46.28,
         ];
         let mut s = SpotSeries::new();
         for (idx, close) in closes.iter().enumerate() {
@@ -954,9 +972,16 @@ mod tests {
         let mut s = SpotSeries::new();
         feed_trend(&mut s, 100.0, 1.0, 30); // steady climb
         let b = s.bias();
-        assert_eq!(b.direction, Direction::Bull, "a steady climb must read Bull");
+        assert_eq!(
+            b.direction,
+            Direction::Bull,
+            "a steady climb must read Bull"
+        );
         assert!(s.allows_bullish(), "calls allowed in an uptrend");
-        assert!(!s.allows_bearish(), "PUTS VETOED in a confirmed uptrend (today's mistake)");
+        assert!(
+            !s.allows_bearish(),
+            "PUTS VETOED in a confirmed uptrend (today's mistake)"
+        );
     }
 
     #[test]
@@ -979,15 +1004,26 @@ mod tests {
         for k in 0..50u64 {
             s.ingest(25 * 60_000 + 2_000 + k * 100, 999.0); // wild spikes, still minute 25
         }
-        assert_eq!(s.closed_len(), closed_before, "in-progress ticks must not add closed bars");
-        assert_eq!(s.bias().direction, bias_before, "in-progress bar must not move the bias");
+        assert_eq!(
+            s.closed_len(),
+            closed_before,
+            "in-progress ticks must not add closed bars"
+        );
+        assert_eq!(
+            s.bias().direction,
+            bias_before,
+            "in-progress bar must not move the bias"
+        );
     }
 
     #[test]
     fn reversal_break_reads_closed_bars_only() {
         let mut s = SpotSeries::new();
         feed_trend(&mut s, 100.0, 1.0, 35);
-        assert!(s.reversal_break().is_none(), "steady trend is not a reversal");
+        assert!(
+            s.reversal_break().is_none(),
+            "steady trend is not a reversal"
+        );
 
         for m in 36..41 {
             let px = 135.0 - (m - 35) as f64 * 1.2;
@@ -996,7 +1032,9 @@ mod tests {
         }
         s.ingest(41 * 60_000 + 1_000, 128.0);
 
-        let rev = s.reversal_break().expect("break below recent lows should register");
+        let rev = s
+            .reversal_break()
+            .expect("break below recent lows should register");
         assert_eq!(rev.direction, Direction::Bear);
         assert!(rev.move_pct >= 0.0010);
         assert!(rev.atr_multiple >= 1.5);
@@ -1021,7 +1059,10 @@ mod tests {
             .directional_extension_from_extreme(Direction::Bear, 60, 130.0)
             .expect("drop from recent high should be measured");
         assert_eq!(ext.lookback_bars, 60);
-        assert!(ext.extreme > 160.0, "recent closed high should come from closed bars");
+        assert!(
+            ext.extreme > 160.0,
+            "recent closed high should come from closed bars"
+        );
         assert!(ext.points > 30.0);
 
         let before = ext.points;

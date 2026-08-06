@@ -18,7 +18,7 @@ use crate::config::{Config, ExecutionConfig};
 use crate::execution::spawn_order_executor;
 use crate::models::{Instrument, OptionContract};
 use crate::oms::{LiveBridge, ManagerConfig, PositionManager};
-use crate::risk::{ist_now, is_at_or_past, RiskManager};
+use crate::risk::{is_at_or_past, ist_now, RiskManager};
 use crate::strategy::gamma::{GammaMeta, GammaParams};
 use crate::strategy::imbalance::{EquityMeta, ImbalanceParams};
 use crate::websocket::TickEvent;
@@ -31,7 +31,10 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::{info, warn};
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 /// Estimate NIFTY spot from the index instrument, falling back to the chain median.
@@ -39,7 +42,8 @@ fn nifty_spot(instruments: &[Instrument], chain: &[OptionContract]) -> f64 {
     let idx = instruments.iter().find(|i| {
         i.exchange == "NSE"
             && i.segment == "INDICES"
-            && (i.tradingsymbol.eq_ignore_ascii_case("NIFTY 50") || i.name.eq_ignore_ascii_case("NIFTY 50"))
+            && (i.tradingsymbol.eq_ignore_ascii_case("NIFTY 50")
+                || i.name.eq_ignore_ascii_case("NIFTY 50"))
     });
     if let Some(i) = idx {
         if i.last_price > 0.0 {
@@ -76,7 +80,10 @@ pub fn gamma_metas_from_chain(
     strikes.sort_by(|a, b| (a - spot).abs().partial_cmp(&(b - spot).abs()).unwrap());
     let atm_strikes: Vec<f64> = strikes.into_iter().take(3).collect();
 
-    info!("  Strategy 2: NIFTY spot ≈ {:.1}, ATM strikes {:?}", spot, atm_strikes);
+    info!(
+        "  Strategy 2: NIFTY spot ≈ {:.1}, ATM strikes {:?}",
+        spot, atm_strikes
+    );
 
     let mut out = Vec::new();
     for c in nifty_legs {
@@ -149,7 +156,11 @@ fn build_manager(
 
     let is_tuesday = ist_now().weekday() == chrono::Weekday::Tue;
     m.set_is_tuesday(is_tuesday);
-    info!("  Today is {} (Tuesday gamma gate: {})", ist_now().weekday(), if is_tuesday { "OPEN" } else { "closed" });
+    info!(
+        "  Today is {} (Tuesday gamma gate: {})",
+        ist_now().weekday(),
+        if is_tuesday { "OPEN" } else { "closed" }
+    );
 
     m
 }
@@ -168,7 +179,10 @@ async fn run_manager(
     mut order_rx: mpsc::UnboundedReceiver<(String, String, Option<f64>)>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    info!("  Position manager task started ({} tokens tracked)", tracked.len());
+    info!(
+        "  Position manager task started ({} tokens tracked)",
+        tracked.len()
+    );
     let mut flatten_clock = tokio::time::interval(std::time::Duration::from_secs(2));
     let mut shutdown_requested = false;
     let mut shutdown_deadline_ms = 0_u64;
@@ -252,12 +266,27 @@ fn write_session_summary(manager: &PositionManager) {
     );
     let (mut wins, mut losses, mut net) = (0, 0, 0.0);
     for t in trades {
-        if t.net_pnl >= 0.0 { wins += 1; } else { losses += 1; }
+        if t.net_pnl >= 0.0 {
+            wins += 1;
+        } else {
+            losses += 1;
+        }
         net += t.net_pnl;
         csv.push_str(&format!(
             "{},{},{},{},{:?},{},{:.2},{:.2},{:.2},{:.2},{:.2},{},\"{}\"\n",
-            t.opened_ms, t.closed_ms, t.kind.label(), t.symbol, t.side, t.qty,
-            t.entry_price, t.exit_price, t.gross_pnl, t.cost, t.net_pnl, t.reason.label(), t.rationale,
+            t.opened_ms,
+            t.closed_ms,
+            t.kind.label(),
+            t.symbol,
+            t.side,
+            t.qty,
+            t.entry_price,
+            t.exit_price,
+            t.gross_pnl,
+            t.cost,
+            t.net_pnl,
+            t.reason.label(),
+            t.rationale,
         ));
     }
     if let Err(e) = std::fs::write(&path, csv) {
@@ -384,7 +413,10 @@ pub fn spawn_quant_engine(
     engine.set_warmup_until_ms(now_ms() + 3 * 60 * 1_000);
     let mut rx = tx.subscribe();
     tokio::spawn(async move {
-        info!("  Quant engine: ACTIVE (OFI/OIV/CD/SOA, simulated execution, ₹{:.0})", capital);
+        info!(
+            "  Quant engine: ACTIVE (OFI/OIV/CD/SOA, simulated execution, ₹{:.0})",
+            capital
+        );
         loop {
             match rx.recv().await {
                 Ok(ev) if !ev.feed_stale => engine.on_tick(now_ms()),

@@ -8,7 +8,6 @@
 ///
 /// This module is completely standalone. No logic is shared with options_engine.
 /// Merge only if backtests consistently show edge.
-
 use crate::models::{OptionContract, OptionType};
 use crate::store::TickStore;
 
@@ -27,18 +26,26 @@ const NSE_OPT_EXCHANGE_RATE: f64 = 0.000311; // 0.0311%
 /// 0.10% until Mar 31 2026, 0.15% from Apr 1 2026 (Budget 2025-26 change).
 fn stt_sell_rate(exit_ts_ms: u64) -> f64 {
     let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
-    let dt_ist = Utc.timestamp_millis_opt(exit_ts_ms as i64)
+    let dt_ist = Utc
+        .timestamp_millis_opt(exit_ts_ms as i64)
         .single()
         .unwrap_or_else(Utc::now)
         .with_timezone(&ist);
     let hike_date = NaiveDate::from_ymd_opt(2026, 4, 1).expect("valid date");
-    if dt_ist.date_naive() >= hike_date { 0.0015 } else { 0.0010 }
+    if dt_ist.date_naive() >= hike_date {
+        0.0015
+    } else {
+        0.0010
+    }
 }
 
 /// Returns the current date as YYYY-MM-DD in IST.
 fn ist_date_str() -> String {
     let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
-    Utc::now().with_timezone(&ist).format("%Y-%m-%d").to_string()
+    Utc::now()
+        .with_timezone(&ist)
+        .format("%Y-%m-%d")
+        .to_string()
 }
 
 fn tx_cost_entry(price: f64, lot_size: u32) -> f64 {
@@ -76,18 +83,18 @@ fn kelly_lots(capital: f64, confidence: f64, entry_price: f64, lot_size: u32) ->
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 
-const SCAN_INTERVAL_SECS: u64 = 300;         // 5-minute scans
+const SCAN_INTERVAL_SECS: u64 = 300; // 5-minute scans
 const CONFIDENCE_THRESHOLD: f64 = 62.0;
-const STOP_RATIO: f64 = 0.30;                // 30% stop on entry premium
-const TARGET_RATIO: f64 = 0.50;             // 50% target
-const BREAKEVEN_TRIGGER_RATIO: f64 = 0.65;  // trail to BE at 65% of target distance
+const STOP_RATIO: f64 = 0.30; // 30% stop on entry premium
+const TARGET_RATIO: f64 = 0.50; // 50% target
+const BREAKEVEN_TRIGGER_RATIO: f64 = 0.65; // trail to BE at 65% of target distance
 const MAX_HOLD_SECS: u64 = 75 * 60;
 const FORCE_CLOSE_HOUR: u32 = 14;
 const FORCE_CLOSE_MINUTE: u32 = 50;
 const MAX_DAILY_TRADES: u32 = 6;
 const DAILY_CIRCUIT_RATIO: f64 = 0.30;
 // Dynamic Kelly lot sizing: see kelly_lots() below.
-const MAX_KELLY_LOTS: u32 = 5;           // hard cap per trade
+const MAX_KELLY_LOTS: u32 = 5; // hard cap per trade
 const KELLY_CAPITAL_FRACTION: f64 = 0.15; // allocate up to 15% of capital per trade (half-Kelly base)
 const FILL_OFFSET: f64 = 0.5; // buy +₹0.5 slippage model
 
@@ -150,7 +157,7 @@ impl PerStrike {
 #[derive(Debug, Clone)]
 struct ScanSnapshot {
     ts_ms: u64,
-    spot: f64,   // estimated via put-call parity
+    spot: f64, // estimated via put-call parity
     atm_strike: f64,
     strikes: Vec<PerStrike>, // sorted by |strike - spot|, ATM±5
 }
@@ -158,16 +165,19 @@ struct ScanSnapshot {
 impl ScanSnapshot {
     fn avg_ce_ofi(&self) -> f64 {
         let vals: Vec<f64> = self.strikes.iter().map(|s| s.ce_ofi()).collect();
-        if vals.is_empty() { return 0.0; }
+        if vals.is_empty() {
+            return 0.0;
+        }
         vals.iter().sum::<f64>() / vals.len() as f64
     }
 
     fn avg_pe_ofi(&self) -> f64 {
         let vals: Vec<f64> = self.strikes.iter().map(|s| s.pe_ofi()).collect();
-        if vals.is_empty() { return 0.0; }
+        if vals.is_empty() {
+            return 0.0;
+        }
         vals.iter().sum::<f64>() / vals.len() as f64
     }
-
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -197,8 +207,8 @@ struct QuantPosition {
     underlying: String,
     direction: SignalDir,
     strike: f64,
-    lot_size: u32,    // contract lot size from instruments API
-    n_lots: u32,      // Kelly-sized number of lots bought this trade
+    lot_size: u32, // contract lot size from instruments API
+    n_lots: u32,   // Kelly-sized number of lots bought this trade
     entry_price: f64,
     entry_ts_ms: u64,
     stop_price: f64,
@@ -292,7 +302,10 @@ fn score_ofi(state: &UnderlyingState) -> (f64, f64) {
     // OFI uses RELATIVE dominance: in options, buy_qty > sell_qty on both sides
     // is normal (market maker asymmetry). What matters is whether PE buyers are
     // more aggressive than CE buyers, or vice versa.
-    let latest = match state.latest() { Some(s) => s, None => return (0.0, 0.0) };
+    let latest = match state.latest() {
+        Some(s) => s,
+        None => return (0.0, 0.0),
+    };
     let avg_ce = latest.avg_ce_ofi();
     let avg_pe = latest.avg_pe_ofi();
 
@@ -305,31 +318,53 @@ fn score_ofi(state: &UnderlyingState) -> (f64, f64) {
     // CE signal: CE buyers clearly more dominant than PE buyers
     if relative < -0.15 {
         ce_score += 25.0;
-        if relative < -0.25 { ce_score += 5.0; }
-        if relative < -0.35 { ce_score += 5.0; }
+        if relative < -0.25 {
+            ce_score += 5.0;
+        }
+        if relative < -0.35 {
+            ce_score += 5.0;
+        }
         if let Some(prev) = state.prev() {
             let prev_rel = prev.avg_pe_ofi() - prev.avg_ce_ofi();
-            if prev_rel < -0.10 { ce_score += 5.0; } // consistent
+            if prev_rel < -0.10 {
+                ce_score += 5.0;
+            } // consistent
         }
-        let avg_vol: f64 = latest.strikes.iter()
+        let avg_vol: f64 = latest
+            .strikes
+            .iter()
             .map(|s| s.ce_volume as f64)
-            .sum::<f64>() / latest.strikes.len().max(1) as f64;
-        if avg_vol > 5000.0 { ce_score += 3.0; }
+            .sum::<f64>()
+            / latest.strikes.len().max(1) as f64;
+        if avg_vol > 5000.0 {
+            ce_score += 3.0;
+        }
     }
 
     // PE signal: PE buyers clearly more dominant than CE buyers
     if relative > 0.15 {
         pe_score += 25.0;
-        if relative > 0.25 { pe_score += 5.0; }
-        if relative > 0.35 { pe_score += 5.0; }
+        if relative > 0.25 {
+            pe_score += 5.0;
+        }
+        if relative > 0.35 {
+            pe_score += 5.0;
+        }
         if let Some(prev) = state.prev() {
             let prev_rel = prev.avg_pe_ofi() - prev.avg_ce_ofi();
-            if prev_rel > 0.10 { pe_score += 5.0; } // consistent
+            if prev_rel > 0.10 {
+                pe_score += 5.0;
+            } // consistent
         }
-        let avg_vol: f64 = latest.strikes.iter()
+        let avg_vol: f64 = latest
+            .strikes
+            .iter()
             .map(|s| s.pe_volume as f64)
-            .sum::<f64>() / latest.strikes.len().max(1) as f64;
-        if avg_vol > 5000.0 { pe_score += 3.0; }
+            .sum::<f64>()
+            / latest.strikes.len().max(1) as f64;
+        if avg_vol > 5000.0 {
+            pe_score += 3.0;
+        }
     }
 
     (ce_score.min(OFI_MAX), pe_score.min(OFI_MAX))
@@ -349,7 +384,11 @@ fn score_oiv(state: &UnderlyingState) -> (f64, f64) {
 
     for s_new in &new.strikes {
         // find matching strike in old snapshot
-        if let Some(s_old) = old.strikes.iter().find(|s| (s.strike - s_new.strike).abs() < 1.0) {
+        if let Some(s_old) = old
+            .strikes
+            .iter()
+            .find(|s| (s.strike - s_new.strike).abs() < 1.0)
+        {
             pe_velocity += s_new.pe_oi as i64 - s_old.pe_oi as i64;
             ce_velocity += s_new.ce_oi as i64 - s_old.ce_oi as i64;
         }
@@ -369,25 +408,37 @@ fn score_oiv(state: &UnderlyingState) -> (f64, f64) {
     // per-trade aggressor data the writer assumption is the safer default here.
     if pe_velocity > 20_000 && diff > 15_000 {
         ce_score += 20.0;
-        if diff > 50_000 { ce_score += 8.0; }
-        if diff > 100_000 { ce_score += 7.0; }
+        if diff > 50_000 {
+            ce_score += 8.0;
+        }
+        if diff > 100_000 {
+            ce_score += 7.0;
+        }
         // Monotonic check: mid-scan PE OI also above oldest
         if let Some(mid) = state.prev() {
             let mid_pe: u32 = mid.strikes.iter().map(|s| s.pe_oi).sum();
             let old_pe: u32 = old.strikes.iter().map(|s| s.pe_oi).sum();
-            if mid_pe > old_pe { ce_score += 7.0; }
+            if mid_pe > old_pe {
+                ce_score += 7.0;
+            }
         }
     }
 
     // Rising CE OI = call writers accumulating → bearish (maps to BuyPE / downside signal).
     if ce_velocity > 20_000 && -diff > 15_000 {
         pe_score += 20.0;
-        if -diff > 50_000 { pe_score += 8.0; }
-        if -diff > 100_000 { pe_score += 7.0; }
+        if -diff > 50_000 {
+            pe_score += 8.0;
+        }
+        if -diff > 100_000 {
+            pe_score += 7.0;
+        }
         if let Some(mid) = state.prev() {
             let mid_ce: u32 = mid.strikes.iter().map(|s| s.ce_oi).sum();
             let old_ce: u32 = old.strikes.iter().map(|s| s.ce_oi).sum();
-            if mid_ce > old_ce { pe_score += 7.0; }
+            if mid_ce > old_ce {
+                pe_score += 7.0;
+            }
         }
     }
 
@@ -400,7 +451,10 @@ fn score_cd(state: &UnderlyingState) -> (f64, f64) {
     // "Controlled" = option premium rose proportionally (no IV panic spike):
     //   ATM PE rise should be < 5x the absolute spot drop in points.
     //   E.g., spot falls 40pts → ATM PE can rise up to 200pts before we call it "panic".
-    let latest = match state.latest() { Some(s) => s, None => return (0.0, 0.0) };
+    let latest = match state.latest() {
+        Some(s) => s,
+        None => return (0.0, 0.0),
+    };
     let reference = match state.oldest().or_else(|| state.prev()) {
         Some(s) => s,
         None => return (0.0, 0.0),
@@ -418,11 +472,15 @@ fn score_cd(state: &UnderlyingState) -> (f64, f64) {
 
     // Bearish: spot fell 0.12%+
     if spot_change_pct < -0.0012 {
-        let atm_pe_now = latest.strikes.iter()
+        let atm_pe_now = latest
+            .strikes
+            .iter()
             .find(|s| (s.strike - latest.atm_strike).abs() < 1.0)
             .map(|s| s.pe_ltp)
             .unwrap_or(0.0);
-        let atm_pe_ref = reference.strikes.iter()
+        let atm_pe_ref = reference
+            .strikes
+            .iter()
             .find(|s| (s.strike - reference.atm_strike).abs() < 1.0)
             .map(|s| s.pe_ltp)
             .unwrap_or(0.0);
@@ -433,8 +491,10 @@ fn score_cd(state: &UnderlyingState) -> (f64, f64) {
             // panic = PE rose more than 5x spot_fall in points
             if pe_rise_pts > 0.0 && pe_rise_pts < 5.0 * spot_change_pts {
                 pe_score += 20.0;
-                if spot_change_pct < -0.0025 { pe_score += 8.0; } // bigger move
-                // Monotonic: both intermediate scans show decline
+                if spot_change_pct < -0.0025 {
+                    pe_score += 8.0;
+                } // bigger move
+                  // Monotonic: both intermediate scans show decline
                 if let Some(prev) = state.prev() {
                     if prev.spot < reference.spot && latest.spot < prev.spot {
                         pe_score += 7.0;
@@ -446,11 +506,15 @@ fn score_cd(state: &UnderlyingState) -> (f64, f64) {
 
     // Bullish: spot rose 0.12%+
     if spot_change_pct > 0.0012 {
-        let atm_ce_now = latest.strikes.iter()
+        let atm_ce_now = latest
+            .strikes
+            .iter()
             .find(|s| (s.strike - latest.atm_strike).abs() < 1.0)
             .map(|s| s.ce_ltp)
             .unwrap_or(0.0);
-        let atm_ce_ref = reference.strikes.iter()
+        let atm_ce_ref = reference
+            .strikes
+            .iter()
             .find(|s| (s.strike - reference.atm_strike).abs() < 1.0)
             .map(|s| s.ce_ltp)
             .unwrap_or(0.0);
@@ -459,7 +523,9 @@ fn score_cd(state: &UnderlyingState) -> (f64, f64) {
             let ce_rise_pts = atm_ce_now - atm_ce_ref;
             if ce_rise_pts > 0.0 && ce_rise_pts < 5.0 * spot_change_pts {
                 ce_score += 20.0;
-                if spot_change_pct > 0.0025 { ce_score += 8.0; }
+                if spot_change_pct > 0.0025 {
+                    ce_score += 8.0;
+                }
                 if let Some(prev) = state.prev() {
                     if prev.spot > reference.spot && latest.spot > prev.spot {
                         ce_score += 7.0;
@@ -474,8 +540,13 @@ fn score_cd(state: &UnderlyingState) -> (f64, f64) {
 
 fn score_soa(state: &UnderlyingState) -> (f64, f64) {
     // Session OI Accumulation
-    if !state.session_oi_set { return (0.0, 0.0); }
-    let latest = match state.latest() { Some(s) => s, None => return (0.0, 0.0) };
+    if !state.session_oi_set {
+        return (0.0, 0.0);
+    }
+    let latest = match state.latest() {
+        Some(s) => s,
+        None => return (0.0, 0.0),
+    };
 
     let mut pe_accum: i64 = 0;
     let mut ce_accum: i64 = 0;
@@ -497,11 +568,15 @@ fn score_soa(state: &UnderlyingState) -> (f64, f64) {
     // More PE OI accumulated = put writers loaded → bullish → ce_score
     if net > 150_000 {
         ce_score += 15.0;
-        if net > 300_000 { ce_score += 10.0; }
+        if net > 300_000 {
+            ce_score += 10.0;
+        }
     // More CE OI accumulated = call writers loaded → bearish → pe_score
     } else if net < -150_000 {
         pe_score += 15.0;
-        if net < -300_000 { pe_score += 10.0; }
+        if net < -300_000 {
+            pe_score += 10.0;
+        }
     }
 
     (ce_score.min(SOA_MAX), pe_score.min(SOA_MAX))
@@ -527,7 +602,11 @@ impl StrategyScores {
             .iter()
             .filter(|&&v| v > 0.0)
             .count();
-        let bonus = if strategies_contributing >= 2 { CROSS_BONUS } else { 0.0 };
+        let bonus = if strategies_contributing >= 2 {
+            CROSS_BONUS
+        } else {
+            0.0
+        };
         raw + bonus
     }
 
@@ -537,26 +616,54 @@ impl StrategyScores {
             .iter()
             .filter(|&&v| v > 0.0)
             .count();
-        let bonus = if strategies_contributing >= 2 { CROSS_BONUS } else { 0.0 };
+        let bonus = if strategies_contributing >= 2 {
+            CROSS_BONUS
+        } else {
+            0.0
+        };
         raw + bonus
     }
 
     fn tag_ce(&self) -> String {
         let mut parts = Vec::new();
-        if self.ofi_ce > 0.0 { parts.push(format!("OFI({:.0})", self.ofi_ce)); }
-        if self.oiv_ce > 0.0 { parts.push(format!("OIV({:.0})", self.oiv_ce)); }
-        if self.cd_ce > 0.0  { parts.push(format!("CD({:.0})", self.cd_ce)); }
-        if self.soa_ce > 0.0 { parts.push(format!("SOA({:.0})", self.soa_ce)); }
-        if parts.is_empty() { "none".to_string() } else { parts.join("+") }
+        if self.ofi_ce > 0.0 {
+            parts.push(format!("OFI({:.0})", self.ofi_ce));
+        }
+        if self.oiv_ce > 0.0 {
+            parts.push(format!("OIV({:.0})", self.oiv_ce));
+        }
+        if self.cd_ce > 0.0 {
+            parts.push(format!("CD({:.0})", self.cd_ce));
+        }
+        if self.soa_ce > 0.0 {
+            parts.push(format!("SOA({:.0})", self.soa_ce));
+        }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join("+")
+        }
     }
 
     fn tag_pe(&self) -> String {
         let mut parts = Vec::new();
-        if self.ofi_pe > 0.0 { parts.push(format!("OFI({:.0})", self.ofi_pe)); }
-        if self.oiv_pe > 0.0 { parts.push(format!("OIV({:.0})", self.oiv_pe)); }
-        if self.cd_pe > 0.0  { parts.push(format!("CD({:.0})", self.cd_pe)); }
-        if self.soa_pe > 0.0 { parts.push(format!("SOA({:.0})", self.soa_pe)); }
-        if parts.is_empty() { "none".to_string() } else { parts.join("+") }
+        if self.ofi_pe > 0.0 {
+            parts.push(format!("OFI({:.0})", self.ofi_pe));
+        }
+        if self.oiv_pe > 0.0 {
+            parts.push(format!("OIV({:.0})", self.oiv_pe));
+        }
+        if self.cd_pe > 0.0 {
+            parts.push(format!("CD({:.0})", self.cd_pe));
+        }
+        if self.soa_pe > 0.0 {
+            parts.push(format!("SOA({:.0})", self.soa_pe));
+        }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join("+")
+        }
     }
 }
 
@@ -606,7 +713,9 @@ impl QuantEngine {
 
         let mut min_expiries: HashMap<String, String> = HashMap::new();
         for c in &contracts {
-            let entry = min_expiries.entry(c.underlying.clone()).or_insert_with(|| c.expiry.clone());
+            let entry = min_expiries
+                .entry(c.underlying.clone())
+                .or_insert_with(|| c.expiry.clone());
             if c.expiry < *entry {
                 *entry = c.expiry.clone();
             }
@@ -614,14 +723,20 @@ impl QuantEngine {
 
         for (i, c) in contracts.iter().enumerate() {
             if let Some(min_exp) = min_expiries.get(&c.underlying) {
-                if c.expiry != *min_exp { continue; }
+                if c.expiry != *min_exp {
+                    continue;
+                }
             }
             token_to_idx.insert(c.instrument_token, i);
             underlying_strikes
                 .entry(c.underlying.clone())
                 .or_default()
                 .push(c.strike);
-            let key = (c.underlying.clone(), (c.strike * 1000.0) as u64, c.option_type);
+            let key = (
+                c.underlying.clone(),
+                (c.strike * 1000.0) as u64,
+                c.option_type,
+            );
             strike_token.insert(key, c.instrument_token);
         }
 
@@ -707,8 +822,16 @@ impl QuantEngine {
     }
 
     pub fn diagnostics(&self) -> (usize, usize, usize) {
-        let wins = self.closed_trades.iter().filter(|t| t.net_pnl > 0.0).count();
-        let losses = self.closed_trades.iter().filter(|t| t.net_pnl < 0.0).count();
+        let wins = self
+            .closed_trades
+            .iter()
+            .filter(|t| t.net_pnl > 0.0)
+            .count();
+        let losses = self
+            .closed_trades
+            .iter()
+            .filter(|t| t.net_pnl < 0.0)
+            .count();
         (self.closed_trades.len(), wins, losses)
     }
 
@@ -725,7 +848,10 @@ impl QuantEngine {
 
         for underlying in &underlyings {
             let snap = self.build_snapshot(underlying, ts_ms);
-            let snap = match snap { Some(s) => s, None => continue };
+            let snap = match snap {
+                Some(s) => s,
+                None => continue,
+            };
 
             if snap.spot <= 0.0 || snap.strikes.is_empty() {
                 continue;
@@ -739,16 +865,28 @@ impl QuantEngine {
             if in_warmup {
                 warn!(
                     "Quant scan #{} {} [WARMUP] spot={:.0} strikes={}",
-                    self.scan_count, underlying, snap.spot, snap.strikes.len()
+                    self.scan_count,
+                    underlying,
+                    snap.spot,
+                    snap.strikes.len()
                 );
                 continue;
             }
 
             let (ofi_ce, ofi_pe) = score_ofi(state);
             let (oiv_ce, oiv_pe) = score_oiv(state);
-            let (cd_ce,  cd_pe)  = score_cd(state);
+            let (cd_ce, cd_pe) = score_cd(state);
             let (soa_ce, soa_pe) = score_soa(state);
-            let scores = StrategyScores { ofi_ce, ofi_pe, oiv_ce, oiv_pe, cd_ce, cd_pe, soa_ce, soa_pe };
+            let scores = StrategyScores {
+                ofi_ce,
+                ofi_pe,
+                oiv_ce,
+                oiv_pe,
+                cd_ce,
+                cd_pe,
+                soa_ce,
+                soa_pe,
+            };
 
             let ce_total = scores.total_ce();
             let pe_total = scores.total_pe();
@@ -773,37 +911,38 @@ impl QuantEngine {
             // Spot alignment gate: use the 15-minute trend (oldest→latest = 3 scans).
             // This avoids vetoing trades on 5-min bounces inside a larger trend.
             // Block only when the full 15-min window is firmly counter-directional (>0.2%).
-            let direction = raw_direction.and_then(|(dir, conf, tags)| {
-                // Use oldest scan if available (15-min window), else prev (10-min)
-                let reference_spot = state.oldest()
-                    .or_else(|| state.prev())
-                    .map(|s| s.spot)
-                    .unwrap_or(0.0);
-                let latest_spot = state.latest().map(|s| s.spot).unwrap_or(0.0);
-                let spot_change = if reference_spot > 0.0 {
-                    (latest_spot - reference_spot) / reference_spot
-                } else {
-                    0.0
-                };
+            let direction =
+                raw_direction.and_then(|(dir, conf, tags)| {
+                    // Use oldest scan if available (15-min window), else prev (10-min)
+                    let reference_spot = state
+                        .oldest()
+                        .or_else(|| state.prev())
+                        .map(|s| s.spot)
+                        .unwrap_or(0.0);
+                    let latest_spot = state.latest().map(|s| s.spot).unwrap_or(0.0);
+                    let spot_change = if reference_spot > 0.0 {
+                        (latest_spot - reference_spot) / reference_spot
+                    } else {
+                        0.0
+                    };
 
-                // Veto if spot rose 0.20%+ over 15 min when taking PE
-                // Veto if spot fell 0.20%+ over 15 min when taking CE
-                let blocked = match dir {
-                    SignalDir::PE => spot_change > 0.0020,
-                    SignalDir::CE => spot_change < -0.0020,
-                };
-                if blocked {
-                    warn!(
+                    // Veto if spot rose 0.20%+ over 15 min when taking PE
+                    // Veto if spot fell 0.20%+ over 15 min when taking CE
+                    let blocked = match dir {
+                        SignalDir::PE => spot_change > 0.0020,
+                        SignalDir::CE => spot_change < -0.0020,
+                    };
+                    if blocked {
+                        warn!(
                         "Quant: {} signal for {} vetoed by 15-min spot alignment (spot_Δ={:+.2}%)",
                         match dir { SignalDir::PE => "PE", SignalDir::CE => "CE" },
                         underlying, spot_change * 100.0
                     );
-                    None
-                } else {
-                    Some((dir, conf, tags))
-                }
-            });
-
+                        None
+                    } else {
+                        Some((dir, conf, tags))
+                    }
+                });
 
             if let Some((dir, confidence, tags)) = direction {
                 // Daily circuit breaker — only on REALIZED losses, not open positions
@@ -819,14 +958,18 @@ impl QuantEngine {
                     continue;
                 }
                 // Skip if already have open position for this underlying
-                if self.open_positions.iter().any(|p| p.underlying == *underlying) {
+                if self
+                    .open_positions
+                    .iter()
+                    .any(|p| p.underlying == *underlying)
+                {
                     warn!("Quant: already in position for {}", underlying);
                     continue;
                 }
 
-                if let Some(signal) = self.build_signal(
-                    &snap, underlying, dir, confidence, &tags, ts_ms,
-                ) {
+                if let Some(signal) =
+                    self.build_signal(&snap, underlying, dir, confidence, &tags, ts_ms)
+                {
                     self.execute_signal(signal, ts_ms);
                 }
             }
@@ -837,51 +980,69 @@ impl QuantEngine {
         let strikes = self.underlying_strikes.get(underlying)?;
 
         // Collect all strike data from store
-        let mut all_strikes: Vec<PerStrike> = strikes.iter().filter_map(|&strike| {
-            let ce_key = (underlying.to_string(), (strike * 1000.0) as u64, OptionType::CE);
-            let pe_key = (underlying.to_string(), (strike * 1000.0) as u64, OptionType::PE);
+        let mut all_strikes: Vec<PerStrike> = strikes
+            .iter()
+            .filter_map(|&strike| {
+                let ce_key = (
+                    underlying.to_string(),
+                    (strike * 1000.0) as u64,
+                    OptionType::CE,
+                );
+                let pe_key = (
+                    underlying.to_string(),
+                    (strike * 1000.0) as u64,
+                    OptionType::PE,
+                );
 
-            let ce_tok = self.strike_token.get(&ce_key).copied();
-            let pe_tok = self.strike_token.get(&pe_key).copied();
+                let ce_tok = self.strike_token.get(&ce_key).copied();
+                let pe_tok = self.strike_token.get(&pe_key).copied();
 
-            let ce_tick = ce_tok.and_then(|t| self.store.get(t));
-            let pe_tick = pe_tok.and_then(|t| self.store.get(t));
+                let ce_tick = ce_tok.and_then(|t| self.store.get(t));
+                let pe_tick = pe_tok.and_then(|t| self.store.get(t));
 
-            let ce_ltp = ce_tick.as_ref().map(|t| t.ltp).unwrap_or(0.0);
-            let pe_ltp = pe_tick.as_ref().map(|t| t.ltp).unwrap_or(0.0);
+                let ce_ltp = ce_tick.as_ref().map(|t| t.ltp).unwrap_or(0.0);
+                let pe_ltp = pe_tick.as_ref().map(|t| t.ltp).unwrap_or(0.0);
 
-            // Skip if neither side has data
-            if ce_ltp < 0.05 && pe_ltp < 0.05 { return None; }
+                // Skip if neither side has data
+                if ce_ltp < 0.05 && pe_ltp < 0.05 {
+                    return None;
+                }
 
-            Some(PerStrike {
-                strike,
-                ce_token: ce_tok,
-                ce_ltp,
-                ce_oi:       ce_tick.as_ref().map(|t| t.oi).unwrap_or(0),
-                ce_buy_qty:  ce_tick.as_ref().map(|t| t.buy_qty).unwrap_or(0),
-                ce_sell_qty: ce_tick.as_ref().map(|t| t.sell_qty).unwrap_or(0),
-                ce_volume:   ce_tick.as_ref().map(|t| t.volume).unwrap_or(0),
-                pe_token: pe_tok,
-                pe_ltp,
-                pe_oi:       pe_tick.as_ref().map(|t| t.oi).unwrap_or(0),
-                pe_buy_qty:  pe_tick.as_ref().map(|t| t.buy_qty).unwrap_or(0),
-                pe_sell_qty: pe_tick.as_ref().map(|t| t.sell_qty).unwrap_or(0),
-                pe_volume:   pe_tick.as_ref().map(|t| t.volume).unwrap_or(0),
+                Some(PerStrike {
+                    strike,
+                    ce_token: ce_tok,
+                    ce_ltp,
+                    ce_oi: ce_tick.as_ref().map(|t| t.oi).unwrap_or(0),
+                    ce_buy_qty: ce_tick.as_ref().map(|t| t.buy_qty).unwrap_or(0),
+                    ce_sell_qty: ce_tick.as_ref().map(|t| t.sell_qty).unwrap_or(0),
+                    ce_volume: ce_tick.as_ref().map(|t| t.volume).unwrap_or(0),
+                    pe_token: pe_tok,
+                    pe_ltp,
+                    pe_oi: pe_tick.as_ref().map(|t| t.oi).unwrap_or(0),
+                    pe_buy_qty: pe_tick.as_ref().map(|t| t.buy_qty).unwrap_or(0),
+                    pe_sell_qty: pe_tick.as_ref().map(|t| t.sell_qty).unwrap_or(0),
+                    pe_volume: pe_tick.as_ref().map(|t| t.volume).unwrap_or(0),
+                })
             })
-        }).collect();
+            .collect();
 
-        if all_strikes.is_empty() { return None; }
+        if all_strikes.is_empty() {
+            return None;
+        }
 
         // Compute time-to-expiry for the corrected parity formula.
         const RISK_FREE_RATE: f64 = 0.065; // 6.5% RBI repo rate (matches options_engine default)
         let t_years = {
             let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("valid IST offset");
-            let ts_naive = Utc.timestamp_millis_opt(ts_ms as i64)
+            let ts_naive = Utc
+                .timestamp_millis_opt(ts_ms as i64)
                 .single()
                 .unwrap_or_else(Utc::now)
                 .with_timezone(&ist)
                 .date_naive();
-            let expiry_str = self.contracts.iter()
+            let expiry_str = self
+                .contracts
+                .iter()
                 .filter(|c| c.underlying == underlying && !c.expiry.is_empty())
                 .map(|c| c.expiry.as_str())
                 .min()
@@ -895,25 +1056,30 @@ impl QuantEngine {
         };
 
         // Estimate spot via corrected put-call parity: S = K·e^{-rT} + C - P
-        let mut implied_spots: Vec<f64> = all_strikes.iter()
+        let mut implied_spots: Vec<f64> = all_strikes
+            .iter()
             .filter_map(|s| s.implied_spot(t_years, RISK_FREE_RATE))
             .collect();
-        if implied_spots.is_empty() { return None; }
+        if implied_spots.is_empty() {
+            return None;
+        }
 
         implied_spots.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let spot = implied_spots[implied_spots.len() / 2]; // median
 
         // Find ATM strike
-        let atm_strike = all_strikes.iter()
+        let atm_strike = all_strikes
+            .iter()
             .map(|s| s.strike)
-            .min_by(|a, b| {
-                (a - spot).abs().partial_cmp(&(b - spot).abs()).unwrap()
-            })
+            .min_by(|a, b| (a - spot).abs().partial_cmp(&(b - spot).abs()).unwrap())
             .unwrap_or(spot);
 
         // Keep only ATM±5 strikes (by proximity)
         all_strikes.sort_by(|a, b| {
-            (a.strike - spot).abs().partial_cmp(&(b.strike - spot).abs()).unwrap()
+            (a.strike - spot)
+                .abs()
+                .partial_cmp(&(b.strike - spot).abs())
+                .unwrap()
         });
         all_strikes.truncate(11); // top 11 closest = ATM±5 strikes
 
@@ -934,11 +1100,16 @@ impl QuantEngine {
         tags: &str,
         ts_ms: u64,
     ) -> Option<QuantSignal> {
-        let _opt_type = match dir { SignalDir::CE => OptionType::CE, SignalDir::PE => OptionType::PE };
+        let _opt_type = match dir {
+            SignalDir::CE => OptionType::CE,
+            SignalDir::PE => OptionType::PE,
+        };
 
         // Find ATM token of the signaled type
         let atm_strike = snap.atm_strike;
-        let token = snap.strikes.iter()
+        let token = snap
+            .strikes
+            .iter()
             .filter(|s| {
                 let tok = match dir {
                     SignalDir::CE => s.ce_token,
@@ -951,7 +1122,8 @@ impl QuantEngine {
                 tok.is_some() && ltp > 0.5
             })
             .min_by(|a, b| {
-                (a.strike - atm_strike).abs()
+                (a.strike - atm_strike)
+                    .abs()
                     .partial_cmp(&(b.strike - atm_strike).abs())
                     .unwrap()
             })
@@ -961,15 +1133,23 @@ impl QuantEngine {
             })?;
 
         let tick = self.store.get(token)?;
-        if tick.ltp < 0.5 { return None; }
+        if tick.ltp < 0.5 {
+            return None;
+        }
 
         let entry_price = tick.ltp + FILL_OFFSET;
-        let lot_size = self.token_to_idx.get(&token)
+        let lot_size = self
+            .token_to_idx
+            .get(&token)
             .map(|&i| self.contracts[i].lot_size)?; // None → skip signal; lot_size must come from API
-        let tradingsymbol = self.token_to_idx.get(&token)
+        let tradingsymbol = self
+            .token_to_idx
+            .get(&token)
             .map(|&i| self.contracts[i].tradingsymbol.clone())
             .unwrap_or_default();
-        let strike = self.token_to_idx.get(&token)
+        let strike = self
+            .token_to_idx
+            .get(&token)
             .map(|&i| self.contracts[i].strike)
             .unwrap_or(atm_strike);
 
@@ -988,7 +1168,12 @@ impl QuantEngine {
     }
 
     fn execute_signal(&mut self, signal: QuantSignal, ts_ms: u64) {
-        let n_lots = kelly_lots(self.capital, signal.confidence, signal.entry_price, signal.lot_size);
+        let n_lots = kelly_lots(
+            self.capital,
+            signal.confidence,
+            signal.entry_price,
+            signal.lot_size,
+        );
         let contracts = signal.lot_size * n_lots;
         let cost = tx_cost_entry(signal.entry_price, contracts);
         let premium_outlay = signal.entry_price * contracts as f64;
@@ -1003,11 +1188,20 @@ impl QuantEngine {
         self.capital -= premium_outlay + cost;
         self.trades_today += 1;
 
-        let dir_str = match signal.direction { SignalDir::CE => "CE", SignalDir::PE => "PE" };
+        let dir_str = match signal.direction {
+            SignalDir::CE => "CE",
+            SignalDir::PE => "PE",
+        };
         warn!(
             "Quant ENTRY  #{} {} {} strike={} entry=₹{:.2} lots={} conf={:.0} tags=[{}]",
-            self.trades_today, signal.underlying, dir_str,
-            signal.strike, signal.entry_price, n_lots, signal.confidence, signal.strategy_tags
+            self.trades_today,
+            signal.underlying,
+            dir_str,
+            signal.strike,
+            signal.entry_price,
+            n_lots,
+            signal.confidence,
+            signal.strategy_tags
         );
 
         let stop = signal.entry_price * (1.0 - STOP_RATIO);
@@ -1037,15 +1231,23 @@ impl QuantEngine {
 
     fn check_positions(&mut self, ts_ms: u64) {
         let ist = FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
-        let dt = Utc.timestamp_millis_opt(ts_ms as i64).single().unwrap_or_else(Utc::now);
+        let dt = Utc
+            .timestamp_millis_opt(ts_ms as i64)
+            .single()
+            .unwrap_or_else(Utc::now);
         let dt_ist = dt.with_timezone(&ist);
         let force_close = dt_ist.hour() > FORCE_CLOSE_HOUR
             || (dt_ist.hour() == FORCE_CLOSE_HOUR && dt_ist.minute() >= FORCE_CLOSE_MINUTE);
 
         let tokens: Vec<u32> = self.open_positions.iter().map(|p| p.token).collect();
         for token in tokens {
-            let ltp = match self.store.get(token) { Some(t) => t.ltp, None => continue };
-            if ltp <= 0.0 { continue; }
+            let ltp = match self.store.get(token) {
+                Some(t) => t.ltp,
+                None => continue,
+            };
+            if ltp <= 0.0 {
+                continue;
+            }
 
             let exit_price = (ltp - FILL_OFFSET).max(0.05);
             let reason = self.exit_reason(token, exit_price, ts_ms, force_close);
@@ -1113,11 +1315,13 @@ impl QuantEngine {
         self.capital += exit_price * lots_total as f64 - exit_cost;
         self.daily_realized_pnl += net;
 
-        let dir_str = match pos.direction { SignalDir::CE => "CE", SignalDir::PE => "PE" };
+        let dir_str = match pos.direction {
+            SignalDir::CE => "CE",
+            SignalDir::PE => "PE",
+        };
         warn!(
             "Quant EXIT  {} {} {} exit=₹{:.2} gross=₹{:+.2} net=₹{:+.2} reason={}",
-            pos.underlying, dir_str, pos.tradingsymbol,
-            exit_price, gross, net, reason
+            pos.underlying, dir_str, pos.tradingsymbol, exit_price, gross, net, reason
         );
 
         let trade = ClosedTrade {
@@ -1146,7 +1350,8 @@ impl QuantEngine {
 
     fn ensure_csv(&mut self) {
         if self.trades_csv_file.is_none() {
-            let is_new = self.trades_csv_path
+            let is_new = self
+                .trades_csv_path
                 .metadata()
                 .map(|m| m.len() == 0)
                 .unwrap_or(true); // doesn't exist yet → new
@@ -1174,11 +1379,21 @@ impl QuantEngine {
         if let Some(ref mut f) = self.trades_csv_file {
             let row = format!(
                 "{},{},{},{:.1},{},{:.2},{:.2},{},{},{:.2},{:.2},{:.2},{},{:.0},{}\n",
-                t.underlying, t.tradingsymbol, t.direction, t.strike, t.lot_size,
-                t.entry_price, t.exit_price,
-                t.entry_ts_ms, t.exit_ts_ms,
-                t.gross_pnl, t.tx_costs, t.net_pnl,
-                t.exit_reason, t.confidence, t.strategy_tags
+                t.underlying,
+                t.tradingsymbol,
+                t.direction,
+                t.strike,
+                t.lot_size,
+                t.entry_price,
+                t.exit_price,
+                t.entry_ts_ms,
+                t.exit_ts_ms,
+                t.gross_pnl,
+                t.tx_costs,
+                t.net_pnl,
+                t.exit_reason,
+                t.confidence,
+                t.strategy_tags
             );
             let _ = f.write_all(row.as_bytes());
         }
@@ -1186,14 +1401,22 @@ impl QuantEngine {
 
     fn write_session_summary(&self) {
         let net: f64 = self.closed_trades.iter().map(|t| t.net_pnl).sum();
-        let wins = self.closed_trades.iter().filter(|t| t.net_pnl > 0.0).count();
-        let losses = self.closed_trades.iter().filter(|t| t.net_pnl < 0.0).count();
+        let wins = self
+            .closed_trades
+            .iter()
+            .filter(|t| t.net_pnl > 0.0)
+            .count();
+        let losses = self
+            .closed_trades
+            .iter()
+            .filter(|t| t.net_pnl < 0.0)
+            .count();
         let gross: f64 = self.closed_trades.iter().map(|t| t.gross_pnl).sum();
         let costs: f64 = self.closed_trades.iter().map(|t| t.tx_costs).sum();
 
-        let summary_path = self.log_dir.join(
-            format!("{}_quant_summary.txt", ist_date_str())
-        );
+        let summary_path = self
+            .log_dir
+            .join(format!("{}_quant_summary.txt", ist_date_str()));
         let body = format!(
             "QUANT ENGINE SESSION SUMMARY\n\
              ============================\n\
@@ -1207,8 +1430,11 @@ impl QuantEngine {
              Return        : {:.1}%\n",
             self.scan_count,
             self.closed_trades.len(),
-            wins, losses,
-            gross, costs, net,
+            wins,
+            losses,
+            gross,
+            costs,
+            net,
             self.capital,
             (self.capital - self.initial_capital) / self.initial_capital * 100.0,
         );

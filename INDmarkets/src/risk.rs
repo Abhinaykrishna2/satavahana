@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn stop_price_caps_loss_at_budget() {
         let rm = RiskManager::new(5000.0, 1.0, 15.0, 35.0); // budget ₹50
-        // One NIFTY lot (65) long at ₹100: stop distance = 50/65 ≈ 0.769
+                                                            // One NIFTY lot (65) long at ₹100: stop distance = 50/65 ≈ 0.769
         let stop = rm.stop_price(100.0, 65, PositionSide::Long);
         let loss = (100.0 - stop) * 65.0;
         assert!((loss - 50.0).abs() < 1e-6);
@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn max_qty_for_stop_respects_budget() {
         let rm = RiskManager::new(5000.0, 1.0, 15.0, 35.0); // budget ₹50
-        // 0.50 per-unit risk => 100 units max (50 / 0.5).
+                                                            // 0.50 per-unit risk => 100 units max (50 / 0.5).
         assert_eq!(rm.max_qty_for_stop(200.0, 199.5), 100);
         assert_eq!(rm.max_qty_for_stop(200.0, 200.0), 0); // zero distance => no size
     }

@@ -86,7 +86,10 @@ impl BacktestEngine {
     }
 
     pub fn record_tick(&mut self, tick: &Tick, timestamp_us: u64) {
-        let entry = self.price_history.entry(tick.token).or_insert_with(VecDeque::new);
+        let entry = self
+            .price_history
+            .entry(tick.token)
+            .or_insert_with(VecDeque::new);
 
         entry.push_back(PriceSnapshot {
             timestamp_us,
@@ -105,9 +108,8 @@ impl BacktestEngine {
 
     pub fn simulate_trade(&self, signal: SpreadSignal) -> BacktestTrade {
         let api_lag = self.sample_api_lag();
-        let total_lag_ms = api_lag
-            + self.config.order_placement_lag_ms
-            + self.config.exchange_processing_lag_ms;
+        let total_lag_ms =
+            api_lag + self.config.order_placement_lag_ms + self.config.exchange_processing_lag_ms;
 
         let execution_time_us = signal.timestamp_us + (total_lag_ms * 1000.0) as u64;
 
@@ -153,11 +155,7 @@ impl BacktestEngine {
 
         let gross_pnl = (sell_price - buy_price) * signal.quantity as f64;
 
-        let total_costs = self.calculate_total_costs(
-            buy_price,
-            sell_price,
-            signal.quantity,
-        );
+        let total_costs = self.calculate_total_costs(buy_price, sell_price, signal.quantity);
 
         let net_pnl = gross_pnl - total_costs;
 
@@ -192,10 +190,9 @@ impl BacktestEngine {
 
     fn sample_api_lag(&self) -> f64 {
         use rand_distr::Distribution;
-        let normal = rand_distr::Normal::new(
-            self.config.mean_api_lag_ms,
-            self.config.api_lag_std_ms,
-        ).unwrap();
+        let normal =
+            rand_distr::Normal::new(self.config.mean_api_lag_ms, self.config.api_lag_std_ms)
+                .unwrap();
 
         let mut rng = rand::thread_rng();
         let lag = normal.sample(&mut rng);
@@ -229,12 +226,8 @@ impl BacktestEngine {
                 let price = p.ltp + weight * (n.ltp - p.ltp);
                 Some(price)
             }
-            (Some(p), None) => {
-                Some(p.ltp)
-            }
-            (None, Some(n)) => {
-                Some(n.ltp)
-            }
+            (Some(p), None) => Some(p.ltp),
+            (None, Some(n)) => Some(n.ltp),
             (None, None) => None,
         }
     }
@@ -312,7 +305,11 @@ impl BacktestEngine {
         let profitable_trades = successful_trades.iter().filter(|t| t.net_pnl > 0.0).count();
         let win_rate = (profitable_trades as f64 / total_trades as f64) * 100.0;
 
-        let avg_lag: f64 = successful_trades.iter().map(|t| t.total_lag_ms).sum::<f64>() / total_trades as f64;
+        let avg_lag: f64 = successful_trades
+            .iter()
+            .map(|t| t.total_lag_ms)
+            .sum::<f64>()
+            / total_trades as f64;
         let avg_gross_pnl = total_gross_pnl / total_trades as f64;
         let avg_net_pnl = total_net_pnl / total_trades as f64;
 
@@ -320,7 +317,10 @@ impl BacktestEngine {
         info!("  BACKTEST REPORT");
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
         info!("Total Trades: {}", total_trades);
-        info!("Profitable: {} ({:.2}% win rate)", profitable_trades, win_rate);
+        info!(
+            "Profitable: {} ({:.2}% win rate)",
+            profitable_trades, win_rate
+        );
         info!("");
         info!("P&L Summary:");
         info!("  Gross P&L: ₹{:.2}", total_gross_pnl);
@@ -332,7 +332,10 @@ impl BacktestEngine {
         info!("  Avg Lag: {:.2}ms", avg_lag);
         info!("  Avg Gross P&L: ₹{:.2}", avg_gross_pnl);
         info!("  Avg Net P&L: ₹{:.2}", avg_net_pnl);
-        info!("  Avg Costs per Trade: ₹{:.2}", total_costs / total_trades as f64);
+        info!(
+            "  Avg Costs per Trade: ₹{:.2}",
+            total_costs / total_trades as f64
+        );
         info!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     }
 }

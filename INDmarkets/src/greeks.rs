@@ -2,9 +2,9 @@ use crate::models::{Greeks, OptionContract, OptionType};
 use crate::store::TickStore;
 use crate::websocket::TickEvent;
 use chrono::{DateTime, NaiveDate, Utc};
+use statrs::distribution::{Continuous, ContinuousCDF, Normal};
 use std::collections::HashMap;
 use std::collections::HashSet;
-use statrs::distribution::{Continuous, ContinuousCDF, Normal};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
@@ -48,10 +48,7 @@ impl GreeksEngine {
         }
     }
 
-    pub fn spawn(
-        self,
-        mut rx: broadcast::Receiver<TickEvent>,
-    ) -> tokio::task::JoinHandle<()> {
+    pub fn spawn(self, mut rx: broadcast::Receiver<TickEvent>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             info!(
                 "Greeks engine started — monitoring {} option contracts",
@@ -133,8 +130,7 @@ impl GreeksEngine {
                         opt_tick.volume,
                     );
                 }
-                None => {
-                }
+                None => {}
             }
         }
     }
@@ -146,8 +142,7 @@ pub fn compute_time_to_expiry(expiry_str: &str) -> Option<f64> {
 
 pub fn compute_time_to_expiry_at(expiry_str: &str, as_of_utc: DateTime<Utc>) -> Option<f64> {
     let expiry_date = NaiveDate::parse_from_str(expiry_str, "%Y-%m-%d").ok()?;
-    let expiry_dt = expiry_date
-        .and_hms_opt(10, 0, 0)?;
+    let expiry_dt = expiry_date.and_hms_opt(10, 0, 0)?;
     let now = as_of_utc.naive_utc();
 
     let duration = expiry_dt.signed_duration_since(now);
@@ -167,9 +162,7 @@ fn bs_price(s: f64, k: f64, t: f64, r: f64, q: f64, sigma: f64, opt_type: Option
     let d2 = d1 - sigma * t.sqrt();
 
     match opt_type {
-        OptionType::CE => {
-            s * (-q * t).exp() * normal.cdf(d1) - k * (-r * t).exp() * normal.cdf(d2)
-        }
+        OptionType::CE => s * (-q * t).exp() * normal.cdf(d1) - k * (-r * t).exp() * normal.cdf(d2),
         OptionType::PE => {
             k * (-r * t).exp() * normal.cdf(-d2) - s * (-q * t).exp() * normal.cdf(-d1)
         }
@@ -327,8 +320,7 @@ mod tests {
     #[test]
     fn test_greeks_atm_call() {
         let price = bs_price(100.0, 100.0, 1.0, 0.05, 0.0, 0.2, OptionType::CE);
-        let greeks =
-            compute_greeks(100.0, 100.0, 1.0, 0.05, 0.0, price, OptionType::CE).unwrap();
+        let greeks = compute_greeks(100.0, 100.0, 1.0, 0.05, 0.0, price, OptionType::CE).unwrap();
 
         assert!(
             (greeks.delta - 0.64).abs() < 0.05,
@@ -352,8 +344,7 @@ mod tests {
     #[test]
     fn test_greeks_atm_put() {
         let price = bs_price(100.0, 100.0, 1.0, 0.05, 0.0, 0.2, OptionType::PE);
-        let greeks =
-            compute_greeks(100.0, 100.0, 1.0, 0.05, 0.0, price, OptionType::PE).unwrap();
+        let greeks = compute_greeks(100.0, 100.0, 1.0, 0.05, 0.0, price, OptionType::PE).unwrap();
 
         assert!(
             (greeks.delta - (-0.36)).abs() < 0.05,

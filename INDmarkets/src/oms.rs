@@ -242,12 +242,7 @@ pub struct PositionManager {
 }
 
 impl PositionManager {
-    pub fn new(
-        mode: RunMode,
-        risk: RiskManager,
-        lookback: usize,
-        cfg: ManagerConfig,
-    ) -> Self {
+    pub fn new(mode: RunMode, risk: RiskManager, lookback: usize, cfg: ManagerConfig) -> Self {
         PositionManager {
             mode,
             risk,
@@ -325,7 +320,10 @@ impl PositionManager {
 
     fn dispatch_modify(&self, tag: &str, price: f64, kind: InstrumentKind) {
         if let Some(b) = &self.live {
-            let cmd = OrderCommand::ModifyByTag { tag: tag.to_string(), new_price: price };
+            let cmd = OrderCommand::ModifyByTag {
+                tag: tag.to_string(),
+                new_price: price,
+            };
             if let Err(e) = b.tx_for(kind).send(cmd) {
                 warn!("[OMS] live Modify dispatch failed for {}: {}", tag, e);
             }
@@ -334,7 +332,9 @@ impl PositionManager {
 
     fn dispatch_cancel(&self, tag: &str, kind: InstrumentKind) {
         if let Some(b) = &self.live {
-            let cmd = OrderCommand::CancelByTag { tag: tag.to_string() };
+            let cmd = OrderCommand::CancelByTag {
+                tag: tag.to_string(),
+            };
             if let Err(e) = b.tx_for(kind).send(cmd) {
                 warn!("[OMS] live Cancel dispatch failed for {}: {}", tag, e);
             }
@@ -486,10 +486,16 @@ impl PositionManager {
             return;
         }
         for tag in &stale {
-            warn!("[OMS:{}] order aged out after {}ms unfilled; cancelling {}", self.mode.label(), ttl, tag);
+            warn!(
+                "[OMS:{}] order aged out after {}ms unfilled; cancelling {}",
+                self.mode.label(),
+                ttl,
+                tag
+            );
         }
         let drop: HashSet<&String> = stale.iter().collect();
-        self.pending.retain(|o| o.signal.token != token || !drop.contains(&o.tag));
+        self.pending
+            .retain(|o| o.signal.token != token || !drop.contains(&o.tag));
     }
 
     /// True once the engine has flattened (3:15 or shutdown) — no more entries.
@@ -519,7 +525,8 @@ impl PositionManager {
                 let target_dist = (pos.target_price - pos.entry_price).abs();
                 let progress = pos.high_water - pos.entry_price;
                 if target_dist > 0.0 && progress >= TRAIL_TRIGGER_FRAC * target_dist {
-                    let trail = (pos.high_water - TRAIL_GIVEBACK_FRAC * stop_dist).max(pos.entry_price);
+                    let trail =
+                        (pos.high_water - TRAIL_GIVEBACK_FRAC * stop_dist).max(pos.entry_price);
                     if trail > pos.stop_price {
                         pos.stop_price = trail; // ratchet UP only
                         pos.breakeven_set = true;
@@ -532,7 +539,8 @@ impl PositionManager {
                 let target_dist = (pos.entry_price - pos.target_price).abs();
                 let progress = pos.entry_price - pos.high_water;
                 if target_dist > 0.0 && progress >= TRAIL_TRIGGER_FRAC * target_dist {
-                    let trail = (pos.high_water + TRAIL_GIVEBACK_FRAC * stop_dist).min(pos.entry_price);
+                    let trail =
+                        (pos.high_water + TRAIL_GIVEBACK_FRAC * stop_dist).min(pos.entry_price);
                     if trail < pos.stop_price {
                         pos.stop_price = trail; // ratchet DOWN only
                         pos.breakeven_set = true;
@@ -602,7 +610,14 @@ impl PositionManager {
             for (tag, sig, qty, px) in dispatches {
                 // Exit is the opposite side of the entry.
                 let exit_sig = flip_side(&sig);
-                info!("[OMS:LIVE] EXIT order {} {} x{} @ ₹{:.2} [{}]", exit_sig.symbol, side_word(exit_sig.side), qty, px, "square-off");
+                info!(
+                    "[OMS:LIVE] EXIT order {} {} x{} @ ₹{:.2} [{}]",
+                    exit_sig.symbol,
+                    side_word(exit_sig.side),
+                    qty,
+                    px,
+                    "square-off"
+                );
                 self.dispatch_place(&exit_sig, &tag, qty, px);
             }
         } else {
@@ -707,7 +722,13 @@ impl PositionManager {
 
     /// Reconcile a broker order update (live mode). Confirmed entry fills open
     /// positions at the real average price; confirmed exit fills close them.
-    pub fn on_order_update(&mut self, tag: &str, status: &str, avg_price: Option<f64>, now_ms: u64) {
+    pub fn on_order_update(
+        &mut self,
+        tag: &str,
+        status: &str,
+        avg_price: Option<f64>,
+        now_ms: u64,
+    ) {
         // Terminal failure: drop a dead entry order, or let a failed exit retry.
         if status.eq_ignore_ascii_case("REJECTED")
             || status.eq_ignore_ascii_case("CANCELLED")
@@ -718,7 +739,10 @@ impl PositionManager {
                 warn!("[OMS] entry order {} {} — removing from book", tag, status);
                 self.pending.remove(idx);
             } else if let Some(p) = self.open.iter_mut().find(|p| p.exit_tag == tag) {
-                warn!("[OMS] exit order {} {} — will retry square-off on next trigger", tag, status);
+                warn!(
+                    "[OMS] exit order {} {} — will retry square-off on next trigger",
+                    tag, status
+                );
                 p.exiting = false;
                 p.exit_tag.clear();
             }
@@ -752,7 +776,9 @@ impl PositionManager {
                     PositionSide::Long => top.bid.max(0.0),
                     PositionSide::Short => top.ask,
                 };
-                if let Some((exit_tag, sig, qty, px)) = self.prepare_live_exit(pos_idx, exit_px, exit_reason, now_ms) {
+                if let Some((exit_tag, sig, qty, px)) =
+                    self.prepare_live_exit(pos_idx, exit_px, exit_reason, now_ms)
+                {
                     let exit_sig = flip_side(&sig);
                     warn!(
                         "[OMS:LIVE] late entry fill {} after cancel/flatten — dispatching EXIT {} x{} @ ₹{:.2}",
@@ -766,7 +792,9 @@ impl PositionManager {
         // Exit fill?
         if let Some(idx) = self.open.iter().position(|p| p.exit_tag == tag) {
             let pos = self.open.remove(idx);
-            let exit_px = avg_price.filter(|p| *p > 0.0).unwrap_or(pos.pending_exit_px);
+            let exit_px = avg_price
+                .filter(|p| *p > 0.0)
+                .unwrap_or(pos.pending_exit_px);
             let reason = pos.exit_reason;
             self.close_position(pos, exit_px, reason, now_ms);
         }
@@ -804,8 +832,14 @@ impl PositionManager {
         let sig = ord.signal;
         let stop_dist = entry * sig.stop_frac;
         let (stop_price, target_price) = match sig.side {
-            PositionSide::Long => ((entry - stop_dist).max(0.0), entry + stop_dist * sig.target_r),
-            PositionSide::Short => (entry + stop_dist, (entry - stop_dist * sig.target_r).max(0.0)),
+            PositionSide::Long => (
+                (entry - stop_dist).max(0.0),
+                entry + stop_dist * sig.target_r,
+            ),
+            PositionSide::Short => (
+                entry + stop_dist,
+                (entry - stop_dist * sig.target_r).max(0.0),
+            ),
         };
         info!(
             "[OMS:{}] OPEN {} {} x{} @ ₹{:.2} (stop ₹{:.2}, tgt ₹{:.2}) | {}",
@@ -932,7 +966,8 @@ impl PositionManager {
         if (self.open.len() + self.pending.len()) as u32 >= self.cfg.max_concurrent_positions {
             return;
         }
-        if now_ms.saturating_sub(self.last_open_ms) < self.cfg.cooldown_ms && self.last_open_ms > 0 {
+        if now_ms.saturating_sub(self.last_open_ms) < self.cfg.cooldown_ms && self.last_open_ms > 0
+        {
             return;
         }
         // Don't stack multiple orders/positions on the same token.
@@ -1020,14 +1055,19 @@ impl PositionManager {
         let mut modifies: Vec<(String, f64, InstrumentKind)> = Vec::new();
 
         for ord in self.pending.iter_mut() {
-            if ord.signal.token != token || ord.born_tick >= tick_no || ord.crossed || ord.cancel_requested {
+            if ord.signal.token != token
+                || ord.born_tick >= tick_no
+                || ord.crossed
+                || ord.cancel_requested
+            {
                 continue;
             }
             if now_ms.saturating_sub(ord.last_repeg_ms) < self.cfg.min_repeg_interval_ms {
                 continue;
             }
             let elapsed = now_ms.saturating_sub(ord.placed_ms);
-            let budget_left = ord.repegs < self.cfg.max_repegs && elapsed < self.cfg.chase_timeout_ms;
+            let budget_left =
+                ord.repegs < self.cfg.max_repegs && elapsed < self.cfg.chase_timeout_ms;
 
             // The market price we want to track (passive near touch).
             let market = match ord.signal.side {
@@ -1043,7 +1083,7 @@ impl PositionManager {
                     // still respects the rate cap, but must NOT burn budget or it would
                     // punish beneficial price action by eventually forcing a cross.
                     let adverse = match ord.signal.side {
-                        PositionSide::Long => market > ord.limit_price,  // price rising — paying up
+                        PositionSide::Long => market > ord.limit_price, // price rising — paying up
                         PositionSide::Short => market < ord.limit_price, // price falling — selling lower
                     };
                     ord.limit_price = market; // track the touch (chase up OR harvest)
@@ -1095,7 +1135,8 @@ impl PositionManager {
                 let qty0 = (budget / stop_dist).floor().max(1.0) as u32;
                 let est = costs::equity_est_roundtrip(sig.ref_price, qty0);
                 let qty = (((budget - est).max(0.0)) / stop_dist).floor();
-                let margin_cap = (self.risk.capital() * self.cfg.mis_leverage / sig.ref_price).floor();
+                let margin_cap =
+                    (self.risk.capital() * self.cfg.mis_leverage / sig.ref_price).floor();
                 qty.min(margin_cap).min(sig.max_lots as f64).max(0.0) as u32
             }
             InstrumentKind::Option => {
@@ -1184,12 +1225,18 @@ impl PositionManager {
                 let exit_sig = flip_side(sig);
                 warn!(
                     "[OMS:LIVE] FLATTEN market square-off {} {} x{} tag={}",
-                    exit_sig.symbol, side_word(exit_sig.side), qty, tag
+                    exit_sig.symbol,
+                    side_word(exit_sig.side),
+                    qty,
+                    tag
                 );
                 self.dispatch_place_market(&exit_sig, tag, *qty);
             }
             for (tag, px, kind) in cross_modifies {
-                warn!("[OMS:LIVE] FLATTEN cross resting exit tag={} @ ₹{:.2}", tag, px);
+                warn!(
+                    "[OMS:LIVE] FLATTEN cross resting exit tag={} @ ₹{:.2}",
+                    tag, px
+                );
                 self.dispatch_modify(&tag, px, kind);
             }
             info!(
@@ -1287,8 +1334,16 @@ mod tests {
 
     fn depth(bid_px: f64, bid_qty: u32, ask_px: f64, ask_qty: u32) -> MarketDepth {
         let mut d = MarketDepth::default();
-        d.bids[0] = DepthEntry { price: bid_px, quantity: bid_qty, orders: 1 };
-        d.asks[0] = DepthEntry { price: ask_px, quantity: ask_qty, orders: 1 };
+        d.bids[0] = DepthEntry {
+            price: bid_px,
+            quantity: bid_qty,
+            orders: 1,
+        };
+        d.asks[0] = DepthEntry {
+            price: ask_px,
+            quantity: ask_qty,
+            orders: 1,
+        };
         d
     }
 
@@ -1402,19 +1457,58 @@ mod tests {
         // entry 100, stop 98 (dist 2), target 104 (dist 4) → trail triggers at high-water 102.6.
         let mut p = test_long_position(100.0, 98.0, 104.0);
         // Below the 65% trigger: stop unchanged.
-        PositionManager::apply_trailing_stop(&mut p, BookTop { bid: 101.0, ask: 101.05 });
-        assert!((p.stop_price - 98.0).abs() < 1e-9, "no trail before 65% of target");
+        PositionManager::apply_trailing_stop(
+            &mut p,
+            BookTop {
+                bid: 101.0,
+                ask: 101.05,
+            },
+        );
+        assert!(
+            (p.stop_price - 98.0).abs() < 1e-9,
+            "no trail before 65% of target"
+        );
         assert!(!p.breakeven_set);
         // Past the trigger (high-water 103): stop ratchets to 103 − 0.5×2 = 102 (locks profit).
-        PositionManager::apply_trailing_stop(&mut p, BookTop { bid: 103.0, ask: 103.05 });
-        assert!((p.stop_price - 102.0).abs() < 1e-9, "stop ratchets up to 102");
-        assert!(p.breakeven_set && p.stop_price > p.entry_price, "stop now locks a profit");
+        PositionManager::apply_trailing_stop(
+            &mut p,
+            BookTop {
+                bid: 103.0,
+                ask: 103.05,
+            },
+        );
+        assert!(
+            (p.stop_price - 102.0).abs() < 1e-9,
+            "stop ratchets up to 102"
+        );
+        assert!(
+            p.breakeven_set && p.stop_price > p.entry_price,
+            "stop now locks a profit"
+        );
         // Pullback: high-water holds at 103, stop must NOT loosen below 102.
-        PositionManager::apply_trailing_stop(&mut p, BookTop { bid: 101.5, ask: 101.55 });
-        assert!((p.stop_price - 102.0).abs() < 1e-9, "a pullback must never loosen the stop");
+        PositionManager::apply_trailing_stop(
+            &mut p,
+            BookTop {
+                bid: 101.5,
+                ask: 101.55,
+            },
+        );
+        assert!(
+            (p.stop_price - 102.0).abs() < 1e-9,
+            "a pullback must never loosen the stop"
+        );
         // Further favorable move: stop ratchets up again.
-        PositionManager::apply_trailing_stop(&mut p, BookTop { bid: 103.8, ask: 103.85 });
-        assert!((p.stop_price - 102.8).abs() < 1e-9, "stop ratchets up to 103.8 − 1.0");
+        PositionManager::apply_trailing_stop(
+            &mut p,
+            BookTop {
+                bid: 103.8,
+                ask: 103.85,
+            },
+        );
+        assert!(
+            (p.stop_price - 102.8).abs() < 1e-9,
+            "stop ratchets up to 103.8 − 1.0"
+        );
     }
 
     // THE headline: with max 1 trade/day, once trade 1 closes, no 2nd trade — even
@@ -1434,7 +1528,10 @@ mod tests {
         assert_eq!(m.closed_trades().len(), 1);
 
         // The close recorded into the shared circuit → daily cap (1) reached; lock FREE.
-        assert!(!crate::portfolio::is_locked(&circuit), "lock is free after the trade closed");
+        assert!(
+            !crate::portfolio::is_locked(&circuit),
+            "lock is free after the trade closed"
+        );
         assert_eq!(
             crate::portfolio::halt_reason_for(&circuit, "micro"),
             Some("daily account trade cap reached"),
@@ -1446,7 +1543,11 @@ mod tests {
         m.on_tick(1, &wall(100.0), 11_000);
         m.on_tick(1, &wall(100.0), 12_000);
         m.on_tick(1, &absorb(100.0), 13_000);
-        assert_eq!(m.pending_count(), 0, "no 2nd trade today even with the lock free");
+        assert_eq!(
+            m.pending_count(),
+            0,
+            "no 2nd trade today even with the lock free"
+        );
         assert_eq!(m.open_count(), 0);
     }
 
@@ -1485,7 +1586,11 @@ mod tests {
         let mut m = manager();
         m.risk.record_realized(-20_000.0); // > 15% of 100k => lower circuit
         run_to_signal(&mut m);
-        assert_eq!(m.pending_count(), 0, "no orders once the lower circuit trips");
+        assert_eq!(
+            m.pending_count(),
+            0,
+            "no orders once the lower circuit trips"
+        );
         assert_eq!(m.open_count(), 0);
     }
 
@@ -1494,7 +1599,11 @@ mod tests {
         let mut m = manager();
         m.risk.record_realized(40_000.0); // > 35% of 100k => upper circuit
         run_to_signal(&mut m);
-        assert_eq!(m.pending_count(), 0, "no overtrading once the upper circuit trips");
+        assert_eq!(
+            m.pending_count(),
+            0,
+            "no overtrading once the upper circuit trips"
+        );
         assert_eq!(m.open_count(), 0);
     }
 
@@ -1510,7 +1619,11 @@ mod tests {
         // Micro produces a valid signal but must NOT rest an order while a trade is
         // open elsewhere — one trade at a time across the whole account.
         run_to_signal(&mut m);
-        assert_eq!(m.pending_count(), 0, "micro entry cancelled while options holds the slot");
+        assert_eq!(
+            m.pending_count(),
+            0,
+            "micro entry cancelled while options holds the slot"
+        );
         assert_eq!(m.open_count(), 0);
 
         // The other engine's trade closes → the global slot frees.
@@ -1522,7 +1635,10 @@ mod tests {
         m.on_tick(1, &wall(100.0), 12_000);
         m.on_tick(1, &absorb(100.0), 13_000);
         assert!(m.pending_count() >= 1, "micro opens once the slot is free");
-        assert!(crate::portfolio::is_locked(&circuit), "micro now holds the global slot");
+        assert!(
+            crate::portfolio::is_locked(&circuit),
+            "micro now holds the global slot"
+        );
     }
 
     #[test]
@@ -1577,8 +1693,19 @@ mod tests {
         let mut p = ImbalanceParams::default();
         p.min_samples = 3;
         m.enable_equity_imbalance(p);
-        m.register_equity(EquityMeta { token: 1, symbol: "INFY".into(), exchange: "NSE".into(), product: "MIS".into() });
-        m.arm_live(LiveBridge { equity_tx: eq_tx, options_tx: opt_tx }, "TST".into());
+        m.register_equity(EquityMeta {
+            token: 1,
+            symbol: "INFY".into(),
+            exchange: "NSE".into(),
+            product: "MIS".into(),
+        });
+        m.arm_live(
+            LiveBridge {
+                equity_tx: eq_tx,
+                options_tx: opt_tx,
+            },
+            "TST".into(),
+        );
         run_to_signal(&mut m);
         assert!(m.pending_count() >= 1);
         let mut tag = None;
@@ -1589,7 +1716,11 @@ mod tests {
         }
         let tag = tag.expect("a Place command should have been sent");
         m.on_order_update(&tag, "REJECTED", None, 5_000);
-        assert_eq!(m.pending_count(), 0, "rejected entry must be removed, not leaked");
+        assert_eq!(
+            m.pending_count(),
+            0,
+            "rejected entry must be removed, not leaked"
+        );
     }
 
     #[test]
@@ -1598,9 +1729,16 @@ mod tests {
         // Larger capital so a NIFTY lot's stop risk fits the per-trade budget.
         let risk = RiskManager::new(500_000.0, 1.0, 15.0, 35.0); // budget ₹5000
         let mut m = PositionManager::new(RunMode::Paper, risk, 5, base_cfg());
-        m.enable_gamma(GammaParams { min_samples: 8, ..GammaParams::default() });
+        m.enable_gamma(GammaParams {
+            min_samples: 8,
+            ..GammaParams::default()
+        });
         m.set_is_tuesday(true);
-        m.register_gamma(GammaMeta { token: 2, symbol: "NIFTY2561724500CE".into(), lot_size: 65 });
+        m.register_gamma(GammaMeta {
+            token: 2,
+            symbol: "NIFTY2561724500CE".into(),
+            lot_size: 65,
+        });
 
         // Build a slow ask-depletion baseline (≈2/tick) on the option leg...
         let mut ask = 100u32;
@@ -1612,7 +1750,10 @@ mod tests {
         }
         // ...then a sudden queue collapse => depletion ratio >> 5x => fires.
         m.on_tick(2, &depth(99.5, 50, 100.5, 30), t); // depletion ~52 vs MA ~2
-        assert!(m.pending_count() >= 1 || m.open_count() >= 1, "gamma should place an order");
+        assert!(
+            m.pending_count() >= 1 || m.open_count() >= 1,
+            "gamma should place an order"
+        );
         drive_option(&mut m, &depth(99.5, 50, 100.5, 30), t + 1000);
         let opened = m.open_count() >= 1 || !m.closed_trades().is_empty();
         assert!(opened, "gamma option order should fill");
@@ -1639,8 +1780,19 @@ mod tests {
         let mut p = ImbalanceParams::default();
         p.min_samples = 3;
         m.enable_equity_imbalance(p);
-        m.register_equity(EquityMeta { token: 1, symbol: "INFY".into(), exchange: "NSE".into(), product: "MIS".into() });
-        m.arm_live(LiveBridge { equity_tx: eq_tx, options_tx: opt_tx }, "TST".into());
+        m.register_equity(EquityMeta {
+            token: 1,
+            symbol: "INFY".into(),
+            exchange: "NSE".into(),
+            product: "MIS".into(),
+        });
+        m.arm_live(
+            LiveBridge {
+                equity_tx: eq_tx,
+                options_tx: opt_tx,
+            },
+            "TST".into(),
+        );
 
         // Drive to a signal: a real Place command is emitted, but NO position opens
         // until the broker confirms the fill.
@@ -1692,7 +1844,10 @@ mod tests {
             123456789,
         );
         assert!(tag.len() <= 20, "tag too long: {tag}");
-        assert!(tag.chars().all(|c| c.is_ascii_alphanumeric()), "bad tag: {tag}");
+        assert!(
+            tag.chars().all(|c| c.is_ascii_alphanumeric()),
+            "bad tag: {tag}"
+        );
     }
 
     #[test]
@@ -1705,8 +1860,19 @@ mod tests {
         let mut p = ImbalanceParams::default();
         p.min_samples = 3;
         m.enable_equity_imbalance(p);
-        m.register_equity(EquityMeta { token: 1, symbol: "INFY".into(), exchange: "NSE".into(), product: "MIS".into() });
-        m.arm_live(LiveBridge { equity_tx: eq_tx, options_tx: opt_tx }, "TST-".into());
+        m.register_equity(EquityMeta {
+            token: 1,
+            symbol: "INFY".into(),
+            exchange: "NSE".into(),
+            product: "MIS".into(),
+        });
+        m.arm_live(
+            LiveBridge {
+                equity_tx: eq_tx,
+                options_tx: opt_tx,
+            },
+            "TST-".into(),
+        );
 
         run_to_signal(&mut m);
         let mut entry_tag = None;
@@ -1724,7 +1890,11 @@ mod tests {
         assert_eq!(m.closed_trades().len(), 0);
 
         m.flatten_all(7_000);
-        assert_eq!(m.open_count(), 1, "live flatten must not close locally before broker fill");
+        assert_eq!(
+            m.open_count(),
+            1,
+            "live flatten must not close locally before broker fill"
+        );
         assert_eq!(m.closed_trades().len(), 0);
 
         let mut exit_tag = None;
@@ -1752,7 +1922,13 @@ mod tests {
     }
     fn place_tags(cmds: &[OrderCommand]) -> Vec<String> {
         cmds.iter()
-            .filter_map(|c| if let OrderCommand::Place(p) = c { Some(p.tag.clone()) } else { None })
+            .filter_map(|c| {
+                if let OrderCommand::Place(p) = c {
+                    Some(p.tag.clone())
+                } else {
+                    None
+                }
+            })
             .collect()
     }
     fn modify_prices(cmds: &[OrderCommand]) -> Vec<(String, f64)> {
@@ -1772,31 +1948,55 @@ mod tests {
         let (eq_tx, mut eq_rx) = mpsc::unbounded_channel();
         let (opt_tx, _opt_rx) = mpsc::unbounded_channel();
         let risk = RiskManager::new(100_000.0, 1.0, 15.0, 35.0);
-        let cfg = ManagerConfig { chase_timeout_ms: 2_000, ..base_cfg() };
+        let cfg = ManagerConfig {
+            chase_timeout_ms: 2_000,
+            ..base_cfg()
+        };
         let mut m = PositionManager::new(RunMode::Live, risk, 5, cfg);
         let mut p = ImbalanceParams::default();
         p.min_samples = 3;
         m.enable_equity_imbalance(p);
-        m.register_equity(EquityMeta { token: 1, symbol: "INFY".into(), exchange: "NSE".into(), product: "MIS".into() });
-        m.arm_live(LiveBridge { equity_tx: eq_tx, options_tx: opt_tx }, "TST".into());
+        m.register_equity(EquityMeta {
+            token: 1,
+            symbol: "INFY".into(),
+            exchange: "NSE".into(),
+            product: "MIS".into(),
+        });
+        m.arm_live(
+            LiveBridge {
+                equity_tx: eq_tx,
+                options_tx: opt_tx,
+            },
+            "TST".into(),
+        );
 
         run_to_signal(&mut m);
-        let entry_tag = place_tags(&drain_all(&mut eq_rx)).pop().expect("entry place");
+        let entry_tag = place_tags(&drain_all(&mut eq_rx))
+            .pop()
+            .expect("entry place");
         m.on_order_update(&entry_tag, "COMPLETE", Some(100.05), 6_000);
         assert_eq!(m.open_count(), 1);
 
         // Target hit -> exit dispatched at the bid (101.0); withhold the broker fill.
         m.on_tick(1, &depth(101.0, 80, 101.05, 50), 7_000);
-        let exit_tag = place_tags(&drain_all(&mut eq_rx)).pop().expect("exit place");
-        assert_eq!(m.open_count(), 1, "no local close — awaits broker exit fill");
+        let exit_tag = place_tags(&drain_all(&mut eq_rx))
+            .pop()
+            .expect("exit place");
+        assert_eq!(
+            m.open_count(),
+            1,
+            "no local close — awaits broker exit fill"
+        );
 
         // Bid falls to 100.5: the sell @101.0 can't fill; chase re-pegs DOWN to track the
         // touch (elapsed 500 < 2000 => track window, not yet crossing).
         m.on_tick(1, &depth(100.5, 80, 100.55, 50), 7_500);
         let mods = modify_prices(&drain_all(&mut eq_rx));
         assert!(
-            mods.iter().any(|(t, px)| t == &exit_tag && (*px - 100.5).abs() < 1e-6),
-            "exit must re-peg to the new bid 100.5, got {:?}", mods
+            mods.iter()
+                .any(|(t, px)| t == &exit_tag && (*px - 100.5).abs() < 1e-6),
+            "exit must re-peg to the new bid 100.5, got {:?}",
+            mods
         );
         assert_eq!(m.open_count(), 1);
 
@@ -1804,8 +2004,10 @@ mod tests {
         m.on_tick(1, &depth(100.5, 80, 100.55, 50), 9_500);
         let mods = modify_prices(&drain_all(&mut eq_rx));
         assert!(
-            mods.iter().any(|(t, px)| t == &exit_tag && (*px - 100.0).abs() < 1e-6),
-            "exit must cross through to 100.0 after the window, got {:?}", mods
+            mods.iter()
+                .any(|(t, px)| t == &exit_tag && (*px - 100.0).abs() < 1e-6),
+            "exit must cross through to 100.0 after the window, got {:?}",
+            mods
         );
 
         // Broker fills the crossed exit -> position closes.
@@ -1823,29 +2025,49 @@ mod tests {
         let (opt_tx, _opt_rx) = mpsc::unbounded_channel();
         let risk = RiskManager::new(100_000.0, 1.0, 15.0, 35.0);
         // Long chase window so the exit stays "tracking" (not auto-crossed) before flatten.
-        let cfg = ManagerConfig { chase_timeout_ms: 60_000, ..base_cfg() };
+        let cfg = ManagerConfig {
+            chase_timeout_ms: 60_000,
+            ..base_cfg()
+        };
         let mut m = PositionManager::new(RunMode::Live, risk, 5, cfg);
         let mut p = ImbalanceParams::default();
         p.min_samples = 3;
         m.enable_equity_imbalance(p);
-        m.register_equity(EquityMeta { token: 1, symbol: "INFY".into(), exchange: "NSE".into(), product: "MIS".into() });
-        m.arm_live(LiveBridge { equity_tx: eq_tx, options_tx: opt_tx }, "TST".into());
+        m.register_equity(EquityMeta {
+            token: 1,
+            symbol: "INFY".into(),
+            exchange: "NSE".into(),
+            product: "MIS".into(),
+        });
+        m.arm_live(
+            LiveBridge {
+                equity_tx: eq_tx,
+                options_tx: opt_tx,
+            },
+            "TST".into(),
+        );
 
         run_to_signal(&mut m);
-        let entry_tag = place_tags(&drain_all(&mut eq_rx)).pop().expect("entry place");
+        let entry_tag = place_tags(&drain_all(&mut eq_rx))
+            .pop()
+            .expect("entry place");
         m.on_order_update(&entry_tag, "COMPLETE", Some(100.05), 6_000);
 
         // Target hit -> position now mid-exit with a resting (unfilled) limit.
         m.on_tick(1, &depth(101.0, 80, 101.05, 50), 7_000);
-        let exit_tag = place_tags(&drain_all(&mut eq_rx)).pop().expect("exit place");
+        let exit_tag = place_tags(&drain_all(&mut eq_rx))
+            .pop()
+            .expect("exit place");
         assert_eq!(m.open_count(), 1);
 
         // EOD flatten: must cross the resting exit (101.0 bid - 10*0.05 = 100.5), not skip.
         m.flatten_all(8_000);
         let mods = modify_prices(&drain_all(&mut eq_rx));
         assert!(
-            mods.iter().any(|(t, px)| t == &exit_tag && (*px - 100.5).abs() < 1e-6),
-            "flatten must cross the already-exiting position's resting order, got {:?}", mods
+            mods.iter()
+                .any(|(t, px)| t == &exit_tag && (*px - 100.5).abs() < 1e-6),
+            "flatten must cross the already-exiting position's resting order, got {:?}",
+            mods
         );
         assert_eq!(m.open_count(), 1, "still awaiting the broker fill");
 
@@ -1874,8 +2096,19 @@ mod tests {
         let mut p = ImbalanceParams::default();
         p.min_samples = 3;
         m.enable_equity_imbalance(p);
-        m.register_equity(EquityMeta { token: 1, symbol: "INFY".into(), exchange: "NSE".into(), product: "MIS".into() });
-        m.arm_live(LiveBridge { equity_tx: eq_tx, options_tx: opt_tx }, "TST".into());
+        m.register_equity(EquityMeta {
+            token: 1,
+            symbol: "INFY".into(),
+            exchange: "NSE".into(),
+            product: "MIS".into(),
+        });
+        m.arm_live(
+            LiveBridge {
+                equity_tx: eq_tx,
+                options_tx: opt_tx,
+            },
+            "TST".into(),
+        );
 
         run_to_signal(&mut m); // live Long entry resting at the bid 100.0
         let _ = drain_all(&mut eq_rx);
@@ -1888,10 +2121,14 @@ mod tests {
             t += 1_000;
         }
         let mods = modify_prices(&drain_all(&mut eq_rx));
-        assert!(!mods.is_empty(), "favorable moves should still re-peg to harvest the better price");
+        assert!(
+            !mods.is_empty(),
+            "favorable moves should still re-peg to harvest the better price"
+        );
         assert!(
             mods.iter().all(|(_, px)| *px <= 100.0 + 1e-9),
-            "a favorable harvest must never cross UP to the ask, got {:?}", mods
+            "a favorable harvest must never cross UP to the ask, got {:?}",
+            mods
         );
         // Budget intact: the order is still resting, never crossed/filled.
         assert_eq!(m.open_count(), 0, "no cross-to-ask fill happened");
@@ -1908,8 +2145,19 @@ mod tests {
         let mut p = ImbalanceParams::default();
         p.min_samples = 3;
         m.enable_equity_imbalance(p);
-        m.register_equity(EquityMeta { token: 1, symbol: "INFY".into(), exchange: "NSE".into(), product: "MIS".into() });
-        m.arm_live(LiveBridge { equity_tx: eq_tx, options_tx: opt_tx }, "TST".into());
+        m.register_equity(EquityMeta {
+            token: 1,
+            symbol: "INFY".into(),
+            exchange: "NSE".into(),
+            product: "MIS".into(),
+        });
+        m.arm_live(
+            LiveBridge {
+                equity_tx: eq_tx,
+                options_tx: opt_tx,
+            },
+            "TST".into(),
+        );
 
         run_to_signal(&mut m);
         let mut entry_tag = None;
@@ -1921,13 +2169,21 @@ mod tests {
         let entry_tag = entry_tag.expect("entry place command");
 
         m.flatten_all(4_500);
-        assert_eq!(m.pending_count(), 1, "pending live entry stays tracked until broker status");
+        assert_eq!(
+            m.pending_count(),
+            1,
+            "pending live entry stays tracked until broker status"
+        );
 
         // Drain cancel command, then simulate a broker fill racing the cancel.
         while eq_rx.try_recv().is_ok() {}
         m.on_order_update(&entry_tag, "COMPLETE", Some(100.05), 5_000);
         assert_eq!(m.pending_count(), 0);
-        assert_eq!(m.open_count(), 1, "late fill remains open locally until exit fill confirms");
+        assert_eq!(
+            m.open_count(),
+            1,
+            "late fill remains open locally until exit fill confirms"
+        );
 
         let mut exit_tag = None;
         while let Ok(cmd) = eq_rx.try_recv() {
@@ -1976,6 +2232,10 @@ mod tests {
         }
         // Give it room to cross and fill if it hasn't yet.
         drive_until_open(&mut m, &depth(100.10, 12, 100.15, 90), t);
-        assert_eq!(m.open_count(), 1, "chase should eventually secure the entry");
+        assert_eq!(
+            m.open_count(),
+            1,
+            "chase should eventually secure the entry"
+        );
     }
 }

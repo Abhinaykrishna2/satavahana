@@ -224,7 +224,10 @@ impl BookTracker {
 
     /// Whether `token` has accumulated at least `n` snapshots (warmup check).
     pub fn is_warm(&self, token: u32, n: usize) -> bool {
-        self.states.get(&token).map(|s| s.samples >= n).unwrap_or(false)
+        self.states
+            .get(&token)
+            .map(|s| s.samples >= n)
+            .unwrap_or(false)
     }
 }
 
@@ -266,10 +269,18 @@ mod tests {
     fn depth(bids: &[(f64, u32)], asks: &[(f64, u32)]) -> MarketDepth {
         let mut d = MarketDepth::default();
         for (i, (p, q)) in bids.iter().enumerate().take(5) {
-            d.bids[i] = DepthEntry { price: *p, quantity: *q, orders: 1 };
+            d.bids[i] = DepthEntry {
+                price: *p,
+                quantity: *q,
+                orders: 1,
+            };
         }
         for (i, (p, q)) in asks.iter().enumerate().take(5) {
-            d.asks[i] = DepthEntry { price: *p, quantity: *q, orders: 1 };
+            d.asks[i] = DepthEntry {
+                price: *p,
+                quantity: *q,
+                orders: 1,
+            };
         }
         d
     }
@@ -303,7 +314,11 @@ mod tests {
     fn tracker_emits_extreme_negative_obi_for_sell_wall() {
         let mut t = BookTracker::new(10);
         let f = t.update(1, &depth(&[(100.0, 20)], &[(101.0, 80)]));
-        assert!(f.obi <= -0.4, "sell wall OBI should be <= -0.4, got {}", f.obi);
+        assert!(
+            f.obi <= -0.4,
+            "sell wall OBI should be <= -0.4, got {}",
+            f.obi
+        );
         assert_eq!(f.samples, 1);
         // First snapshot has no flow yet.
         assert_eq!(f.ofi, 0.0);
@@ -316,7 +331,7 @@ mod tests {
         t.update(7, &depth(&[(100.0, 50)], &[(101.0, 100)]));
         t.update(7, &depth(&[(100.0, 50)], &[(101.0, 98)])); // -2
         t.update(7, &depth(&[(100.0, 50)], &[(101.0, 96)])); // -2
-        // Sudden large consumption.
+                                                             // Sudden large consumption.
         let f = t.update(7, &depth(&[(100.0, 50)], &[(101.0, 60)])); // -36
         assert!(f.ask_depletion >= 36.0);
         assert!(
@@ -335,6 +350,10 @@ mod tests {
         }
         // Inject a sell wall: OBI drops well below the recent mean => negative z.
         let f = t.update(3, &depth(&[(100.0, 20)], &[(101.0, 80)]));
-        assert!(f.obi_z < -1.0, "expected strongly negative z-score, got {}", f.obi_z);
+        assert!(
+            f.obi_z < -1.0,
+            "expected strongly negative z-score, got {}",
+            f.obi_z
+        );
     }
 }
