@@ -29,6 +29,9 @@ const COMPOSITE_SPOT_REVERSAL_MIN_MOVE_PCT: f64 = 0.0018;
 const FAR_DTE_COMPOSITE_MIN_DTE: f64 = 3.5;
 const FAR_DTE_COMPOSITE_CE_RSI_MAX: f64 = 70.0;
 const FAR_DTE_COMPOSITE_PE_RSI_MIN: f64 = 30.0;
+// Global over-extension gate (SATA_RSI_EXTREME_BLOCK): applies to EVERY directional buy.
+const OVEREXT_PE_RSI_MAX: f64 = 35.0; // block BuyPE (bearish) when RSI already ≤ 35 (oversold)
+const OVEREXT_CE_RSI_MIN: f64 = 70.0; // block BuyCE (bullish) when RSI already ≥ 70 (overbought)
 const MAX_CE_OTM_STEPS: usize = 3;
 const MAX_PE_OTM_STEPS: usize = 3;
 // Cold-start Kelly is 16.25%; 3.0 caps a fresh one-lot entry near 49% of
@@ -1131,6 +1134,11 @@ pub struct OptionsEngine {
     /// persistently-rejected exit (e.g. a funds/margin reject, which on a CLOSE proves the
     /// broker holds no inventory) can never spray the broker forever.
     exit_failures: HashMap<u64, u32>,
+    /// Broker order_ids whose terminal cancel/reject was already processed. Kite postbacks are
+    /// at-least-once (2026-08-10: one exit order's CANCELLED arrived 5×), and exit orders route
+    /// by a shared per-position tag, so a duplicate terminal could reach handle_failed_exit and
+    /// fire a false MANUAL INTERVENTION. A cancel/reject is final per order_id — process once.
+    terminal_orders_seen: HashSet<String>,
     pending_capital_reserved: f64,
     max_concurrent_positions: usize,
     entry_order_timeout_ms: u64,
@@ -1169,6 +1177,7 @@ pub struct OptionsEngine {
     // are byte-for-byte unchanged. Toggles: SATA_EXIT_ON_REVERSAL / _CONFIRM_SCANS /
     // _MIN_STRENGTH.
     exit_on_reversal: bool,
+    overext_rsi_block: bool,
     reversal_confirm_scans: u32,
     reversal_min_strength: f64,
     /// Per-position reversal confirmation tracker: pos-id → (last-evaluated scan, count).
@@ -1226,6 +1235,9 @@ impl OptionsEngine {
             });
         // Env-gated exit-on-thesis-reversal knobs (DEFAULT OFF — live/tests unchanged).
         let exit_on_reversal = std::env::var("SATA_EXIT_ON_REVERSAL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
+            .unwrap_or(false);
+        let overext_rsi_block = std::env::var("SATA_RSI_EXTREME_BLOCK")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
             .unwrap_or(false);
         let reversal_confirm_scans = std::env::var("SATA_REVERSAL_CONFIRM_SCANS")
@@ -1311,6 +1323,7 @@ impl OptionsEngine {
             pending_entry_orders: Vec::new(),
             pending_exit_orders: Vec::new(),
             exit_failures: HashMap::new(),
+            terminal_orders_seen: HashSet::new(),
             pending_capital_reserved: 0.0,
             max_concurrent_positions: 4,
             entry_order_timeout_ms: 4 * 60 * 1_000,
@@ -1330,6 +1343,7 @@ impl OptionsEngine {
             shared_circuit: None,
             spot_series: std::collections::HashMap::new(),
             exit_on_reversal,
+            overext_rsi_block,
             reversal_confirm_scans,
             reversal_min_strength,
             reversal_state: HashMap::new(),
@@ -1667,6 +1681,41 @@ impl OptionsEngine {
     }
 
     fn handle_order_update(&mut self, update: OrderUpdate) {
+        // Idempotency gate for at-least-once broker postbacks. A cancel/reject is the FINAL
+        // state of an order_id, so process it at most once. Without this, Kite re-delivering
+        // one exit order's CANCELLED (5× on 2026-08-10) let duplicates route by shared tag to a
+        // fresh same-tag record, reach handle_failed_exit, and drive the failure counter to its
+        // cap → false "MANUAL INTERVENTION". COMPLETE is deliberately NOT gated: it owns an
+        // avg-price re-poll path and is already duplicate-safe via reconcile_orphaned_exit_fill.
+        // OPEN is not gated: partial-fill progress needs every update.
+        if let Some(order_id) = update.order_id.as_deref() {
+            let is_terminal_cancel = update
+                .status
+                .as_deref()
+                .map(|s| s.to_ascii_uppercase())
+                .is_some_and(|s| {
+                    matches!(s.as_str(), "CANCELLED" | "CANCELED" | "REJECTED" | "EXPIRED")
+                });
+            if is_terminal_cancel && !self.terminal_orders_seen.insert(order_id.to_string()) {
+                // Already handled this order's terminal. Fill count is final at cancel/reject
+                // time, but fold it in defensively so a late partial can never be dropped into
+                // an oversell before we ignore the duplicate.
+                if let Some(p) = self
+                    .pending_exit_orders
+                    .iter_mut()
+                    .find(|p| p.tag == update.tag)
+                {
+                    p.record_fill_progress(&update);
+                }
+                warn!(
+                    "Duplicate terminal postback dropped | tag={} order_id={} status={} — already processed (at-least-once delivery)",
+                    update.tag,
+                    order_id,
+                    update.status.as_deref().unwrap_or("?")
+                );
+                return;
+            }
+        }
         if let Some(idx) = self
             .pending_entry_orders
             .iter()
@@ -1884,7 +1933,12 @@ impl OptionsEngine {
                             pending.reason, pending.tag, msg
                         );
                     } else {
-                        self.handle_failed_exit(pending, "PLACE_ERROR", Some(msg));
+                        self.handle_failed_exit(
+                            pending,
+                            "PLACE_ERROR",
+                            Some(msg),
+                            update.order_id.as_deref(),
+                        );
                     }
                     return;
                 }
@@ -1959,7 +2013,12 @@ impl OptionsEngine {
             }
 
             let pending = self.pending_exit_orders.remove(idx);
-            self.handle_failed_exit(pending, &status_upper, update.message.as_deref());
+            self.handle_failed_exit(
+                pending,
+                &status_upper,
+                update.message.as_deref(),
+                update.order_id.as_deref(),
+            );
         }
     }
 
@@ -2157,7 +2216,9 @@ impl OptionsEngine {
         pending: PendingExitOrder,
         status_upper: &str,
         reject_msg: Option<&str>,
+        order_id: Option<&str>,
     ) {
+        let order_id = order_id.unwrap_or("?");
         let is_untracked = Self::is_untracked_exit_reason(&pending.reason);
 
         if pending.total_filled_quantity >= pending.total_quantity && pending.total_quantity > 0 {
@@ -2212,8 +2273,9 @@ impl OptionsEngine {
         if let Some(pos) = self.positions.iter_mut().find(|p| p.id == pending.pos_id) {
             if funds_reject || attempts >= MAX_EXIT_ATTEMPTS {
                 error!(
-                    "Exit order {} {} — {} on a CLOSE: broker shows no open inventory. Halting exit resubmit after {} attempt(s); position {} left exit_pending. MANUAL INTERVENTION REQUIRED (reconcile on the broker).",
+                    "Exit order {} (order_id={}) {} — {} on a CLOSE: broker shows no open inventory. Halting exit resubmit after {} attempt(s); position {} left exit_pending. MANUAL INTERVENTION REQUIRED (reconcile on the broker).",
                     pending.tag,
+                    order_id,
                     status_upper,
                     if funds_reject { "funds/margin reject" } else { "retry cap reached" },
                     attempts,
@@ -2222,8 +2284,8 @@ impl OptionsEngine {
                 pos.exit_pending = true; // blocks close_position_at (guard: !is_open || exit_pending)
             } else {
                 warn!(
-                    "Exit order {} terminal status {} (attempt {}/{}). Will re-attempt exit later.",
-                    pending.tag, status_upper, attempts, MAX_EXIT_ATTEMPTS
+                    "Exit order {} (order_id={}) terminal status {} (attempt {}/{}). Will re-attempt exit later.",
+                    pending.tag, order_id, status_upper, attempts, MAX_EXIT_ATTEMPTS
                 );
                 pos.exit_pending = false;
             }
@@ -4176,6 +4238,31 @@ impl OptionsEngine {
                 snap.days_to_expiry
             );
             return signals;
+        }
+        // Global over-extension gate (env-gated: SATA_RSI_EXTREME_BLOCK, default OFF).
+        // Common-sense: never buy a bearish PE into an already-oversold tape (RSI ≤ 35, a bounce
+        // is likelier than more downside) or a bullish CE into an overbought one (RSI ≥ 70). Unlike
+        // the strategy-specific gates below, this applies to EVERY directional buy regardless of
+        // strategy or DTE — it closes the hole that let the 08-07 GEX/composite PE fire at RSI 34.1.
+        if self.overext_rsi_block {
+            if let Some(rsi) = self
+                .spot_series
+                .get(&snap.underlying)
+                .and_then(|series| series.rsi14())
+            {
+                let overextended = match dominant_action {
+                    SignalAction::BuyPE => rsi <= OVEREXT_PE_RSI_MAX,
+                    SignalAction::BuyCE => rsi >= OVEREXT_CE_RSI_MIN,
+                    _ => false,
+                };
+                if overextended {
+                    warn!(
+                        "  {} gen_signals: {:?} blocked — over-extension gate (RSI14 {:.1}; PE≤{:.0}, CE≥{:.0}): don't buy into an exhausted move",
+                        snap.underlying, dominant_action, rsi, OVEREXT_PE_RSI_MAX, OVEREXT_CE_RSI_MIN
+                    );
+                    return signals;
+                }
+            }
         }
         if snap.days_to_expiry > FAR_DTE_COMPOSITE_MIN_DTE {
             if let Some(rsi) = self
@@ -8557,6 +8644,105 @@ mod tests {
         assert!(!engine.positions[0].is_open);
         assert!(!engine.positions[0].exit_pending);
         assert!((engine.positions[0].exit_price - 55.10).abs() < 0.01);
+    }
+
+    #[test]
+    fn duplicate_terminal_cancel_for_same_order_is_ignored() {
+        // 2026-08-10 incident: Kite re-delivered the CANCELLED postback for ONE exit order
+        // (order_id 371688) FIVE times. Exit orders for a position share a per-position tag
+        // and route by tag (PendingExitOrder has no order_id), so once a re-fire had produced
+        // a fresh same-tag record (market_fallback_sent=false), a *duplicate* CANCELLED of the
+        // already-cancelled limit order routed to that fresh record, reached handle_failed_exit,
+        // and inflated exit_failures to the cap → false "MANUAL INTERVENTION REQUIRED".
+        // A terminal cancel/reject is FINAL per order_id: it must be processed at most once.
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_dup_terminal_cancel_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+        let mut engine = OptionsEngine::new(
+            Vec::new(),
+            TickStore::new(),
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+        engine.set_clock_override_ms(20_000);
+        engine.positions.push(test_position(true));
+        // Record in the state right after the poll's 15s timeout-cancel of the stale limit.
+        engine.pending_exit_orders.push(PendingExitOrder {
+            pos_id: 1,
+            tag: "SATAEXIT1".to_string(),
+            tradingsymbol: "NIFTY26APR22000CE".to_string(),
+            total_quantity: 65,
+            placed_ms: 0,
+            last_status_poll_ms: 0,
+            reason: "STOP HIT".to_string(),
+            cancel_requested: true,
+            last_cancel_attempt_ms: 0,
+            market_fallback_sent: false,
+            fallback_book_price: 55.0,
+            total_filled_quantity: 0,
+            total_filled_notional: 0.0,
+            current_order_filled_quantity: 0,
+            current_order_filled_notional: 0.0,
+        });
+
+        let cancel_371688 = || OrderUpdate {
+            tag: "SATAEXIT1".to_string(),
+            order_id: Some("371688".to_string()),
+            status: Some("CANCELLED".to_string()),
+            average_price: Some(0.0),
+            filled_quantity: Some(0),
+            pending_quantity: Some(65),
+            source: "postback".to_string(),
+            message: None,
+        };
+
+        // Delivery #1: the genuine cancel of the limit order → launches exactly ONE MARKET
+        // fallback (a NEW broker order). This is the only time 371688's CANCELLED should act.
+        engine.handle_order_update(cancel_371688());
+        assert!(engine.pending_exit_orders[0].market_fallback_sent);
+        let mut fallback_places = 0;
+        while let Ok(cmd) = order_rx.try_recv() {
+            if let OrderCommand::Place(c) = cmd {
+                assert!(c.limit_price.is_none(), "fallback must be MARKET");
+                fallback_places += 1;
+            }
+        }
+        assert_eq!(fallback_places, 1, "exactly one market fallback");
+        assert_eq!(engine.exit_failures.get(&1).copied().unwrap_or(0), 0);
+
+        // Model the re-fire the incident produced: handle_failed_exit had reset exit_pending,
+        // and close_position_at pushed a FRESH same-tag record. A duplicate CANCELLED of the
+        // old limit order (371688) now meets a record with market_fallback_sent=false — the
+        // exact state that let the duplicate reach handle_failed_exit in production.
+        {
+            let p = &mut engine.pending_exit_orders[0];
+            p.market_fallback_sent = false;
+            p.cancel_requested = false;
+        }
+
+        // Delivery #2..#5: duplicates of 371688's CANCELLED. Each must be a NO-OP.
+        for _ in 0..4 {
+            engine.handle_order_update(cancel_371688());
+        }
+
+        assert_eq!(
+            engine.exit_failures.get(&1).copied().unwrap_or(0),
+            0,
+            "duplicate terminal postbacks for an already-processed order must not increment \
+             the exit-failure counter (this is what fired the false MANUAL INTERVENTION)"
+        );
+        assert!(
+            order_rx.try_recv().is_err(),
+            "duplicate terminal postbacks must not emit any new order commands"
+        );
     }
 
     #[test]
