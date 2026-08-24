@@ -11,6 +11,8 @@ config/config.toml
 CLAUDE.md
 BACKTESTING.md
 PERFORMANCE.md
+.env
+.env.*
 
 # Kite session token cache (contains access token — never commit)
 config/.kite_token
@@ -65,3 +67,12 @@ lion.mp4
 
 # Scripts
 scripts.sh
+
+# CodeGraph index (local code-intelligence cache)
+.codegraph/
+
+# Python research sandbox (local experiments, not part of the Rust build)
+satakarni/
+
+# Local engine walkthrough / analysis notes
+details.txt
