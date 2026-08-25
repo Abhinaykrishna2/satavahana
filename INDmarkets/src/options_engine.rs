@@ -199,6 +199,126 @@ fn one_lot_entry_cost(entry_price: f64, lot_size: u32) -> f64 {
     entry_price * lot_size as f64 + entry_order_cost(entry_price, lot_size, 1)
 }
 
+// ── RESEARCH-ONLY dump sink (constructed only by backtest bins) ──────────────
+// Writes two CSVs per replay day: scan-level chain state and candidate rows at
+// the composite-evaluation point of generate_signals, annotated with which
+// downstream gate resolved them. Inert unless a bin calls set_research_dump.
+pub struct ResearchDumper {
+    scans: std::io::BufWriter<std::fs::File>,
+    candidates: std::io::BufWriter<std::fs::File>,
+    pending: Option<String>,
+}
+
+impl ResearchDumper {
+    const SCAN_HEADER: &'static str = "\
+ts_ms,ist,underlying,spot,atm_strike,atm_iv_pct,iv_rank,pcr_oi,pcr_vol,max_pain,max_pain_dist_pct,net_gex,dte,regime,gap_pct,total_ce_oi,total_pe_oi,total_ce_vol,total_pe_vol,bias_dir,bias_strength,rsi14,adx,atr,bbw_pct,or_dir,closed_bars";
+    const CAND_HEADER: &'static str = "\
+ts_ms,ist,underlying,spot,atm_strike,dte,regime,session,gap_pct,compressive,sideways_threshold_pct,dominant,ce_score_sum,pe_score_sum,n_ce,n_pe,strategies,composite,conf_floor,iv_rank,atm_iv_pct,pcr_oi,pcr_vol,max_pain_dist_pct,net_gex,bias_dir,bias_strength,rsi14,adx,atr,or_dir,scalp_aligned,scalp_observed,has_spot_reversal,outcome";
+
+    pub fn new(dir: &str) -> std::io::Result<Self> {
+        use std::io::Write;
+        std::fs::create_dir_all(dir)?;
+        let mut scans = std::io::BufWriter::new(std::fs::File::create(format!("{dir}/scans.csv"))?);
+        writeln!(scans, "{}", Self::SCAN_HEADER)?;
+        let mut candidates =
+            std::io::BufWriter::new(std::fs::File::create(format!("{dir}/candidates.csv"))?);
+        writeln!(candidates, "{}", Self::CAND_HEADER)?;
+        Ok(Self { scans, candidates, pending: None })
+    }
+
+    fn ist(ts_ms: u64) -> String {
+        chrono::Utc
+            .timestamp_millis_opt(ts_ms as i64)
+            .single()
+            .map(|t| {
+                t.with_timezone(&chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap())
+                    .format("%H:%M:%S")
+                    .to_string()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn scan(&mut self, snap: &ChainSnapshot, tech: &ScanTechSnapshot) {
+        use std::io::Write;
+        let max_pain_dist = if snap.spot > 0.0 {
+            (snap.max_pain - snap.spot) / snap.spot * 100.0
+        } else {
+            0.0
+        };
+        let _ = writeln!(
+            self.scans,
+            "{},{},{},{:.2},{:.0},{:.2},{:.1},{:.3},{:.3},{:.0},{:.3},{:.3e},{:.2},{:?},{:.2},{},{},{},{},{:?},{:.2},{:.1},{:.1},{:.2},{:.3},{:?},{}",
+            snap.timestamp_ms,
+            Self::ist(snap.timestamp_ms),
+            snap.underlying,
+            snap.spot,
+            snap.atm_strike,
+            snap.atm_iv * 100.0,
+            snap.iv_rank,
+            snap.pcr_oi,
+            snap.pcr_vol,
+            snap.max_pain,
+            max_pain_dist,
+            snap.net_gex,
+            snap.days_to_expiry,
+            snap.regime,
+            snap.overnight_gap_pct,
+            snap.total_ce_oi,
+            snap.total_pe_oi,
+            snap.total_ce_vol,
+            snap.total_pe_vol,
+            tech.bias_dir,
+            tech.bias_strength,
+            tech.rsi14.unwrap_or(f64::NAN),
+            tech.adx.unwrap_or(f64::NAN),
+            tech.atr.unwrap_or(f64::NAN),
+            tech.bbw_pct.unwrap_or(f64::NAN),
+            tech.or_dir,
+            tech.closed_bars,
+        );
+    }
+
+    /// Queue a candidate row; any unresolved previous row is flushed as UNRESOLVED.
+    pub fn begin_candidate(&mut self, row: String) {
+        if let Some(prev) = self.pending.take() {
+            self.write_candidate(&prev, "UNRESOLVED");
+        }
+        self.pending = Some(row);
+    }
+
+    pub fn note(&mut self, outcome: &str) {
+        if let Some(row) = self.pending.take() {
+            self.write_candidate(&row, outcome);
+        }
+    }
+
+    fn write_candidate(&mut self, row: &str, outcome: &str) {
+        use std::io::Write;
+        let _ = writeln!(self.candidates, "{},{outcome}", row);
+    }
+
+    pub fn flush(&mut self) {
+        use std::io::Write;
+        if let Some(row) = self.pending.take() {
+            self.write_candidate(&row, "UNRESOLVED");
+        }
+        let _ = self.scans.flush();
+        let _ = self.candidates.flush();
+    }
+}
+
+/// Technical-panel fields paired with each scan dump row.
+pub struct ScanTechSnapshot {
+    pub bias_dir: crate::technicals::Direction,
+    pub bias_strength: f64,
+    pub rsi14: Option<f64>,
+    pub adx: Option<f64>,
+    pub atr: Option<f64>,
+    pub bbw_pct: Option<f64>,
+    pub or_dir: Option<crate::technicals::Direction>,
+    pub closed_bars: usize,
+}
+
 fn entry_cutoff_ist_mins_for_dte(days_to_expiry: f64) -> u32 {
     if days_to_expiry > 1.0 {
         14 * 60 + 55
@@ -482,6 +602,31 @@ fn advance_replay_scan_anchor(last: Option<u64>, now: u64, interval: u64) -> u64
         }
         _ => now,
     }
+}
+
+/// Wall-clock-anchored replay scan scheduler. Scans fire at the first tick at or
+/// after each grid point `k*interval + phase`, mirroring live's spawn-anchored
+/// interval timer instead of drifting with the first CSV row.
+/// Returns the grid time to record as the scan instant (for slot bookkeeping).
+fn anchored_scan_due(
+    last_grid: Option<u64>,
+    now: u64,
+    interval: u64,
+    phase: u64,
+) -> Option<u64> {
+    if interval == 0 {
+        return Some(now);
+    }
+    let now_slot = now.saturating_sub(phase) / interval;
+    let due = match last_grid {
+        None => Some(now_slot * interval + phase),
+        Some(last) => {
+            let last_slot = last.saturating_sub(phase) / interval;
+            (now_slot > last_slot).then(|| now_slot * interval + phase)
+        }
+    };
+    // Never schedule a "grid point" in the future (possible when phase > now early on).
+    due.filter(|&t| t <= now)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1104,6 +1249,8 @@ pub struct OptionsEngine {
 
     clock_override_ms: Option<u64>,
     replay_last_scan_ms: Option<u64>,
+    replay_scan_phase_ms: Option<u64>,
+    research: Option<ResearchDumper>,
     warmup_until_ms: Option<u64>,
 
     scan_interval_secs: u64,
@@ -1297,6 +1444,8 @@ impl OptionsEngine {
             scan_count: 0,
             clock_override_ms: None,
             replay_last_scan_ms: None,
+            replay_scan_phase_ms: None,
+            research: None,
             warmup_until_ms: None,
             scan_interval_secs: cfg.scan_interval_secs.max(1),
             // 0 = unlimited (rely on the daily P&L circuits instead of a count cap).
@@ -1446,17 +1595,30 @@ impl OptionsEngine {
         }
 
         let scan_interval_ms = self.scan_interval_secs.saturating_mul(1_000);
-        let should_scan = self
-            .replay_last_scan_ms
-            .map(|last| timestamp_ms.saturating_sub(last) >= scan_interval_ms)
-            .unwrap_or(true);
-        if should_scan {
+        let scan_decision = match self.replay_scan_phase_ms {
+            Some(phase) => anchored_scan_due(self.replay_last_scan_ms, timestamp_ms, scan_interval_ms, phase)
+                .map(|grid_t| {
+                    self.replay_last_scan_ms = Some(grid_t);
+                    true
+                })
+                .unwrap_or(false),
+            None => {
+                let should_scan = self
+                    .replay_last_scan_ms
+                    .map(|last| timestamp_ms.saturating_sub(last) >= scan_interval_ms)
+                    .unwrap_or(true);
+                if should_scan {
+                    self.replay_last_scan_ms = Some(advance_replay_scan_anchor(
+                        self.replay_last_scan_ms,
+                        timestamp_ms,
+                        scan_interval_ms,
+                    ));
+                }
+                should_scan
+            }
+        };
+        if scan_decision {
             self.scan_count += 1;
-            self.replay_last_scan_ms = Some(advance_replay_scan_anchor(
-                self.replay_last_scan_ms,
-                timestamp_ms,
-                scan_interval_ms,
-            ));
             self.run_full_scan();
         }
     }
@@ -1504,6 +1666,150 @@ impl OptionsEngine {
     /// baselines before trading begins (mirrors the live OpeningBell run-in).
     pub fn set_warmup_until_ms(&mut self, ts_ms: u64) {
         self.warmup_until_ms = Some(ts_ms);
+    }
+
+    /// BACKTEST-ONLY: pin replay scans to the wall-clock grid
+    /// `k*scan_interval + phase_ms`, mirroring live's spawn-anchored cadence.
+    /// `None` (default) keeps the legacy first-tick anchoring.
+    pub fn set_replay_scan_phase_ms(&mut self, phase_ms: u64) {
+        let interval_ms = self.scan_interval_secs.saturating_mul(1_000).max(1);
+        self.replay_scan_phase_ms = Some(phase_ms % interval_ms);
+    }
+
+    /// BACKTEST-ONLY: enable scan + candidate CSV dumps under `dir`.
+    pub fn set_research_dump(&mut self, dir: &str) {
+        match ResearchDumper::new(dir) {
+            Ok(d) => self.research = Some(d),
+            Err(e) => warn!("research dump disabled: cannot init {}: {}", dir, e),
+        }
+    }
+
+    pub fn finalize_research_dump(&mut self) {
+        if let Some(d) = self.research.as_mut() {
+            d.flush();
+        }
+    }
+
+    /// RESEARCH-ONLY: annotate the pending candidate row with its gate outcome.
+    fn research_note(&mut self, outcome: &str) {
+        if let Some(d) = self.research.as_mut() {
+            d.note(outcome);
+        }
+    }
+
+    fn research_begin_candidate(&mut self, row: String) {
+        if let Some(d) = self.research.as_mut() {
+            d.begin_candidate(row);
+        }
+    }
+
+    /// Build the ex-ante feature row for a candidate at the composite-evaluation
+    /// point. Everything here was knowable at scan time — no look-ahead.
+    #[allow(clippy::too_many_arguments)]
+    fn research_candidate_row(
+        &self,
+        snap: &ChainSnapshot,
+        dominant: SignalAction,
+        scored: &[(SignalAction, f64, StrategyType, Vec<(String, f64)>)],
+        dominant_has_spot_reversal: bool,
+        session_now: SessionPhase,
+        compressive: bool,
+        sideways_threshold_pct: f64,
+        composite_score: f64,
+        confidence_floor: f64,
+    ) -> String {
+        let (bias_dir, bias_strength, rsi14, adx, atr, or_dir) = self
+            .spot_series
+            .get(&snap.underlying)
+            .map(|s| {
+                let b = s.bias();
+                (
+                    b.direction,
+                    b.strength,
+                    s.rsi14(),
+                    s.dmi_adx().map(|d| d.adx),
+                    s.atr(),
+                    s.opening_range().map(|r| r.direction),
+                )
+            })
+            .unwrap_or((
+                crate::technicals::Direction::Neutral,
+                0.0,
+                None,
+                None,
+                None,
+                None,
+            ));
+        let direction = match dominant {
+            SignalAction::BuyCE => crate::technicals::Direction::Bull,
+            SignalAction::BuyPE => crate::technicals::Direction::Bear,
+            _ => crate::technicals::Direction::Neutral,
+        };
+        let (scalp_aligned, scalp_observed) = self
+            .spot_series
+            .get(&snap.underlying)
+            .and_then(|s| s.scalp_assessment(direction))
+            .map(|a| (a.aligned, a.observed))
+            .unwrap_or((0, 0));
+        let ce_sum: f64 = scored
+            .iter()
+            .filter(|(a, ..)| *a == SignalAction::BuyCE)
+            .map(|(_, s, ..)| *s)
+            .sum();
+        let pe_sum: f64 = scored
+            .iter()
+            .filter(|(a, ..)| *a == SignalAction::BuyPE)
+            .map(|(_, s, ..)| *s)
+            .sum();
+        let n_ce = scored.iter().filter(|(a, ..)| *a == SignalAction::BuyCE).count();
+        let n_pe = scored.iter().filter(|(a, ..)| *a == SignalAction::BuyPE).count();
+        let strategies = scored
+            .iter()
+            .map(|(a, s, t, _)| format!("{t}:{a:?}:{s:.0}"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let max_pain_dist = if snap.spot > 0.0 {
+            (snap.max_pain - snap.spot) / snap.spot * 100.0
+        } else {
+            0.0
+        };
+        format!(
+            "{},{},{},{:.2},{:.0},{:.2},{:?},{:?},{:.2},{},{:.4},{:?},{:.1},{:.1},{},{},\"{}\",{:.2},{:.1},{:.1},{:.2},{:.3},{:.3},{:.3},{:.3e},{:?},{:.2},{:.1},{:.1},{:.2},{},{},{},{}",
+            snap.timestamp_ms,
+            ResearchDumper::ist(snap.timestamp_ms),
+            snap.underlying,
+            snap.spot,
+            snap.atm_strike,
+            snap.days_to_expiry,
+            snap.regime,
+            session_now,
+            snap.overnight_gap_pct,
+            compressive as i32,
+            sideways_threshold_pct,
+            dominant,
+            ce_sum,
+            pe_sum,
+            n_ce,
+            n_pe,
+            strategies.replace(',', ";"),
+            composite_score,
+            confidence_floor,
+            snap.iv_rank,
+            snap.atm_iv * 100.0,
+            snap.pcr_oi,
+            snap.pcr_vol,
+            max_pain_dist,
+            snap.net_gex,
+            bias_dir,
+            bias_strength,
+            rsi14.unwrap_or(f64::NAN),
+            adx.unwrap_or(f64::NAN),
+            atr.unwrap_or(f64::NAN),
+            or_dir.map(|d| format!("{d:?}")).unwrap_or_default(),
+            scalp_aligned,
+            scalp_observed,
+            dominant_has_spot_reversal as i32,
+        )
     }
 
     pub fn set_live_order_bridge(
@@ -2679,6 +2985,34 @@ impl OptionsEngine {
             if snap.atm_iv > 0.01 {
                 self.iv_history
                     .push(&snap.underlying.clone(), snap.timestamp_ms, snap.atm_iv);
+            }
+            if self.research.is_some() {
+                let tech = self
+                    .spot_series
+                    .get(&snap.underlying)
+                    .map(|s| ScanTechSnapshot {
+                        bias_dir: s.bias().direction,
+                        bias_strength: s.bias().strength,
+                        rsi14: s.rsi14(),
+                        adx: s.dmi_adx().map(|d| d.adx),
+                        atr: s.atr(),
+                        bbw_pct: s.bollinger_width().map(|b| b.width_pct),
+                        or_dir: s.opening_range().map(|r| r.direction),
+                        closed_bars: s.closed_len(),
+                    })
+                    .unwrap_or_else(|| ScanTechSnapshot {
+                        bias_dir: crate::technicals::Direction::Neutral,
+                        bias_strength: 0.0,
+                        rsi14: None,
+                        adx: None,
+                        atr: None,
+                        bbw_pct: None,
+                        or_dir: None,
+                        closed_bars: 0,
+                    });
+                if let Some(d) = self.research.as_mut() {
+                    d.scan(&snap, &tech);
+                }
             }
             if self.scan_count % 5 == 1 {
                 self.log_chain_analysis(&snap);
@@ -4311,11 +4645,26 @@ impl OptionsEngine {
 
         let n_dominant = dominant_signals.len();
         let confidence_floor = self.min_confidence_floor_for(snap, primary_strategy);
+        if self.research.is_some() {
+            let row = self.research_candidate_row(
+                snap,
+                dominant_action.clone(),
+                &scored,
+                dominant_has_spot_reversal,
+                session_now,
+                compressive,
+                sideways_threshold_pct,
+                composite_score,
+                confidence_floor,
+            );
+            self.research_begin_candidate(row);
+        }
         warn!(
             "  {} gen_signals: dominant={:?} composite={:.1} threshold={:.0} strategies={}",
             snap.underlying, dominant_action, composite_score, confidence_floor, n_dominant
         );
         if composite_score < confidence_floor {
+            self.research_note("BELOW_THRESHOLD");
             return signals;
         }
 
@@ -4347,6 +4696,7 @@ impl OptionsEngine {
                 "  {} gen_signals: {:?} blocked — 0-DTE signal needs a warm spot majority without opening-range conflict, got {}/{} and OR {:?}",
                 snap.underlying, dominant_action, aligned, observed, opening_range
             );
+            self.research_note("FLOW_0DTE");
             return signals;
         }
 
@@ -4365,6 +4715,7 @@ impl OptionsEngine {
                         STANDALONE_SPOT_REVERSAL_CE_RSI_MAX,
                         STANDALONE_SPOT_REVERSAL_PE_RSI_MIN
                     );
+                    self.research_note("RSI_CHASE_STANDALONE_SR");
                     return signals;
                 }
             }
@@ -4409,6 +4760,7 @@ impl OptionsEngine {
                             ext.lookback_bars,
                             snap.pcr_oi
                         );
+                        self.research_note("LATE_0DTE_REVERSAL");
                         return signals;
                     }
                 }
@@ -4427,6 +4779,7 @@ impl OptionsEngine {
                 snap.iv_rank,
                 snap.pcr_oi
             );
+            self.research_note("MIDDAY_PE_RICH_IV");
             return signals;
         }
 
@@ -4443,6 +4796,7 @@ impl OptionsEngine {
             snap.underlying, option_price, MIN_TRADEABLE_OPTION_PRICE
         );
         if option_price < MIN_TRADEABLE_OPTION_PRICE {
+            self.research_note("MIN_PRICE");
             return signals;
         }
 
@@ -4520,6 +4874,7 @@ impl OptionsEngine {
             lots = lots.min(1);
         }
         if lots == 0 {
+            self.research_note("SIZING_ZERO");
             return signals;
         }
 
@@ -4528,6 +4883,7 @@ impl OptionsEngine {
         let capital_required = option_price * lot_size as f64 * lots as f64
             + entry_order_cost(option_price, lot_size, lots);
         if capital_required > self.risk.available_capital() {
+            self.research_note("CAPITAL");
             return signals;
         }
 
@@ -4585,6 +4941,7 @@ impl OptionsEngine {
                 "  {} signal rejected: R:R {:.2}:1 below {:.2} floor",
                 snap.underlying, risk_reward, min_risk_reward
             );
+            self.research_note("RR_FLOOR");
             return signals;
         }
 
@@ -4654,6 +5011,7 @@ impl OptionsEngine {
             target_price,
             stop_price,
         );
+        self.research_note("QUEUED");
 
         let sig = Signal {
             id: sig_id,
@@ -7168,6 +7526,34 @@ mod tests {
             advance_replay_scan_anchor(Some(31_000), 61_900, 30_000),
             61_000
         );
+    }
+
+    use super::anchored_scan_due;
+
+    #[test]
+    fn anchored_scan_fires_on_wall_clock_grid_regardless_of_first_tick() {
+        let interval = 30_000;
+        let phase = 7_000;
+        // First tick at :03 — no grid point passed yet, no scan.
+        assert_eq!(anchored_scan_due(None, 3_000, interval, phase), None);
+        // First tick at :09 — grid point :07 already passed → scan recorded at :07.
+        assert_eq!(anchored_scan_due(None, 9_000, interval, phase), Some(7_000));
+        // Tick at :21 — same slot, no second scan.
+        assert_eq!(
+            anchored_scan_due(Some(7_000), 21_000, interval, phase),
+            None
+        );
+        // Tick at :38 — slot :37 crossed → scan at :37 (not at :38).
+        assert_eq!(
+            anchored_scan_due(Some(7_000), 38_000, interval, phase),
+            Some(37_000)
+        );
+        // Feed gap spanning two slots → one catch-up scan at the latest passed point.
+        assert_eq!(
+            anchored_scan_due(Some(37_000), 158_000, interval, phase),
+            Some(157_000)
+        );
+        // Legacy behaviour is untouched when phase is None (handled in caller).
     }
 
     #[test]

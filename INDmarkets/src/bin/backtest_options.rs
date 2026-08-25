@@ -47,6 +47,13 @@ struct CliArgs {
     fill_offset_inr: f64,
     max_daily_trades: Option<u32>,
     capital: Option<f64>,
+    // BACKTEST-ONLY sweep knobs (never read by the live engine).
+    min_confidence: Option<f64>,
+    scan_interval: Option<u64>,
+    profit_target: Option<f64>,
+    stop_loss: Option<f64>,
+    scan_phase_secs: Option<u64>,
+    dump_dir: Option<String>,
 }
 
 fn print_usage(bin: &str) {
@@ -60,6 +67,12 @@ fn print_usage(bin: &str) {
            --capital <N>                           Override starting capital\n\
            --fill-offset-inr <value>              Buy +x / Sell -x execution offset in INR (default: 0.5)\n\
            --max-daily-trades <N>                 Override live config max_daily_trades (currently 1)\n\
+           --min-confidence <N>                   BACKTEST-ONLY: composite score floor (config: 60)\n\
+           --scan-interval <N>                    BACKTEST-ONLY: scan cadence in seconds (config: 30)\n\
+           --profit-target <N>                    BACKTEST-ONLY: profit target cap %% (config: 55)\n\
+           --stop-loss <N>                        BACKTEST-ONLY: stop-loss cap %% (config: 35)\n\
+           --scan-phase-secs <0..29>              BACKTEST-ONLY: pin scans to wall-clock grid k*interval+phase, mirroring live spawn anchoring\n\
+           --dump-dir <path>                      BACKTEST-ONLY: write research scans.csv + candidates.csv under path\n\
            -h, --help                             Show this help\n\
          \n\
          Examples:\n\
@@ -88,6 +101,14 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
     let mut fill_offset_inr = 0.5_f64;
     let mut max_daily_trades: Option<u32> = None;
     let mut capital: Option<f64> = None;
+    // BACKTEST-ONLY sweep knobs. These set fields on the OptionsEngineConfig the backtest
+    // already builds; they never touch config/config.toml or options_engine.rs (the live path).
+    let mut min_confidence: Option<f64> = None;
+    let mut scan_interval: Option<u64> = None;
+    let mut profit_target: Option<f64> = None;
+    let mut stop_loss: Option<f64> = None;
+    let mut scan_phase_secs: Option<u64> = None;
+    let mut dump_dir: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -143,6 +164,46 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
                 max_daily_trades = Some(value.parse::<u32>()
                     .map_err(|e| format!("Invalid --max-daily-trades value '{}': {}", value, e))?);
             }
+            "--min-confidence" => {
+                let v = args.next().ok_or_else(|| "Missing value for --min-confidence".to_string())?;
+                min_confidence = Some(v.parse::<f64>().map_err(|e| format!("Invalid --min-confidence '{}': {}", v, e))?);
+            }
+            "--scan-interval" => {
+                let v = args.next().ok_or_else(|| "Missing value for --scan-interval".to_string())?;
+                scan_interval = Some(v.parse::<u64>().map_err(|e| format!("Invalid --scan-interval '{}': {}", v, e))?);
+            }
+            "--profit-target" => {
+                let v = args.next().ok_or_else(|| "Missing value for --profit-target".to_string())?;
+                profit_target = Some(v.parse::<f64>().map_err(|e| format!("Invalid --profit-target '{}': {}", v, e))?);
+            }
+            "--stop-loss" => {
+                let v = args.next().ok_or_else(|| "Missing value for --stop-loss".to_string())?;
+                stop_loss = Some(v.parse::<f64>().map_err(|e| format!("Invalid --stop-loss '{}': {}", v, e))?);
+            }
+            "--scan-phase-secs" => {
+                let v = args.next().ok_or_else(|| "Missing value for --scan-phase-secs".to_string())?;
+                scan_phase_secs = Some(v.parse::<u64>().map_err(|e| format!("Invalid --scan-phase-secs '{}': {}", v, e))?);
+            }
+            "--dump-dir" => {
+                let v = args.next().ok_or_else(|| "Missing value for --dump-dir".to_string())?;
+                dump_dir = Some(v);
+            }
+            _ if arg.starts_with("--min-confidence=") => {
+                let v = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
+                min_confidence = Some(v.parse::<f64>().map_err(|e| format!("Invalid --min-confidence '{}': {}", v, e))?);
+            }
+            _ if arg.starts_with("--scan-interval=") => {
+                let v = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
+                scan_interval = Some(v.parse::<u64>().map_err(|e| format!("Invalid --scan-interval '{}': {}", v, e))?);
+            }
+            _ if arg.starts_with("--profit-target=") => {
+                let v = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
+                profit_target = Some(v.parse::<f64>().map_err(|e| format!("Invalid --profit-target '{}': {}", v, e))?);
+            }
+            _ if arg.starts_with("--stop-loss=") => {
+                let v = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
+                stop_loss = Some(v.parse::<f64>().map_err(|e| format!("Invalid --stop-loss '{}': {}", v, e))?);
+            }
             _ if arg.starts_with('-') => {
                 return Err(format!("Unknown flag: {}", arg).into());
             }
@@ -165,6 +226,12 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
         max_daily_trades,
         fill_offset_inr,
         capital,
+        min_confidence,
+        scan_interval,
+        profit_target,
+        stop_loss,
+        scan_phase_secs,
+        dump_dir,
     })
 }
 
@@ -529,6 +596,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         eprintln!("capital override: ₹{:.2} (config was ₹{:.2})", cap, engine_cfg.initial_capital);
         engine_cfg.initial_capital = cap;
     }
+    if let Some(v) = cli.min_confidence {
+        eprintln!("min_confidence override: {:.1} (config was {:.1})", v, engine_cfg.min_confidence);
+        engine_cfg.min_confidence = v;
+        engine_cfg.expiry_day_min_confidence = v;
+    }
+    if let Some(v) = cli.scan_interval {
+        eprintln!("scan_interval override: {}s (config was {}s)", v, engine_cfg.scan_interval_secs);
+        engine_cfg.scan_interval_secs = v;
+    }
+    if let Some(v) = cli.profit_target {
+        eprintln!("profit_target override: {:.1}% (config was {:.1}%)", v, engine_cfg.profit_target_pct);
+        engine_cfg.profit_target_pct = v;
+    }
+    if let Some(v) = cli.stop_loss {
+        eprintln!("stop_loss override: {:.1}% (config was {:.1}%)", v, engine_cfg.stop_loss_pct);
+        engine_cfg.stop_loss_pct = v;
+    }
     match cli.capital_mode {
         CapitalMode::Continuous => {
             eprintln!(
@@ -583,6 +667,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         replay_date.as_deref(),
     );
     engine.set_execution_fill_offsets(cli.fill_offset_inr, cli.fill_offset_inr);
+    if let Some(secs) = cli.scan_phase_secs {
+        eprintln!(
+            "scan-phase override: scans pinned to wall-clock grid k*{}s + {}s",
+            engine_cfg.scan_interval_secs, secs
+        );
+        engine.set_replay_scan_phase_ms(secs.saturating_mul(1_000));
+    }
+    if let Some(dir) = cli.dump_dir.as_deref() {
+        engine.set_research_dump(dir);
+    }
 
     let mut rdr = satavahana::open_csv(&options_file)?;
     let headers = rdr.headers()?.clone();
@@ -715,6 +809,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     engine.finalize_replay("Backtest end-of-data exit");
+    engine.finalize_research_dump();
 
     let trades_csv = find_single_file_with_suffix(&run_dir, "_options_trades.csv")?;
     let (summary, trade_details) = summarize_trades(&trades_csv)?;
