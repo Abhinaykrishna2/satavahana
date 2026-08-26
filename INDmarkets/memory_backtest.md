@@ -211,3 +211,29 @@ gates, frozen splits, exam = 8 live-loss days + 08-24).
   `--scan-phase-secs` wall-clock scan anchoring, `--dump-dir` research dumps.
 - DO NOT REPEAT: another selector on top of the current gate stack. Sample remains binding
   (~130 queued candidates / 32 days). Revisit only at ~250+ days or after recording index spot.
+
+---
+
+## 10. Consequence world model + loss forensics (2026-08-25) — final run of this cycle
+
+- The three big replay losses (07-21/07-23/08-07) share one ex-ante latent:
+  **BuyPE entered at 2–13% of session range** after −71..−106 pt extensions,
+  RSI 26–34; two had RR_FLOOR rejections minutes before the fill re-passed.
+  Winners entered mid-range (28–57%) or in ADX-61 explosions. Clock-hour alone
+  remains refuted (§6); range-position × ADX is the surviving structure.
+- Consequence rollouts (2,468 states × both sides, canonical tick paths):
+  extremes bleed on BOTH sides; mid-range+ADX>35 is the only positive bucket
+  (+700-class). Shrunk-bucket walk-forward policy: +₹34.79/day vs baseline but
+  CI [−212,+286] → NOT significant. Logistic + same latents: CV AUC .519, test
+  .458 → stronger ML does NOT beat the bucket map on this sample.
+- DO NOT REPEAT: (a) another selector without range-position conditioning;
+  (b) ML capacity increases before ~250 days; (c) treating replay P&L as live EV.
+- Kept for reuse: implementation scripts removed by request; methodology retained here; result artifacts `results/wm_rollouts.parquet` / `wm_policy_decisions.csv` kept as evidence.
+
+- Blocking the three losses via range-position gates is NOT possible cleanly:
+  losses sit at rp≤10% but six winners share rp 2–16% (06-23 +639 @8%, 07-22 +503
+  @16%, 07-24 +552 @15%, 08-10 +66 @2%, 08-12 +91 @4%, 08-24 +268 @9%). Best
+  hindsight rules net only +383..+886 total (~+10..23/day) while cutting W/L from
+  13/3 to 7/4 or 9/7 — hindsight by construction, inside noise. Walk-forward LCB
+  version of same latent: Δ+34.79/day CI [−212,+286]. Full table:
+  satakarni/RESEARCH_LOG.md; per-trade rp: satakarni/results/trade_range_positions.csv.
