@@ -54,6 +54,7 @@ struct CliArgs {
     stop_loss: Option<f64>,
     scan_phase_secs: Option<u64>,
     dump_dir: Option<String>,
+    underlying_tokens: Vec<String>,
 }
 
 fn print_usage(bin: &str) {
@@ -73,6 +74,7 @@ fn print_usage(bin: &str) {
            --stop-loss <N>                        BACKTEST-ONLY: stop-loss cap %% (config: 35)\n\
            --scan-phase-secs <0..29>              BACKTEST-ONLY: pin scans to wall-clock grid k*interval+phase, mirroring live spawn anchoring\n\
            --dump-dir <path>                      BACKTEST-ONLY: write research scans.csv + candidates.csv under path\n\
+           --underlying-token <NAME>=<TOKEN>      BACKTEST-ONLY: map underlying to a spot/index token present in the CSV (repeatable; enables direct-spot replay)\n\
            -h, --help                             Show this help\n\
          \n\
          Examples:\n\
@@ -109,6 +111,7 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
     let mut stop_loss: Option<f64> = None;
     let mut scan_phase_secs: Option<u64> = None;
     let mut dump_dir: Option<String> = None;
+    let mut underlying_tokens: Vec<String> = Vec::new();
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -188,6 +191,13 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
                 let v = args.next().ok_or_else(|| "Missing value for --dump-dir".to_string())?;
                 dump_dir = Some(v);
             }
+            "--underlying-token" => {
+                let v = args.next().ok_or_else(|| "Missing value for --underlying-token".to_string())?;
+                if !v.contains('=') {
+                    return Err(format!("Invalid --underlying-token '{}': expected NAME=TOKEN", v).into());
+                }
+                underlying_tokens.push(v);
+            }
             _ if arg.starts_with("--min-confidence=") => {
                 let v = arg.split_once('=').map(|(_, v)| v).unwrap_or("");
                 min_confidence = Some(v.parse::<f64>().map_err(|e| format!("Invalid --min-confidence '{}': {}", v, e))?);
@@ -232,6 +242,7 @@ fn parse_args() -> Result<CliArgs, Box<dyn Error>> {
         stop_loss,
         scan_phase_secs,
         dump_dir,
+        underlying_tokens,
     })
 }
 
@@ -655,7 +666,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         });
 
     let store = TickStore::new();
-    let underlying_tokens: HashMap<String, u32> = HashMap::new();
+    // BACKTEST-ONLY direct-spot support: map underlyings to index tokens present in
+    // the CSV (synthetic spot rows injected by the canonical builder).
+    let underlying_tokens: HashMap<String, u32> = cli
+        .underlying_tokens
+        .iter()
+        .filter_map(|spec| {
+            let (name, tok) = spec.split_once('=')?;
+            match tok.parse::<u32>() {
+                Ok(t) if t > 0 => Some((name.to_string(), t)),
+                _ => {
+                    eprintln!("ignoring invalid --underlying-token '{}'", spec);
+                    None
+                }
+            }
+        })
+        .collect();
+    if !underlying_tokens.is_empty() {
+        eprintln!("direct-spot replay: {:?}", underlying_tokens);
+    }
     let mut engine = OptionsEngine::new_with_date(
         contracts,
         store.clone(),

@@ -1252,6 +1252,10 @@ pub struct OptionsEngine {
     replay_scan_phase_ms: Option<u64>,
     research: Option<ResearchDumper>,
     warmup_until_ms: Option<u64>,
+    /// EXPERIMENT (env SATA_TICK_FEED_SPOT=1): feed EVERY direct underlying tick
+    /// into SpotSeries so 1-minute bars carry true resolution instead of ~2
+    /// samples/minute. Scan cadence unchanged. Default OFF.
+    tick_feed_spot: bool,
 
     scan_interval_secs: u64,
     max_daily_trades: u32,
@@ -1447,6 +1451,9 @@ impl OptionsEngine {
             replay_scan_phase_ms: None,
             research: None,
             warmup_until_ms: None,
+            tick_feed_spot: std::env::var("SATA_TICK_FEED_SPOT")
+                .map(|v| v.trim() == "1")
+                .unwrap_or(false),
             scan_interval_secs: cfg.scan_interval_secs.max(1),
             // 0 = unlimited (rely on the daily P&L circuits instead of a count cap).
             max_daily_trades: if cfg.max_daily_trades == 0 {
@@ -1581,6 +1588,19 @@ impl OptionsEngine {
 
     pub fn process_replay_tick(&mut self, timestamp_ms: u64) {
         self.set_clock_override_ms(timestamp_ms);
+        if self.tick_feed_spot {
+            // PHASE-4 experiment: every direct underlying tick feeds SpotSeries
+            // (true-resolution bars); signal evaluation cadence is unchanged.
+            for (name, tok) in &self.underlying_tokens {
+                if let Some(tick) = self.store.get(*tok) {
+                    if tick.ltp > 0.0 {
+                        if let Some(series) = self.spot_series.get_mut(name) {
+                            series.ingest(timestamp_ms, tick.ltp);
+                        }
+                    }
+                }
+            }
+        }
         self.process_order_updates();
         self.poll_pending_orders();
         self.check_open_positions();
@@ -3257,17 +3277,18 @@ impl OptionsEngine {
             if pending.cancel_requested {
                 continue;
             }
-            // Once the order has been placed at the broker (order_id is set), scan-based
-            // validation is moot. MARKET orders fill in <1ms; LIMIT orders that are already
-            // live at the exchange are handled by poll_pending_orders (timeout / price-reversal).
-            // Marking a just-placed order here causes legitimate fills to be flattened.
-            if pending.order_id.is_some() {
-                continue;
-            }
+            // 2026-08-05 defect: a broker-ACKNOWLEDGED limit (order_id set) used to be
+            // exempt from scan revalidation. It sat ~196s at the exchange while every
+            // later scan said NO-TRADE, then filled into a broken setup (-₹1,728).
+            // Revalidation now applies to acknowledged orders too: the same-scan-cycle
+            // guard and the ack grace below still protect legitimate fast fills, and a
+            // cancel/fill race is resolved idempotently downstream — a fill that lands
+            // after a guard-based cancel is promoted only to be flattened immediately
+            // (flatten_stale_filled_entry), without consuming an extra daily slot.
             // Don't apply scan-based cancellation to orders placed in the current scan cycle.
             // Tick-driven pending-entry execution can also place an order shortly before the
             // next scan, so require both a later scan and a short wall-clock grace before using
-            // scan results to cancel an order that has not yet received a broker order_id.
+            // scan results to cancel the order.
             if pending.placed_at_scan_count >= self.scan_count
                 || now.saturating_sub(pending.placed_ms) < ENTRY_SCAN_VALIDATION_GRACE_MS
             {
@@ -3410,14 +3431,24 @@ impl OptionsEngine {
                 continue;
             }
 
-            let min_delay_ms: u64 = if signal.strategy == StrategyType::GammaScalp
-                && signal.entry_ctx.days_to_expiry < 0.5
-            {
-                5_000
-            } else if signal.strategy == StrategyType::SpotReversal || signal.confidence >= 90.0 {
-                5_000
-            } else {
-                30_000
+            // EXPERIMENT A (env SATA_MATURATION_MODE, research-only; unset = production):
+            //   "default"  — 5s for gamma-scalp/SpotReversal/high-score, else 30s
+            //   "fast5"    — everything matures in 5s
+            //   "immediate"— mature instantly (0s)
+            let min_delay_ms: u64 = match std::env::var("SATA_MATURATION_MODE").as_deref() {
+                Ok("immediate") => 0,
+                Ok("fast5") => 5_000,
+                _ => if signal.strategy == StrategyType::GammaScalp
+                    && signal.entry_ctx.days_to_expiry < 0.5
+                {
+                    5_000
+                } else if signal.strategy == StrategyType::SpotReversal
+                    || signal.confidence >= 90.0
+                {
+                    5_000
+                } else {
+                    30_000
+                },
             };
             let age_ms = self.current_time_ms().saturating_sub(signal.timestamp_ms);
             if age_ms < min_delay_ms {
@@ -5074,9 +5105,25 @@ impl OptionsEngine {
         // Always start at ATM regardless of capital tier.
         // If ATM is unaffordable, the fallback scan below finds the nearest
         // affordable strike. Forcing OTM early led to unnecessarily far strikes.
+        //
+        // EXPERIMENT B (env SATA_STRIKE_OFFSET_STEPS, research-only; unset/0 = ATM):
+        // signed strike offset from ATM in 50-pt steps. Positive = further OTM for
+        // the trade side (CE → higher, PE → lower); negative = ITM. Clamped to ±3
+        // and to chain bounds. Unaffordable picks fall through to the legacy scan.
+        let strike_offset_steps: i32 = std::env::var("SATA_STRIKE_OFFSET_STEPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .map(|v| v.clamp(-3, 3))
+            .unwrap_or(0);
         let candidate_idx = match action {
-            SignalAction::BuyCE => atm_idx,
-            SignalAction::BuyPE => atm_idx,
+            SignalAction::BuyCE => {
+                (atm_idx as i64 + strike_offset_steps as i64)
+                    .clamp(0, snap.strikes.len() as i64 - 1) as usize
+            }
+            SignalAction::BuyPE => {
+                (atm_idx as i64 - strike_offset_steps as i64)
+                    .clamp(0, snap.strikes.len() as i64 - 1) as usize
+            }
             _ => atm_idx,
         };
 
@@ -7226,18 +7273,33 @@ impl OptionsEngine {
             // which for an over-deployed trade happens BEFORE the wider % stop price is touched.
             // Reference capital is the day-start capital (a fixed rupee cap for the whole day,
             // consistent with the daily circuit). Checked FIRST so it wins over every other exit.
-            let hard_cap_reason = if self.robust_risk.enabled {
+            //
+            // EXPERIMENT C (research-only): env SATA_LOSS_CAP_PCT_OF_DAY enables THIS cap
+            // standalone — sizing/entries/profit exits untouched, unlike the robust-risk
+            // master which also resizes. Unset ⇒ production behaviour byte-identical.
+            let standalone_cap_frac: Option<f64> = if self.robust_risk.enabled {
+                None
+            } else {
+                std::env::var("SATA_LOSS_CAP_PCT_OF_DAY").ok().and_then(|v| {
+                    v.trim().parse::<f64>().ok().map(|f| (f / 100.0).clamp(0.005, 0.50))
+                })
+            };
+            let hard_cap_reason = if self.robust_risk.enabled || standalone_cap_frac.is_some() {
                 let gross = (current_price - entry_price) * lot_size as f64 * lots as f64;
                 let costs =
                     round_trip_order_cost(entry_price, current_price, lot_size, lots, now_ms);
                 let net = gross - costs;
-                let cap = self.robust_risk.max_trade_loss_frac * self.risk.daily_start_capital;
+                let frac = self
+                    .robust_risk
+                    .max_trade_loss_frac
+                    .min(standalone_cap_frac.unwrap_or(f64::MAX));
+                let cap = frac * self.risk.daily_start_capital;
                 if cap > 0.0 && net <= -cap {
                     Some(format!(
                         "HARD LOSS CAP: net ₹{:.0} ≤ -₹{:.0} ({:.0}% of capital) @ ₹{:.2}",
                         net,
                         cap,
-                        self.robust_risk.max_trade_loss_frac * 100.0,
+                        frac * 100.0,
                         current_price
                     ))
                 } else {
@@ -9507,6 +9569,299 @@ mod tests {
             OrderCommand::StatusByTag { tag } => assert_eq!(tag, "SATAENTRY1"),
             other => panic!("expected status command, got {:?}", other),
         }
+    }
+
+    // ── 2026-08-05 regression: acknowledged LIMIT must stay scan-revalidated ────
+    // Production sequence: score-80.2 signal → LIMIT placed and ACKNOWLEDGED by the
+    // broker → next scans said NO-TRADE (score collapse / no signal) → the old
+    // order_id exemption blocked revalidation → order sat ~196s and filled into a
+    // dead setup for −₹1,727.95. The stale fill must never become a tracked trade.
+    #[test]
+    fn regression_20260805_acknowledged_limit_cancelled_on_scan_collapse_and_late_fill_flattened() {
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_20260805_regression_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+
+        let store = TickStore::new();
+        store.update(Tick {
+            token: 101,
+            ltp: 100.0,
+            mode: TickMode::Ltp,
+            ..Tick::default()
+        });
+        let mut engine = OptionsEngine::new(
+            vec![test_contract()],
+            store,
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+
+        let placed_at = test_ist_ms(10, 0, 0);
+        engine.scan_count = 5; // order placed at scan 3 → two later scans have run
+        engine.pending_entry_orders.push(PendingEntryOrder {
+            pos_id: 1,
+            signal: test_signal(placed_at - 60_000),
+            token: 101,
+            tradingsymbol: "NIFTY26JUL22000CE".to_string(),
+            estimated_capital: 5_100.0,
+            tag: "SATAENTRY1".to_string(),
+            placed_ms: placed_at,
+            last_status_poll_ms: 0,
+            cancel_requested: false,
+            cancel_reason: None,
+            last_cancel_attempt_ms: 0,
+            released_after_timeout: false,
+            order_id: Some("20260805123".to_string()), // broker-ACKNOWLEDGED
+            signal_price: 100.25,
+            placed_at_scan_count: 3,
+        });
+
+        // Later scan: NO signal fired at all (the 08-05 signature).
+        let now = test_ist_ms(10, 2, 0);
+        engine.set_clock_override_ms(now);
+        engine.last_scan_result.insert(
+            "NIFTY".to_string(),
+            super::LastScanResult {
+                action: SignalAction::Hold,
+                best_score: 0.0,
+                scanned_at_ms: now,
+            },
+        );
+
+        engine.validate_pending_entries_against_scan();
+        assert!(
+            engine.pending_entry_orders[0].cancel_requested,
+            "acknowledged limit must still be cancelled when the latest scan collapses"
+        );
+        assert_eq!(
+            engine.pending_entry_orders[0].cancel_reason,
+            Some(super::CancelReasonKind::ScanScoreCollapse)
+        );
+        match order_rx.try_recv().expect("cancel despite ack") {
+            OrderCommand::CancelByTag { tag } => assert_eq!(tag, "SATAENTRY1"),
+            other => panic!("expected CancelByTag, got {:?}", other),
+        }
+        while order_rx.try_recv().is_ok() {} // drain StatusByTag
+
+        // Cancel/fill race: the exchange fills the order anyway.
+        let slots_before_fill = engine.daily_trades_opened;
+        engine.handle_order_update(OrderUpdate {
+            tag: "SATAENTRY1".to_string(),
+            order_id: Some("20260805123".to_string()),
+            status: Some("COMPLETE".to_string()),
+            average_price: Some(99.90),
+            filled_quantity: Some(50),
+            pending_quantity: Some(0),
+            source: "postback".to_string(),
+            message: None,
+        });
+
+        assert!(
+            engine
+                .positions
+                .iter()
+                .all(|p| p.exit_pending || !p.is_open),
+            "late fill must be exit-pending immediately (never a normally tracked trade)"
+        );
+        assert_eq!(engine.pending_exit_orders.len(), 1);
+        assert_eq!(engine.pending_exit_orders[0].reason, "STALE FLATTEN");
+
+        // Exit fill completes the flatten cycle.
+        let slots_before_exit_fill = engine.daily_trades_opened;
+        engine.handle_order_update(OrderUpdate {
+            tag: engine.pending_exit_orders[0].tag.clone(),
+            order_id: Some("20260805999".to_string()),
+            status: Some("COMPLETE".to_string()),
+            average_price: Some(99.50),
+            filled_quantity: Some(50),
+            pending_quantity: Some(0),
+            source: "postback".to_string(),
+            message: None,
+        });
+        assert!(!engine.has_open_position());
+        assert_eq!(
+            engine.daily_trades_opened, slots_before_exit_fill,
+            "stale flatten must not consume a daily trade slot"
+        );
+        assert_eq!(engine.positions_closed, 1);
+    }
+
+    #[test]
+    fn regression_20260805_ack_still_admitted_scan_keeps_legitimate_fill_alive() {
+        // Negative control: same acknowledged order, but the later scan still admits
+        // the same side with a strong score → no cancellation (protects fast fills).
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_20260805_negative_control_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+        let mut engine = OptionsEngine::new(
+            vec![test_contract()],
+            TickStore::new(),
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+
+        let placed_at = test_ist_ms(10, 0, 0);
+        engine.scan_count = 5;
+        engine.pending_entry_orders.push(PendingEntryOrder {
+            pos_id: 1,
+            signal: test_signal(placed_at - 60_000), // BuyCE
+            token: 101,
+            tradingsymbol: "NIFTY26JUL22000CE".to_string(),
+            estimated_capital: 5_100.0,
+            tag: "SATAENTRY1".to_string(),
+            placed_ms: placed_at,
+            last_status_poll_ms: 0,
+            cancel_requested: false,
+            cancel_reason: None,
+            last_cancel_attempt_ms: 0,
+            released_after_timeout: false,
+            order_id: Some("20260805456".to_string()),
+            signal_price: 100.25,
+            placed_at_scan_count: 3,
+        });
+        let now = test_ist_ms(10, 2, 0);
+        engine.set_clock_override_ms(now);
+        engine.last_scan_result.insert(
+            "NIFTY".to_string(),
+            super::LastScanResult {
+                action: SignalAction::BuyCE, // same side, strong score
+                best_score: 88.0,
+                scanned_at_ms: now,
+            },
+        );
+
+        engine.validate_pending_entries_against_scan();
+        assert!(!engine.pending_entry_orders[0].cancel_requested);
+        assert!(order_rx.try_recv().is_err(), "no orders may be emitted");
+    }
+
+    // ── 2026-08-10 regression: duplicate exit postbacks book exactly one close ──
+    #[test]
+    fn regression_20260810_duplicate_exit_completes_book_exactly_one_close() {
+        let cfg = test_config();
+        let log_dir = std::env::temp_dir().join(format!(
+            "satavahana_20260810_regression_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&log_dir);
+
+        let mut engine = OptionsEngine::new(
+            vec![test_contract()],
+            {
+                let s = TickStore::new();
+                s.update(Tick {
+                    token: 101,
+                    ltp: 100.0,
+                    mode: TickMode::Ltp,
+                    ..Tick::default()
+                });
+                s
+            },
+            HashMap::new(),
+            &cfg,
+            0.065,
+            0.0,
+            log_dir.to_string_lossy().as_ref(),
+        );
+        let (order_tx, mut order_rx) = tokio::sync::mpsc::unbounded_channel();
+        engine.set_live_order_bridge(order_tx, None, "SATA".to_string());
+        engine.set_clock_override_ms(test_ist_ms(11, 0, 0));
+
+        // Open a position directly (live entries route through pending orders, so the
+        // 08-10 sequence under test starts from an already-open tracked position).
+        let signal = test_signal(engine.current_time_ms());
+        engine.positions.push(super::Position {
+            id: 1,
+            underlying: "NIFTY".to_string(),
+            tradingsymbol: "NIFTY26JUL22000CE".to_string(),
+            action: SignalAction::BuyCE,
+            strike: 22_000.0,
+            expiry: "2026-07-30".to_string(),
+            option_token: 101,
+            lots: 1,
+            lot_size: 50,
+            entry_price: 100.0,
+            target_price: 130.0,
+            stop_price: 80.0,
+            entry_time_ms: engine.current_time_ms(),
+            entry_datetime: "2026-08-10 11:00:00".to_string(),
+            strategy: StrategyType::SpotReversal,
+            is_open: true,
+            exit_price: 0.0,
+            exit_time_ms: 0,
+            pnl: 0.0,
+            pnl_pct: 0.0,
+            exit_reason: String::new(),
+            capital_deployed: 5_000.0,
+            entry_ctx: test_entry_context(),
+            breakeven_stop_set: false,
+            exit_pending: false,
+            checkpoints_evaluated: 0,
+        });
+        assert!(engine.has_open_position(), "position must be open");
+        let pos_idx = engine.positions.iter().position(|p| p.is_open).unwrap();
+        let capital_before_close = engine.risk.capital;
+
+        engine.close_position_at(pos_idx, 105.0, "TARGET HIT".to_string());
+        match order_rx.try_recv().expect("exit place command") {
+            OrderCommand::Place(c) => {
+                assert_eq!(c.side, OrderSide::Sell);
+                assert!(c.tag.starts_with("SATAEXIT"));
+            }
+            other => panic!("expected SELL Place, got {:?}", other),
+        }
+        while order_rx.try_recv().is_ok() {} // drain StatusByTag
+        assert_eq!(engine.pending_exit_orders.len(), 1);
+        let exit_tag = engine.pending_exit_orders[0].tag.clone();
+
+        // Duplicate COMPLETE postbacks for the same order_id (at-least-once delivery).
+        let complete = || OrderUpdate {
+            tag: exit_tag.clone(),
+            order_id: Some("20260810789".to_string()),
+            status: Some("COMPLETE".to_string()),
+            average_price: Some(104.80),
+            filled_quantity: Some(50),
+            pending_quantity: Some(0),
+            source: "postback".to_string(),
+            message: None,
+        };
+        engine.handle_order_update(complete());
+        assert!(
+            !engine.has_open_position(),
+            "first COMPLETE finalizes the close"
+        );
+        let closes_after_first = engine.positions_closed;
+        let capital_after_first = engine.risk.capital;
+        assert_ne!(capital_after_first, capital_before_close, "P&L booked once");
+
+        for _ in 0..3 {
+            engine.handle_order_update(complete());
+        }
+        assert_eq!(
+            engine.positions_closed, closes_after_first,
+            "duplicate COMPLETE events must not create a second effective close"
+        );
+        assert_eq!(
+            engine.risk.capital, capital_after_first,
+            "capital must be finalized exactly once"
+        );
+        assert!(engine.pending_exit_orders.is_empty());
     }
 
     #[test]
