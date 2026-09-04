@@ -14,8 +14,9 @@ use crate::multileg::{
     stop_frac_ml, structure_regime_score, target_frac, trail_enabled, trail_exits,
     OpeningRegime, PlannedLeg, SellStructure, StrikeQuote, CREDIT_EDGE_ALLOC_FRAC,
     CREDIT_EDGE_DELTA, CREDIT_EDGE_FAR_DTE_MIN_DIRECTIONAL_EFFICIENCY,
-    CREDIT_EDGE_MAX_DTE_DAYS, CREDIT_EDGE_MAX_ER, CREDIT_EDGE_MAX_LOTS,
-    CREDIT_EDGE_MAX_RANGE_PCT, CREDIT_EDGE_THRESHOLD, MOVE_WINDOW_MIN,
+    CREDIT_EDGE_MAX_DTE_DAYS, CREDIT_EDGE_MAX_ENTRY_BALANCE, CREDIT_EDGE_MAX_ER,
+    CREDIT_EDGE_MAX_LOTS, CREDIT_EDGE_MAX_RANGE_PCT, CREDIT_EDGE_THRESHOLD,
+    MOVE_WINDOW_MIN,
 };
 use crate::websocket::FEED_SOFT_STALE_MS;
 
@@ -257,6 +258,13 @@ fn try_plan(
                 "CRED range {:.2}% > {:.2}%",
                 opening.range_pts / spot * 100.0,
                 CREDIT_EDGE_MAX_RANGE_PCT * 100.0
+            ));
+        }
+        // D007 gate (H120): reject pinned-extreme opens, same as live.
+        if !no_gate && opening.edge_frac > CREDIT_EDGE_MAX_ENTRY_BALANCE {
+            return Err(format!(
+                "CRED entry balance {:.2} > {:.2} (opening extreme)",
+                opening.edge_frac, CREDIT_EDGE_MAX_ENTRY_BALANCE
             ));
         }
         if !no_gate
