@@ -36,6 +36,12 @@ pub const WING: f64 = 100.0;
 pub const ENTRY_SLIP: f64 = 0.50;
 
 pub const CREDIT_EDGE_THRESHOLD: f64 = 0.65;
+/// D007 (satakarni): CRED entries are rejected when the 09:45 opening-extreme
+/// fraction exceeds this — spot pinned at an opening-range extreme is when the
+/// open keeps running against a 100pt vertical (paired 50d replay: suppresses
+/// 4 catastrophic/drift losers, 0 winners harmed). One frozen constant; see
+/// satakarni/RESEARCH_STATE.md H120 for caveats.
+pub const CREDIT_EDGE_MAX_ENTRY_BALANCE: f64 = 0.86;
 pub const CREDIT_EDGE_DELTA: f64 = 0.30;
 pub const CREDIT_EDGE_MAX_ER: f64 = 0.50;
 pub const CREDIT_EDGE_MAX_RANGE_PCT: f64 = 0.0200;
@@ -1678,6 +1684,14 @@ impl MultiLegEngine {
                     "CRED range {:.2}% > {:.2}%",
                     range_pct * 100.0,
                     CREDIT_EDGE_MAX_RANGE_PCT * 100.0
+                ));
+            }
+            // D007 gate: reject entries when spot sits at an opening-range
+            // extreme (edge_frac near 1.0 = pinned to the high or the low).
+            if opening_latent.edge_frac > CREDIT_EDGE_MAX_ENTRY_BALANCE {
+                return Err(format!(
+                    "CRED entry balance {:.2} > {:.2} (opening extreme)",
+                    opening_latent.edge_frac, CREDIT_EDGE_MAX_ENTRY_BALANCE
                 ));
             }
             let direction = credit_edge_direction(opening_latent.edge_pos, CREDIT_EDGE_THRESHOLD)
@@ -3661,7 +3675,10 @@ mod tests {
             (9, 30, 0, 24_035.0),
             (9, 35, 0, 24_010.0),
             (9, 40, 0, 24_045.0),
-            (9, 45, 0, 24_048.0),
+            // D007 gate: land inside the range (not pinned at the high) so the
+            // CRED entry-balance check passes; a pinned extreme is rejected.
+            (9, 44, 0, 24_030.0),
+            (9, 45, 0, 24_038.0),
         ] {
             store.update(crate::models::Tick {
                 token: 1,
