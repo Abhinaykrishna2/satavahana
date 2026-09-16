@@ -34,9 +34,10 @@ const OVEREXT_PE_RSI_MAX: f64 = 35.0; // block BuyPE (bearish) when RSI already 
 const OVEREXT_CE_RSI_MIN: f64 = 70.0; // block BuyCE (bullish) when RSI already ≥ 70 (overbought)
 const MAX_CE_OTM_STEPS: usize = 3;
 const MAX_PE_OTM_STEPS: usize = 3;
-// Cold-start Kelly is 16.25%; 3.0 caps a fresh one-lot entry near 49% of
-// deployable capital, enough for ATM-adjacent NIFTY options without scaling lots.
-const ENTRY_EXPOSURE_KELLY_MULT: f64 = 3.0;
+// Cold-start Kelly is 16.25%; 4.0 caps a fresh entry near 65% of deployable capital.
+// Raised from 3.0 (49%) on 2026-09-16 (EXP-009): at ~₹10.9k the 49% cap left near-ATM
+// strikes at 4-6 DTE unaffordable, so the strike scan could only reach 4-5 OTM and skipped.
+const ENTRY_EXPOSURE_KELLY_MULT: f64 = 4.0;
 const RIGID_EXIT_MAX_DTE: f64 = 1.0;
 const RIGID_PROFIT_LOCK_ARM_PCT: f64 = 12.0;
 const RIGID_PROFIT_LOCK_GAIN_PCT: f64 = 2.0;
