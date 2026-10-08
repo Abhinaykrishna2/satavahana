@@ -79,3 +79,6 @@ details.txt
 
 # Local ops tooling
 scripts/
+
+# Personal portfolio analysis (real holdings / account values). Public repo: never commit.
+Equities/
