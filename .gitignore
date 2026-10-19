@@ -64,6 +64,11 @@ src/recorder.rs
 # Large local assets
 logo.png
 lion.mp4
+!assets/
+!assets/*.png
+
+# Local exchange research & captured tape (contains credentials & large data)
+NSE-BSE/
 
 # Scripts
 scripts.sh
@@ -73,6 +78,7 @@ scripts.sh
 
 # Python research sandbox (local experiments, not part of the Rust build)
 satakarni/
+Satakarni/
 
 # Local engine walkthrough / analysis notes
 details.txt
@@ -82,3 +88,4 @@ scripts/
 
 # Personal portfolio analysis (real holdings / account values). Public repo: never commit.
 Equities/
+equities/
